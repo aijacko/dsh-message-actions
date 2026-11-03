@@ -17,6 +17,22 @@ Features you don't use can be turned off in settings. Turn off cost statistics, 
 
 ---
 
+## Screenshots
+
+**Actions on the question row, reply statistics under answers, and the cost card at the bottom of the sidebar**
+
+![Message actions, reply statistics and cost card](pic/en1.png)
+
+**Settings → Messages & Cost → Message Actions**
+
+![Message Actions tab](pic/en2.png)
+
+**Settings → Messages & Cost → Cost Statistics**
+
+![Cost Statistics tab](pic/en3.png)
+
+---
+
 ## Features
 
 | Feature | What it does |
@@ -26,7 +42,7 @@ Features you don't use can be turned off in settings. Turn off cost statistics, 
 | **Delete to end** | Removes everything from this message to the end, for closing off a topic |
 | **Share as image** | Pick the turns you want in a full-screen overlay and generate a long PNG, generated locally, never uploaded |
 | **Export Markdown** | Same selection, exports a `.md` with question / answer structure per turn |
-| **Reply statistics** | `tokens · chars` under every answer, the size of a reply at a glance |
+| **Reply statistics** | `tok · chars` under every answer, the size of a reply at a glance |
 | **Rail sync** | After deletion, the matching sidebar ticks hide and the gaps close, leaving no ghost entries |
 | **Cost card** | Balance / today / per-turn cost at a glance, with single-line and multi-line billing styles |
 | **Peak / off-peak hint** | Peak in orange, off-peak in blue, showing whether now is expensive and when it switches |
@@ -104,7 +120,7 @@ pnpm add "file:/path/to/dsh-message-actions"
 
 1. Hover over any **question** row: Recall, Share, Export, Delete, Delete to end appear on the right.
 2. Hover over a **tool-call row**: "Delete tool" appears on the right; it deletes the node set for that `(turn, step)` — the answer and other tool results in the same step disappear too; other steps are unaffected.
-3. Under every **answer**, `tokens · chars` is shown.
+3. Under every **answer**, `tok · chars` is shown.
 4. Recall and delete actions ask for confirmation by default; turn off "Confirm actions" to run them immediately. After confirming, the content disappears and the sidebar ticks hide in sync.
 5. Share / export opens a full-screen picker; each card shows the question and answer preview for that turn, and you can select one, several, or all; full text is fetched only when you generate.
 6. While a reply is being generated, all buttons are disabled to avoid conflicting with the running session.
@@ -135,7 +151,7 @@ Settings → Plugins → **Messages & Cost**; the page has two tabs, and changes
 | Delete | Question row deletes the whole exchange; tool row deletes that step's tool results |
 | Delete to end | Show "Delete to end" on question rows |
 | Confirm actions | Whether recall and delete actions ask for confirmation |
-| Reply statistics | Whether `tokens · chars` is shown under answers |
+| Reply statistics | Whether `tok · chars` is shown under answers |
 
 **Cost Statistics**
 
@@ -206,7 +222,7 @@ This section only describes what the code actually does. It is risk reduction, n
 ```bash
 node build.mjs        # build to lib/
 node test/check.mjs   # offline assertions, 2541 currently
-# plus a real session-log regression: 18/18 (see DEVELOPMENT.md §13.8)
+# plus a real session-log regression: 18/18
 ```
 
 ```
@@ -224,8 +240,6 @@ test/check.mjs   # dependency-free assertion script
 - Version: `0.2.1`
 - Compatible with: tested on DSH `0.2.1-rc.5` desktop (profile `desktop`)
 - Dependencies: none at runtime
-- QA checklist: [docs/qa-checklist.md](docs/qa-checklist.md)
-- Development notes: [DEVELOPMENT.md](DEVELOPMENT.md)
 
 ---
 
