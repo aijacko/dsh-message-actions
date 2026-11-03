@@ -6,8 +6,10 @@
 //   - $DSH_HOME || ~/.dsh
 //   - 临时文件写入（mode 0600）→ rename 原子替换（Windows 重试）
 //
-// 损坏恢复：JSON 解析失败时把原文件改名为 cost-state.bad-<时间戳>.json，
-// 从空状态启动；版本高于当前版本时按只读快照处理，不回写。
+// 恢复策略：
+//   - 文件超过 4MB：记录一次可诊断 warn，直接以默认状态原子重建并恢复可写；
+//   - 未超限但 JSON 解析失败：把原文件改名为 cost-state.bad-<时间戳>.json 保留现场；
+//   - 版本高于当前版本：按只读快照处理，不回写。
 
 const fs = require("node:fs");
 const os = require("node:os");
@@ -124,8 +126,17 @@ function loadCostState(filePath, logger, maxBytes) {
   try {
     const stat = fs.statSync(filePath);
     if (stat.size > limit) {
-      warn(`cost state too large (${stat.size} bytes, limit ${limit}), ignored`);
-      return { state: defaultState(), readOnly: false, recovered: false };
+      // 超限文件不解析，直接以默认状态重建；不生成 .bad 副本，也不进入只读。
+      // 警告保留体积与阈值，便于用户日后排查（不弹用户可见错误框）。
+      warn(`cost state too large (${stat.size} bytes, limit ${limit}), rebuilt with defaults`);
+      const state = defaultState();
+      try {
+        saveCostState(filePath, state);
+      } catch (err) {
+        // 重建写盘失败不阻塞启动：内存状态仍可正常记账，下次 persist 会重试。
+        warn(`rebuilt cost state write failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      return { state, readOnly: false, recovered: true };
     }
     text = fs.readFileSync(filePath, "utf8");
   } catch (err) {
@@ -145,6 +156,23 @@ function loadCostState(filePath, logger, maxBytes) {
       /* 改名失败也不阻塞启动 */
     }
     return { state: defaultState(), readOnly: false, recovered: true };
+  }
+}
+
+/**
+ * 同步退避等待：优先 Atomics.wait（不占 CPU），不可用时才短暂自旋。
+ * 仅在 rename 因文件占用短暂失败时使用，单次 ≤ 100ms。
+ */
+function waitBriefly(ms) {
+  try {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+    return;
+  } catch {
+    /* 环境不支持 Atomics.wait，退回自旋 */
+  }
+  const until = Date.now() + ms;
+  while (Date.now() < until) {
+    /* busy wait（兜底，总时长 ≤ 100ms） */
   }
 }
 
@@ -193,10 +221,8 @@ function saveCostState(filePath, state) {
         throw err;
       }
       // Windows 上目标文件被占用时 rename 会短暂失败，退避重试。
-      const until = Date.now() + 20 + i * 20;
-      while (Date.now() < until) {
-        /* busy wait，总时长 ≤ 120ms */
-      }
+      // 优先 Atomics.wait（宿主为 Node 主进程，可阻塞但不占 CPU）；不可用时才短暂自旋。
+      waitBriefly(20 + i * 20);
     }
   }
 }

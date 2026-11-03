@@ -2,27 +2,36 @@ import { randomUUID } from "node:crypto";
 import z from "@deepseek-ai/schemastery";
 import shared from "./shared.cjs";
 import store from "./store.cjs";
+import http from "./http.cjs";
+
+const {
+  sendJson,
+  drainRequest,
+  sendError,
+  sendBadRequest,
+  sendForbidden,
+  sendMethodNotAllowed,
+  readJsonBody
+} = http;
 
 const {
   PRODUCER,
   TOMBSTONE_TEXT,
-  ERROR_LABELS,
   planAction,
   roundsOf,
-  goneTurnsOf,
-  buildTurnIndex,
-  turnOf,
-  textOf,
-  MAX_BODY_BYTES,
+  createTurnLookup,
+  liveNodesOf,
+  messageIdOf,
+  messagesSummaryOf,
   isTrustedRequest,
   statusCodeOf,
-  bodyTooLarge,
   beijingDateKey,
   periodInfo,
   PRICE_TABLE,
   routeOfMessage,
   routeOfUsage,
   routingOfProvider,
+  costSwitches,
   turnCostOfGroups,
   deriveTurnUsage,
   createTurnBuffer,
@@ -63,66 +72,12 @@ const Config = z.object({
 
   // —— 费用统计（新增）——
   usageStats: z.boolean().default(true).volatile(),
+  // 计费样式排在「单次消耗」之前；默认单行样式（compact）。
+  costLayout: z.string().default("compact").volatile(),
   costPerTurn: z.boolean().default(true).volatile(),
   costPerTurnAutoClose: z.number().min(0).max(600).default(0).volatile(),
-  costPeakValley: z.boolean().default(true).volatile(),
-  costLayout: z.string().default("default").volatile()
+  costPeakValley: z.boolean().default(true).volatile()
 });
-
-// ---------------------------------------------------------------------------
-// HTTP 工具
-// ---------------------------------------------------------------------------
-
-/**
- * 统一 JSON 响应头。除类型与长度外，附加防缓存 / 防嗅探 / 禁引用 / 禁嵌入，
- * 避免含会话正文与财务数据的响应被浏览器缓存、被嗅探成其它类型或在页面里被内联执行。
- */
-function jsonHeaders(bodyLength) {
-  return {
-    "content-type": "application/json; charset=utf-8",
-    "content-length": bodyLength,
-    "cache-control": "no-store",
-    "x-content-type-options": "nosniff",
-    "referrer-policy": "no-referrer",
-    "cross-origin-resource-policy": "same-origin",
-    "content-security-policy": "default-src 'none'; frame-ancestors 'none'"
-  };
-}
-
-function sendJson(res, status, payload) {
-  if (res.headersSent) return;
-  const body = JSON.stringify(payload);
-  res.writeHead(status, jsonHeaders(Buffer.byteLength(body)));
-  res.end(body);
-}
-
-/**
- * 提前拒绝（405 / 403 / 类型不符）时主动排空请求体。
- * 不排空会让同一个 keep-alive 连接上的剩余字节污染后续请求解析。
- */
-function drainRequest(req) {
-  try {
-    if (typeof req.resume === "function") req.resume();
-  } catch {
-    /* 连接已断开 */
-  }
-}
-
-function errorMessage(code) {
-  return ERROR_LABELS.en[code] || code;
-}
-
-function sendError(res, status, code) {
-  sendJson(res, status, { ok: false, error: { code, message: errorMessage(code) } });
-}
-
-function sendBadRequest(res) {
-  sendError(res, 400, "INVALID_REQUEST");
-}
-
-function sendForbidden(res) {
-  sendError(res, 403, "FORBIDDEN");
-}
 
 // ---------------------------------------------------------------------------
 // 信任围栏
@@ -149,84 +104,8 @@ function isTrusted(req, webServer) {
 }
 
 // ---------------------------------------------------------------------------
-// 请求体读取（1MB 上限 + 断连处理）
+// 事件与随机 id
 // ---------------------------------------------------------------------------
-
-async function readJsonBody(req, res) {
-  const contentLength = req.headers["content-length"];
-  if (contentLength !== undefined && bodyTooLarge(contentLength)) {
-    sendError(res, 413, "PAYLOAD_TOO_LARGE");
-    return null;
-  }
-  const chunks = [];
-  let total = 0;
-  let broken = false;
-  const onBreak = () => {
-    broken = true;
-  };
-  req.on("aborted", onBreak);
-  req.on("close", onBreak);
-  try {
-    for await (const chunk of req) {
-      total += chunk.length;
-      if (total > MAX_BODY_BYTES) {
-        sendError(res, 413, "PAYLOAD_TOO_LARGE");
-        return null;
-      }
-      chunks.push(chunk);
-    }
-  } catch {
-    return null;
-  }
-  if (broken && chunks.length === 0) return null;
-  if (chunks.length === 0) {
-    sendBadRequest(res);
-    return null;
-  }
-  let raw;
-  try {
-    raw = Buffer.concat(chunks).toString("utf8");
-  } catch {
-    raw = chunks.map((c) => c.toString("utf8")).join("");
-  }
-  try {
-    return JSON.parse(raw);
-  } catch {
-    sendBadRequest(res);
-    return null;
-  }
-}
-
-// ---------------------------------------------------------------------------
-// 事件角色与随机 id
-// ---------------------------------------------------------------------------
-
-function messageRole(event) {
-  switch (event.type) {
-    case "user/message": return "user";
-    case "assistant/message": return "assistant";
-    case "tool/result": return "tool";
-    case "system/message": return "system";
-    case "developer/message": return "developer";
-    default: return "other";
-  }
-}
-
-/** 取事件的稳定消息 id（用于客户端与辅助/答行槽位对齐）。 */
-function messageIdOf(event) {
-  if (!event || !event.data) return undefined;
-  if (typeof event.data.id === "string") return event.data.id;
-  if (event.data.message && typeof event.data.message.id === "string") return event.data.message.id;
-  return undefined;
-}
-
-/** 取事件的用量信息（答行统计 tokens 来源）。 */
-function usageOf(event) {
-  if (!event || !event.data) return undefined;
-  const usage = event.data.usage;
-  if (!usage || typeof usage !== "object") return undefined;
-  return usage.outputTokens !== undefined ? { outputTokens: usage.outputTokens } : undefined;
-}
 
 /** 由消息 id 反查表面节点的 seq；找不到返回 null。 */
 function resolveSeqByMessageId(events, nodes, messageId) {
@@ -253,8 +132,7 @@ function makeActionHandler(ctx) {
   return async function handleAction(req, res) {
     if (req.method !== "POST") {
       drainRequest(req);
-      res.writeHead(405, { allow: "POST" });
-      res.end();
+      sendMethodNotAllowed(res, "POST");
       return;
     }
     if (!isTrusted(req, ctx.webServer)) {
@@ -362,8 +240,10 @@ function makeActionHandler(ctx) {
       value: {
         action,
         seq,
+        via: plan.via,
         removed: plan.removed,
         turn: plan.turn,
+        step: plan.step,
         refillText: plan.refillText
       }
     });
@@ -374,8 +254,7 @@ function makeMessagesHandler(ctx) {
   return async function handleMessages(req, res) {
     if (req.method !== "GET") {
       drainRequest(req);
-      res.writeHead(405, { allow: "GET" });
-      res.end();
+      sendMethodNotAllowed(res, "GET");
       return;
     }
     if (!isTrusted(req, ctx.webServer)) {
@@ -400,49 +279,53 @@ function makeMessagesHandler(ctx) {
     const events = session.snapshotEvents();
     const nodes = [...session.surface.nodes];
 
+    // user/message 没有 data.turn（真实日志里只有 assistant/tool 带 turn），
+    // 需要按 turn/start~turn/end 区间推导，否则问行按钮找不到对应 seq。
+    // 一次构建索引与 seq→turn 映射，供 rows / rounds / goneTurns 复用。
+    const turns = createTurnLookup(events);
+
+    // 全文按需接口：只给分享图 / 导出使用，普通 3s 轮询不经过这里。
+    if (url.searchParams.get("full") === "1") {
+      const turnsParam = url.searchParams.get("turns");
+      let turnFilter = null;
+      if (turnsParam !== null && turnsParam !== "") {
+        turnFilter = new Set(
+          turnsParam.split(",")
+            .filter((s) => s.trim() !== "")
+            .map((s) => Number(s))
+            .filter(Number.isSafeInteger)
+        );
+      }
+      const rounds = roundsOf(events, nodes, turns);
+      const liveNodes = liveNodesOf(events, nodes);
+      const lastSeq = liveNodes.length > 0 ? liveNodes[liveNodes.length - 1] : 0;
+      sendJson(res, 200, {
+        ok: true,
+        value: {
+          version: Number.isSafeInteger(lastSeq) ? lastSeq : 0,
+          nodeCount: liveNodes.length,
+          rounds: turnFilter === null ? rounds : rounds.filter((round) => turnFilter.has(round.turn))
+        }
+      });
+      return;
+    }
+
     let filter = null;
     const seqsParam = url.searchParams.get("seqs");
     if (seqsParam !== null && seqsParam !== "") {
       filter = new Set(
-        seqsParam.split(",").map((s) => Number(s)).filter(Number.isSafeInteger)
+        seqsParam.split(",")
+          .filter((s) => s.trim() !== "")
+          .map((s) => Number(s))
+          .filter(Number.isSafeInteger)
       );
     }
 
-    // user/message 没有 data.turn（真实日志里只有 assistant/tool 带 turn），
-    // 需要按 turn/start~turn/end 区间推导，否则问行按钮找不到对应 seq。
-    const turnIndex = buildTurnIndex(events);
-
-    const rows = [];
-    for (const seq of nodes) {
-      const event = events[seq];
-      if (!event) continue;
-      if (shared.isTombstone(event)) continue;
-      if (filter && !filter.has(seq)) continue;
-      const explicitTurn = event.data && event.data.turn;
-      rows.push({
-        seq,
-        type: event.type,
-        id: messageIdOf(event),
-        turn: Number.isSafeInteger(explicitTurn) ? explicitTurn : turnOf(turnIndex, seq),
-        step: event.data && event.data.step,
-        role: messageRole(event),
-        // 真实提问与运行时注入（runtime-context / skill-catalog / time-context）
-        // 都是 user/message，客户端靠 sourceKind 区分，避免点错问行。
-        sourceKind: (event.data && event.data.source && event.data.source.kind) || "user",
-        // 只回传问 / 答正文：系统 / 开发者提示词与工具结果（可能含文件内容、密钥）
-        // 客户端渲染用不到，不回传可把敏感正文的暴露面降到最小。
-        text: event.type === "user/message" || event.type === "assistant/message" ? textOf(event) : "",
-        usage: usageOf(event)
-      });
-    }
-
+    // 摘要轮询：只回 preview / words / usage / callId，不回正文。
+    // 系统 / 开发者提示词与工具结果正文从不进入摘要（预览也只覆盖问 / 答）。
     sendJson(res, 200, {
       ok: true,
-      value: {
-        rows,
-        rounds: roundsOf(events, nodes),
-        goneTurns: goneTurnsOf(events, nodes)
-      }
+      value: messagesSummaryOf(events, nodes, turns, { filter, previewLimit: 200 })
     });
   };
 }
@@ -453,6 +336,8 @@ function makeMessagesHandler(ctx) {
 
 const COST_REFRESH_MIN_INTERVAL_MS = 60 * 1000;
 const COST_BALANCE_TIMEOUT_MS = 10 * 1000;
+const ROUTING_TIMEOUT_MS = 3 * 1000;
+const ROUTING_CACHE_MS = 5 * 1000;
 const DSH_VERSION_FALLBACK = "0.2.1";
 
 /** getBalance 的客户端元数据：时区固定北京时间，不随本机漂移。 */
@@ -532,15 +417,16 @@ async function hasApiKey(ctx) {
  */
 function createCostService(ctx, config) {
   const cfg = config || {};
-  const enabled = cfg.usageStats !== false;
-  const perTurn = cfg.costPerTurn !== false;
+  // 运行时读取开关，默认值与旧版保持一致（未配置 = 开启）。
+  const switches = () => costSwitches(cfg);
+  const isEnabled = () => switches().enabled;
 
   const statePath = resolveStatePath();
   const loaded = loadCostState(statePath, ctx.logger);
   const state = loaded.state;
   const readOnly = loaded.readOnly;
 
-  if (!enabled) {
+  if (!isEnabled()) {
     // 总开关关闭：重新开启后从新余额继续，不补记关闭期间的差额。
     state.lastBalanceCents = null;
     state.lastBalanceAt = 0;
@@ -548,11 +434,13 @@ function createCostService(ctx, config) {
 
   const cache = { rechargeCents: null, bonusCents: null, totalCents: null, updatedAt: 0 };
   const buffers = new Map();
+  const MAX_BUFFERS = 200;
   let lastTurn = null;
   let inFlight = null;
   let lastFetchFailed = false;
   let lastMessageProvider;
   let lastHeaderProvider;
+  let routingCache = { at: 0, value: null };
 
   const warn = (message) => {
     if (typeof ctx.logger?.warn === "function") ctx.logger.warn(`[dsh-message-actions] ${message}`);
@@ -570,19 +458,34 @@ function createCostService(ctx, config) {
   }
 
   async function routingInfo() {
+    const now = Date.now();
+    if (routingCache.value && now - routingCache.at < ROUTING_CACHE_MS) return routingCache.value;
+
     const provider = lastMessageProvider || lastHeaderProvider;
     const mapped = routingOfProvider(provider);
-    if (mapped) return { routing: mapped, provider };
-    if (await hasApiKey(ctx)) return { routing: "api-key", provider: "deepseek-official" };
-    const account = accountServiceOf(ctx);
-    if (!account) return { routing: "unavailable", provider: undefined };
+    const finish = (value) => {
+      routingCache = { at: Date.now(), value };
+      return value;
+    };
+    if (mapped) return finish({ routing: mapped, provider });
+
+    let hasKey = false;
     try {
-      const snapshot = await account.getState();
-      const status = snapshot && typeof snapshot === "object" ? snapshot.status : undefined;
-      if (status === "credential-stored") return { routing: "account", provider: "deepseek-account" };
-      return { routing: "signed-out", provider: undefined };
+      hasKey = await withTimeout(Promise.resolve(hasApiKey(ctx)), ROUTING_TIMEOUT_MS);
     } catch {
-      return { routing: "unavailable", provider: undefined };
+      hasKey = false; // 凭据服务卡住时按未配置处理，继续尝试账户路由
+    }
+    if (hasKey) return finish({ routing: "api-key", provider: "deepseek-official" });
+
+    const account = accountServiceOf(ctx);
+    if (!account) return finish({ routing: "unavailable", provider: undefined });
+    try {
+      const snapshot = await withTimeout(Promise.resolve(account.getState()), ROUTING_TIMEOUT_MS);
+      const status = snapshot && typeof snapshot === "object" ? snapshot.status : undefined;
+      if (status === "credential-stored") return finish({ routing: "account", provider: "deepseek-account" });
+      return finish({ routing: "signed-out", provider: undefined });
+    } catch {
+      return finish({ routing: "unavailable", provider: undefined });
     }
   }
 
@@ -631,7 +534,7 @@ function createCostService(ctx, config) {
 
   /** 背景 / 强制刷新；单飞 + 60s 节流 + 10s 超时。 */
   function refresh(force) {
-    if (!enabled) return Promise.resolve();
+    if (!isEnabled()) return Promise.resolve();
     if (inFlight) return inFlight;
     const now = Date.now();
     if (!force && now - state.lastAttemptAt < COST_REFRESH_MIN_INTERVAL_MS) return Promise.resolve();
@@ -691,13 +594,13 @@ function createCostService(ctx, config) {
       },
       period: period.period,
       nextChangeAt: period.nextChangeAt,
-      lastTurn: perTurn ? lastTurn : null
+      lastTurn: switches().perTurn ? lastTurn : null
     };
   }
 
   /** 会话事件：跟踪最近模型路由，并在 turn/end 时结算本轮。 */
   function onSessionEvent(session, event) {
-    if (!enabled) return;
+    if (!isEnabled()) return;
     if (!event || typeof event !== "object") return;
     const sessionId = session && typeof session.id === "string" ? session.id : undefined;
     if (!sessionId) return;
@@ -706,14 +609,29 @@ function createCostService(ctx, config) {
 
     if (type === "assistant/message") {
       const route = routeOfUsage(data.usage) || routeOfMessage(data.message);
-      if (route) lastMessageProvider = route.provider;
+      if (route) {
+        lastMessageProvider = route.provider;
+        routingCache = { at: 0, value: null };
+      }
     } else if (type === "request/header") {
       const provider = data.header && data.header.config ? data.header.config.provider : undefined;
-      if (typeof provider === "string" && provider.length > 0) lastHeaderProvider = provider;
+      if (typeof provider === "string" && provider.length > 0) {
+        lastHeaderProvider = provider;
+        routingCache = { at: 0, value: null };
+      }
     }
 
-    if (!perTurn) return;
+    if (!switches().perTurn) {
+      // 运行中关闭「单次」后不再保留旧的 lastTurn，避免重新开启时闪回过期金额。
+      lastTurn = null;
+      return;
+    }
     if (type === "turn/start") {
+      // 防御性上限：会话中途异常结束（没有 turn/end）时不让缓冲无限增长。
+      if (buffers.size >= MAX_BUFFERS && !buffers.has(sessionId)) {
+        const oldest = buffers.keys().next();
+        if (!oldest.done) buffers.delete(oldest.value);
+      }
       buffers.set(sessionId, createTurnBuffer(
         Number.isSafeInteger(data.turn) ? data.turn : undefined,
         eventTime(event)
@@ -749,8 +667,8 @@ function createCostService(ctx, config) {
   }
 
   return {
-    enabled,
-    perTurn,
+    isEnabled,
+    isPerTurn: () => switches().perTurn,
     refresh,
     stateValue,
     applyCorrection,
@@ -769,8 +687,7 @@ function makeCostStateHandler(ctx, service) {
   return async function handleCostState(req, res) {
     if (req.method !== "GET") {
       drainRequest(req);
-      res.writeHead(405, { allow: "GET" });
-      res.end();
+      sendMethodNotAllowed(res, "GET");
       return;
     }
     if (!isTrusted(req, ctx.webServer)) {
@@ -781,7 +698,7 @@ function makeCostStateHandler(ctx, service) {
     try {
       const url = new URL(req.url || "/", "http://x");
       const force = url.searchParams.get("refresh") === "1";
-      if (service.enabled) {
+      if (service.isEnabled()) {
         if (force) await service.refresh(true);
         else service.refresh(false).catch(() => {});
       }
@@ -799,8 +716,7 @@ function makeCostCorrectionHandler(ctx, service) {
   return async function handleCostCorrection(req, res) {
     if (req.method !== "POST") {
       drainRequest(req);
-      res.writeHead(405, { allow: "POST" });
-      res.end();
+      sendMethodNotAllowed(res, "POST");
       return;
     }
     if (!isTrusted(req, ctx.webServer)) {
@@ -882,16 +798,16 @@ function apply(ctx, config) {
 
   ctx.effect(() => {
     const offEvent = ctx.on("session/event", (session, event) => cost.onSessionEvent(session, event));
-    let timer = null;
-    if (cost.enabled) {
-      timer = setInterval(() => {
-        cost.refresh(false).catch(() => {});
-      }, COST_REFRESH_MIN_INTERVAL_MS);
-      if (typeof timer.unref === "function") timer.unref();
-    }
+    // 始终创建定时器，但每次触发都重新读开关：运行中关闭后不再取数，
+    // 重新打开后也无需重启即可恢复（默认开启时行为与旧版一致）。
+    const timer = setInterval(() => {
+      if (!cost.isEnabled()) return;
+      cost.refresh(false).catch(() => {});
+    }, COST_REFRESH_MIN_INTERVAL_MS);
+    if (typeof timer.unref === "function") timer.unref();
     return () => {
       if (typeof offEvent === "function") offEvent();
-      if (timer !== null) clearInterval(timer);
+      clearInterval(timer);
       cost.dispose();
     };
   }, "dsh-message-actions: cost service");

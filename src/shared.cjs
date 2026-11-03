@@ -102,6 +102,191 @@ function textOf(event) {
   }
 }
 
+/** 事件对应的角色（供 /messages 摘要与客户端槽位对齐）。 */
+function messageRoleOf(event) {
+  if (!event || typeof event !== 'object') return 'other';
+  switch (event.type) {
+    case 'user/message': return 'user';
+    case 'assistant/message': return 'assistant';
+    case 'tool/result': return 'tool';
+    case 'system/message': return 'system';
+    case 'developer/message': return 'developer';
+    default: return 'other';
+  }
+}
+
+/** 取事件的稳定消息 id（供客户端与辅助/答行槽位对齐）。 */
+function messageIdOf(event) {
+  if (!event || typeof event !== 'object' || !event.data) return undefined;
+  const data = event.data;
+  if (typeof data.id === 'string') return data.id;
+  if (data.message && typeof data.message.id === 'string') return data.message.id;
+  return undefined;
+}
+
+/** 取事件的用量摘要（答行统计 tokens 来源）；只回传 outputTokens。 */
+function usageSummaryOf(event) {
+  if (!event || typeof event !== 'object' || !event.data) return undefined;
+  const usage = event.data.usage;
+  if (!usage || typeof usage !== 'object') return undefined;
+  return usage.outputTokens !== undefined ? { outputTokens: usage.outputTokens } : undefined;
+}
+
+/**
+ * 取工具事件的 callId。
+ * 宿主工具行 DOM 的 `data-chat-node-key` = `9:tool-call<callId>`，
+ * callId 来自 `tool/call.data.callId` / `tool/result.data.message.source.callId`。
+ */
+function toolCallIdOf(event) {
+  if (!event || typeof event !== 'object' || !event.data) return undefined;
+  const data = event.data;
+  if (event.type === 'tool/result') {
+    const source = data.message && data.message.source;
+    if (source && typeof source.callId === 'string' && source.callId !== '') return source.callId;
+  }
+  if (event.type === 'tool/call' && typeof data.callId === 'string' && data.callId !== '') {
+    return data.callId;
+  }
+  return undefined;
+}
+
+/** 宿主工具节点 key 前缀（`conversationContextKey("tool-call", id)` = `9:tool-call<id>`）。 */
+const TOOL_NODE_KEY_PREFIX = '9:tool-call';
+
+/**
+ * 从宿主 DOM 的 `data-chat-node-key` 解析工具 callId。
+ * 这不是序号 / 坐标猜测：前缀与 key 构造规则来自宿主
+ * `conversationContextKey(kind, id) = ${kind.length}:${kind}${id}`，
+ * 而 id 就是服务端 `tool/call` 事件的 callId。
+ * @param {string} nodeKey
+ * @returns {string|null}
+ */
+function toolCallIdFromNodeKey(nodeKey) {
+  if (typeof nodeKey !== 'string' || !nodeKey.startsWith(TOOL_NODE_KEY_PREFIX)) return null;
+  const id = nodeKey.slice(TOOL_NODE_KEY_PREFIX.length);
+  return id.length > 0 ? id : null;
+}
+
+/**
+ * 从 DOM 上现存的工具节点 key 中，挑出应被隐藏的那些。
+ * 宿主切换会话 / 刷新会重建 DOM，新节点不带任何本地隐藏标记，
+ * 因此客户端每次重建后都要按墓碑里的 callId 重新判定一次。
+ * @param {string[]} nodeKeys 现存的 `data-chat-node-key`
+ * @param {string[]} callIds 墓碑覆盖的 callId（来自 /messages 的 goneTools）
+ * @returns {string[]} 需要隐藏的 nodeKey
+ */
+function toolNodeKeysToHide(nodeKeys, callIds) {
+  if (!Array.isArray(nodeKeys) || !Array.isArray(callIds) || callIds.length === 0) return [];
+  const gone = new Set();
+  for (const callId of callIds) {
+    if (typeof callId === 'string' && callId !== '') gone.add(callId);
+  }
+  if (gone.size === 0) return [];
+  const out = [];
+  for (const key of nodeKeys) {
+    const callId = toolCallIdFromNodeKey(key);
+    if (callId !== null && gone.has(callId)) out.push(key);
+  }
+  return out;
+}
+
+/** 在 /messages 摘要 rows 中找到 callId 对应的 tool/result 行（表面顺序第一条）。 */
+function findToolRowByCallId(rows, callId) {
+  if (!Array.isArray(rows) || typeof callId !== 'string' || callId === '') return null;
+  for (const row of rows) {
+    if (row && row.type === 'tool/result' && row.callId === callId) return row;
+  }
+  return null;
+}
+
+/**
+ * 汇总所有墓碑声明的 removed seq。
+ * 墓碑随事件日志一起持久化（带 surfaceOp），因此即使宿主重建表面时
+ * 没有重放 surfaceOp，或客户端拿到旧快照，这里仍能还原「哪些节点已被删」。
+ * @param events 按 seq 索引的事件数组
+ * @returns {Set<number>}
+ */
+function tombstonedSeqsOf(events) {
+  const hidden = new Set();
+  if (!Array.isArray(events)) return hidden;
+  for (const event of events) {
+    if (!isTombstone(event)) continue;
+    const removed = event.data && event.data.source && event.data.source.removed;
+    if (!Array.isArray(removed)) continue;
+    for (const seq of removed) {
+      if (Number.isSafeInteger(seq) && seq >= 0) hidden.add(seq);
+    }
+  }
+  return hidden;
+}
+
+/**
+ * 从 events + 表面节点得到「仍可见」的节点列表。
+ * 不信任宿主表面重放结果：被墓碑覆盖的 seq 一律剔除。
+ * @param events
+ * @param nodes
+ * @returns {number[]}
+ */
+function liveNodesOf(events, nodes) {
+  if (!Array.isArray(nodes)) return [];
+  const hidden = tombstonedSeqsOf(events);
+  if (hidden.size === 0) return nodes.slice();
+  return nodes.filter((seq) => !hidden.has(seq));
+}
+
+/**
+ * 已删除的工具行 callId 列表（供客户端在每次 DOM 重建后重新隐藏）。
+ * 工具行 DOM key = `9:tool-call<callId>`，因此只需 callId。
+ * @param events
+ * @returns {string[]}
+ */
+function goneToolsOf(events) {
+  const hidden = tombstonedSeqsOf(events);
+  const out = [];
+  const seen = new Set();
+  for (const seq of hidden) {
+    const event = events[seq];
+    if (!event) continue;
+    if (event.type !== 'tool/result' && event.type !== 'tool/call') continue;
+    const callId = toolCallIdOf(event);
+    if (typeof callId !== 'string' || callId === '' || seen.has(callId)) continue;
+    seen.add(callId);
+    out.push(callId);
+  }
+  return out;
+}
+
+/** 判断键盘事件目标是否为可编辑控件（输入框内 Enter 必须交给控件自己处理）。 */
+function isEditableTarget(target) {
+  if (!target || typeof target !== 'object') return false;
+  if (target.isContentEditable === true) return true;
+  const tag = typeof target.tagName === 'string' ? target.tagName.toUpperCase() : '';
+  return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT';
+}
+
+/**
+ * 浮层键盘行为判定（纯函数，供客户端与离线测试共用）。
+ *
+ * - 浮层未打开：一律 none（不拦截宿主快捷键）。
+ * - Esc：dismiss。
+ * - Enter：焦点在输入框 / 可编辑区域、或主操作不可用 / 正在执行时返回 none；
+ *   否则返回 primary。disabled 时客户端选择「什么都不做」，与点击禁用按钮一致。
+ * - 其它键：none。
+ *
+ * @param params {{ key?: string, target?: object, overlayOpen?: boolean, primaryEnabled?: boolean, busy?: boolean }}
+ * @returns {'none'|'dismiss'|'primary'}
+ */
+function resolveKeyAction(params) {
+  const opts = params || {};
+  if (opts.overlayOpen !== true) return 'none';
+  if (opts.key === 'Escape' || opts.key === 'Esc') return 'dismiss';
+  if (opts.key !== 'Enter') return 'none';
+  if (isEditableTarget(opts.target)) return 'none';
+  if (opts.busy === true) return 'none';
+  if (opts.primaryEnabled === false) return 'none';
+  return 'primary';
+}
+
 /** 去掉空白后的字符数（用于「答行统计」的“字数”）。 */
 function wordCount(text) {
   return String(text == null ? '' : text).replace(/\s/g, '').length;
@@ -181,6 +366,41 @@ function turnOf(turnIndex, seq) {
   return null;
 }
 
+/**
+ * 把轮次区间展开成 seq → turn 的 Map，避免逐条消息线性扫描 turnIndex。
+ * 结果必须与 turnOf(turnIndex, seq) 一致（见离线测试）。
+ * @param turnIndex buildTurnIndex 的返回值
+ * @returns {Map<number, number>}
+ */
+function buildTurnSeqMap(turnIndex) {
+  const map = new Map();
+  if (!Array.isArray(turnIndex)) return map;
+  for (const info of turnIndex) {
+    // 与 turnOf 的「按 startSeq 顺序取第一个命中」语义保持一致：
+    // 轮次区间若有重叠 / 嵌套，先出现的轮次优先，后出现的不得覆盖。
+    for (let seq = info.startSeq + 1; seq < info.endSeq; seq += 1) {
+      if (!map.has(seq)) map.set(seq, info.turn);
+    }
+  }
+  return map;
+}
+
+/** 一次构建轮次索引与 seq 映射，供 /messages 复用。 */
+function createTurnLookup(events) {
+  const index = buildTurnIndex(events);
+  return { index, seqTurn: buildTurnSeqMap(index) };
+}
+
+/** 从 lookup（或现建）取某 seq 所属轮次。 */
+function turnOfLookup(lookup, seq) {
+  if (lookup && lookup.seqTurn instanceof Map) {
+    const turn = lookup.seqTurn.get(seq);
+    return Number.isSafeInteger(turn) ? turn : null;
+  }
+  if (lookup && Array.isArray(lookup.index)) return turnOf(lookup.index, seq);
+  return null;
+}
+
 /** 返回同一 (turn, step) 的全部表面节点 seq（按出现顺序）。 */
 function stepNodesOf(events, nodes, turn, step) {
   const out = [];
@@ -213,7 +433,10 @@ function planAction(events, nodes, params) {
     return { ok: false, code: 'INVALID_REQUEST' };
   }
 
-  const idx = nodes.indexOf(targetSeq);
+  // 已写墓碑的节点不再可操作：宿主重建表面时可能仍把旧节点留在 nodes 里，
+  // 这里统一按「墓碑 → 可见集合」判定，避免对同一段内容重复撤回 / 重复删除。
+  const liveNodes = liveNodesOf(events, nodes);
+  const idx = liveNodes.indexOf(targetSeq);
   if (idx === -1) return { ok: false, code: 'TARGET_NOT_FOUND' };
   const evt = events[targetSeq];
   if (!evt) return { ok: false, code: 'TARGET_NOT_FOUND' };
@@ -234,8 +457,8 @@ function planAction(events, nodes, params) {
 
   // 删至末尾：从目标节点到 surface 末尾全部遮蔽。
   if (action === 'deleteFrom') {
-    const endSeq = nodes[nodes.length - 1];
-    return buildPlan(events, nodes, targetSeq, endSeq, evt.type, 'deleteFrom',
+    const endSeq = liveNodes[liveNodes.length - 1];
+    return buildPlan(events, liveNodes, targetSeq, endSeq, evt.type, 'deleteFrom',
       turnOf(turnIndex, targetSeq));
   }
 
@@ -243,10 +466,10 @@ function planAction(events, nodes, params) {
   if (evt.type === 'user/message') {
     const turn = turnOf(turnIndex, targetSeq);
     const plan = turn === null
-      ? buildPlan(events, nodes, targetSeq, targetSeq, evt.type, action, null)
+      ? buildPlan(events, liveNodes, targetSeq, targetSeq, evt.type, action, null)
       : (() => {
-          const span = turnSpan(events, nodes, turnIndex, turn);
-          return buildPlan(events, nodes, span.startSeq, span.endSeq, evt.type, action, turn);
+          const span = turnSpan(events, liveNodes, turnIndex, turn);
+          return buildPlan(events, liveNodes, span.startSeq, span.endSeq, evt.type, action, turn);
         })();
     // 撤回回填必须用被点的那条提问文本：轮次区间起点可能是运行时注入消息，
     // 不能取 startSeq 的正文，否则会把注入上下文回填到输入框。
@@ -261,16 +484,16 @@ function planAction(events, nodes, params) {
     if (!Number.isSafeInteger(turn) || !Number.isSafeInteger(step)) {
       return { ok: false, code: 'NOT_DELETABLE' };
     }
-    const stepNodes = stepNodesOf(events, nodes, turn, step);
+    const stepNodes = stepNodesOf(events, liveNodes, turn, step);
     if (stepNodes.length === 0) return { ok: false, code: 'TARGET_NOT_FOUND' };
     const start = stepNodes[0];
     const end = stepNodes[stepNodes.length - 1];
-    const startIdx = nodes.indexOf(start);
-    const endIdx = nodes.indexOf(end);
+    const startIdx = liveNodes.indexOf(start);
+    const endIdx = liveNodes.indexOf(end);
     for (let i = startIdx; i <= endIdx; i++) {
-      if (!stepNodes.includes(nodes[i])) return { ok: false, code: 'SPAN_NOT_CONTIGUOUS' };
+      if (!stepNodes.includes(liveNodes[i])) return { ok: false, code: 'SPAN_NOT_CONTIGUOUS' };
     }
-    return buildPlan(events, nodes, start, end, evt.type, action, turn);
+    return buildPlan(events, liveNodes, start, end, evt.type, action, turn);
   }
 
   return { ok: false, code: 'NOT_DELETABLE' };
@@ -297,6 +520,8 @@ function buildPlan(events, nodes, startSeq, endSeq, targetType, action, turn) {
   const via = targetType === 'user/message' ? 'user' :
     targetType === 'assistant/message' ? 'assistant' :
     targetType === 'tool/result' ? 'tool' : 'unknown';
+  const target = events[startSeq] || {};
+  const step = target.data && Number.isSafeInteger(target.data.step) ? target.data.step : undefined;
   return {
     ok: true,
     startSeq,
@@ -305,6 +530,7 @@ function buildPlan(events, nodes, startSeq, endSeq, targetType, action, turn) {
     kinds,
     via,
     turn,
+    step,
     refillText: action === 'recall' ? textOf(events[startSeq]) : null
   };
 }
@@ -317,18 +543,19 @@ function buildPlan(events, nodes, startSeq, endSeq, targetType, action, turn) {
  * 从活表面分离出「轮次」列表（排除墓碑与系统提示），供分享/导出使用。
  * @returns [{ turn, question, answer }]，按轮次升序。
  */
-function roundsOf(events, nodes) {
-  const turnIndex = buildTurnIndex(events);
+function roundsOf(events, nodes, lookup) {
+  const turns = lookup || createTurnLookup(events);
   const rounds = new Map();
   const ensure = (turn) => {
     if (!rounds.has(turn)) rounds.set(turn, { turn, question: '', answer: '' });
     return rounds.get(turn);
   };
-  for (const seq of nodes) {
+  // 不依赖宿主表面是否重放了 surfaceOp：被墓碑覆盖的节点一律不导出。
+  for (const seq of liveNodesOf(events, nodes)) {
     const evt = events[seq];
     if (!evt || isTombstone(evt)) continue;
     if (evt.type === 'user/message') {
-      const turn = turnOf(turnIndex, seq);
+      const turn = turnOfLookup(turns, seq);
       if (turn === null) continue; // 无轮次归属的游离消息不进导出
       // 运行时上下文 / 技能目录 / 时间上下文也是 user/message，但不算用户提问。
       const kind = evt.data && evt.data.source && evt.data.source.kind;
@@ -339,7 +566,7 @@ function roundsOf(events, nodes) {
       if (text && !r.question) r.question = text;
     } else if (evt.type === 'assistant/message') {
       const data = evt.data || {};
-      const turn = Number.isSafeInteger(data.turn) ? data.turn : turnOf(turnIndex, seq);
+      const turn = Number.isSafeInteger(data.turn) ? data.turn : turnOfLookup(turns, seq);
       if (turn === null) continue;
       const r = ensure(turn);
       const text = textOf(evt);
@@ -355,18 +582,93 @@ function roundsOf(events, nodes) {
  * 用于导航刻度隐藏（turnOutline 只看 turn/start，忽略 surfaceOp，必须靠客户端补齐）。
  * @returns 升序的轮次号数组。
  */
-function goneTurnsOf(events, nodes) {
-  const turnIndex = buildTurnIndex(events);
+function goneTurnsOf(events, nodes, lookup) {
+  const turns = lookup || createTurnLookup(events);
+  const turnIndex = turns.index;
   if (turnIndex.length === 0) return [];
   const live = new Set();
-  for (const seq of nodes) {
+  for (const seq of liveNodesOf(events, nodes)) {
     const evt = events[seq];
     if (!evt || isTombstone(evt)) continue;
     const data = evt.data || {};
-    const turn = Number.isSafeInteger(data.turn) ? data.turn : turnOf(turnIndex, seq);
+    const turn = Number.isSafeInteger(data.turn) ? data.turn : turnOfLookup(turns, seq);
     if (Number.isSafeInteger(turn)) live.add(turn);
   }
   return turnIndex.filter((info) => !live.has(info.turn)).map((info) => info.turn);
+}
+
+/**
+ * `/messages` 摘要快照：只返回预览、字数、用量与 callId，不返回正文。
+ * 分享图 / 导出需要全文时，走 `full=1&turns=a,b` 的按需接口（见 index.mjs）。
+ *
+ * @param events 按 seq 索引的事件数组
+ * @param nodes  当前 surface.nodes
+ * @param lookup createTurnLookup 的返回值（可缺省）
+ * @param options { filter?: Set<number>, previewLimit?: number }
+ * @returns {{ version: number, nodeCount: number, rows: Array, rounds: Array, goneTurns: number[] }}
+ */
+function messagesSummaryOf(events, nodes, lookup, options) {
+  const opts = options || {};
+  const turns = lookup || createTurnLookup(events);
+  const filter = opts.filter instanceof Set ? opts.filter : null;
+  const previewLimit = Number.isFinite(opts.previewLimit) && opts.previewLimit > 0
+    ? Math.floor(opts.previewLimit)
+    : 200;
+  const rows = [];
+  const rounds = new Map();
+  const ensure = (turn) => {
+    if (!rounds.has(turn)) rounds.set(turn, { turn, questionPreview: '', answerPreview: '' });
+    return rounds.get(turn);
+  };
+  const liveNodes = liveNodesOf(events, nodes);
+  for (const seq of liveNodes) {
+    const event = events[seq];
+    if (!event || isTombstone(event)) continue;
+    const data = event.data || {};
+    const explicitTurn = data.turn;
+    const turn = Number.isSafeInteger(explicitTurn) ? explicitTurn : turnOfLookup(turns, seq);
+    // 只有真实提问与助手回答进入预览：system / developer 消息、运行时注入的
+    // 上下文（user/message + 非 user 来源）与工具结果都不回传正文。
+    const isUserQuestion = event.type === 'user/message' &&
+      (data.source === undefined || data.source === null || data.source.kind === undefined || data.source.kind === 'user');
+    const isText = isUserQuestion || event.type === 'assistant/message';
+    const text = isText ? textOf(event) : '';
+    const summary = {
+      seq,
+      type: event.type,
+      id: messageIdOf(event),
+      turn,
+      step: data.step,
+      role: messageRoleOf(event),
+      sourceKind: (data.source && data.source.kind) || 'user',
+      preview: isText ? previewText(text, previewLimit) : '',
+      words: isText ? wordCount(text) : 0,
+      usage: usageSummaryOf(event),
+      callId: toolCallIdOf(event)
+    };
+    if (!filter || filter.has(seq)) rows.push(summary);
+
+    if (isUserQuestion) {
+      if (turn === null) continue;
+      const round = ensure(turn);
+      if (summary.preview && !round.questionPreview) round.questionPreview = summary.preview;
+    } else if (event.type === 'assistant/message') {
+      if (turn === null) continue;
+      const round = ensure(turn);
+      if (summary.preview) round.answerPreview = summary.preview;
+    }
+  }
+  const lastSeq = liveNodes.length > 0 ? liveNodes[liveNodes.length - 1] : 0;
+  return {
+    version: Number.isSafeInteger(lastSeq) ? lastSeq : 0,
+    nodeCount: liveNodes.length,
+    rows,
+    rounds: [...rounds.values()].sort((a, b) => a.turn - b.turn),
+    goneTurns: goneTurnsOf(events, nodes, turns),
+    // 客户端在每次 DOM 重建（切换会话 / 刷新）后据此重新隐藏工具行，
+    // 不能只在删除成功当下隐藏一次。
+    goneTools: goneToolsOf(events)
+  };
 }
 
 /** 生成本轮导出的 Markdown 文本（不含被删内容）。 */
@@ -399,7 +701,8 @@ function exportFilename(sessionId, date) {
   const d = date instanceof Date ? date : new Date();
   const pad = (n) => String(n).padStart(2, '0');
   const stamp = `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}`;
-  return `dsh-${sessionId}-${stamp}.md`;
+  const safeId = String(sessionId == null ? '' : sessionId).replace(/[^\w.-]/g, '_').slice(0, 64);
+  return `dsh-${safeId}-${stamp}.md`;
 }
 
 // ---------------------------------------------------------------------------
@@ -416,6 +719,29 @@ function railTurnOf(label) {
   if (!nums || nums.length === 0) return null;
   const value = parseInt(nums[nums.length - 1], 10);
   return Number.isFinite(value) ? value : null;
+}
+
+/**
+ * 导航刻度的轮号解析：`data-index` 语义未验证，只在它与 aria-label 结果
+ * 一致时才采用；不一致或缺失时完全回退到原有 railTurnOf，避免改变现状。
+ * @param dataIndex 元素 data-index 属性（可能是 0-based，未验证）
+ * @param label aria-label 文本
+ */
+function railTurnOfAttributes(dataIndex, label) {
+  const byLabel = railTurnOf(label);
+  const raw = typeof dataIndex === 'number'
+    ? String(dataIndex)
+    : (typeof dataIndex === 'string' ? dataIndex.trim() : '');
+  const byIndex = /^\d+$/.test(raw) ? parseInt(raw, 10) : null;
+  if (byIndex !== null && Number.isFinite(byIndex) && byIndex >= 1) {
+    if (byLabel === null) return byIndex;
+    // aria-label 可能同时含「第 N 问」与「共 M 轮」：与首个整数或旧解析结果
+    // 任一一致即可信；都不一致说明 data-index 语义不同（如 0-based），回退旧逻辑。
+    const nums = typeof label === 'string' ? label.match(/\d+/g) : null;
+    const first = nums && nums.length > 0 ? parseInt(nums[0], 10) : null;
+    if (byIndex === byLabel || byIndex === first) return byIndex;
+  }
+  return byLabel;
 }
 
 /**
@@ -778,6 +1104,36 @@ function routingOfProvider(provider) {
 }
 
 /**
+ * 费用卡片样式枚举。数组顺序即设置页选项顺序：单行样式排在第一位。
+ * 内部存储值沿用 `compact` / `default`，与旧版本配置兼容。
+ */
+const COST_LAYOUTS = ['compact', 'default'];
+const DEFAULT_COST_LAYOUT = 'compact';
+
+/**
+ * 把已保存 / 未配置的样式值归一为枚举值。
+ * 旧配置里的 `default` 保持不变（映射到「多行样式」），未知值回退到当前默认值。
+ * @param value 配置中的 costLayout
+ * @returns {'compact' | 'default'}
+ */
+function normalizeCostLayout(value) {
+  return value === 'default' ? 'default' : DEFAULT_COST_LAYOUT;
+}
+
+/**
+ * 费用相关开关的运行时视图：每次调用都重新读取 Config，默认值保持「开启」。
+ * @param config 宿主 Config（可能被配置通道原地更新）
+ * @returns {{ enabled: boolean, perTurn: boolean }}
+ */
+function costSwitches(config) {
+  const cfg = config || {};
+  return {
+    enabled: cfg.usageStats !== false,
+    perTurn: cfg.costPerTurn !== false
+  };
+}
+
+/**
  * 聚合一轮（turn/start…turn/end）内各 step 的 usage。
  * 每个 step 只取最后一个有效 assistant 结果（message 优先，其次 attempt），
  * 重试产生的多个 attempt 不重复累加；不同 route 的 step 分别成组，由调用方分价求和。
@@ -1092,6 +1448,65 @@ function easeOutCubic(t) {
 // 工具函数
 // ---------------------------------------------------------------------------
 
+/**
+ * 可取消的延迟执行器（DOM 观察器节流 / rAF 合并）。
+ * 定时/取消函数可注入，便于离线测试「卸载后不再执行」。
+ *
+ * @param run 到点执行的回调
+ * @param options { delay?: number, schedule?: (fn) => handle, cancel?: (handle) => void }
+ * @returns {{ request: () => boolean, dispose: () => void, disposed: boolean }}
+ */
+function createScheduler(run, options) {
+  const o = options || {};
+  const schedule = typeof o.schedule === 'function'
+    ? o.schedule
+    : (fn) => setTimeout(fn, Number.isFinite(o.delay) ? o.delay : 0);
+  const cancel = typeof o.cancel === 'function'
+    ? o.cancel
+    : (handle) => clearTimeout(handle);
+  let handle = null;
+  let disposed = false;
+
+  return {
+    request() {
+      if (disposed || handle !== null) return false;
+      handle = schedule(() => {
+        handle = null;
+        if (!disposed) run();
+      });
+      return true;
+    },
+    dispose() {
+      disposed = true;
+      if (handle !== null) {
+        try { cancel(handle); } catch { /* 已触发 */ }
+        handle = null;
+      }
+    },
+    get disposed() {
+      return disposed;
+    }
+  };
+}
+
+/**
+ * 请求代际栅栏：用于丢弃「后发先至」的旧快照。
+ * 每次 begin() 递增代号，只有最新代号的结果才允许写回。
+ * @returns {{ begin: () => number, isLatest: (token: number) => boolean }}
+ */
+function createRequestGate() {
+  let seq = 0;
+  return {
+    begin() {
+      seq += 1;
+      return seq;
+    },
+    isLatest(token) {
+      return token === seq;
+    }
+  };
+}
+
 /** HTML 转义（用于浮层内注入标题/正文）。 */
 function escapeHtml(value) {
   return String(value == null ? '' : value)
@@ -1128,6 +1543,7 @@ const ICONS = {
  */
 const CSS = `
 .dma-row-actions{display:inline-flex;align-items:center;gap:2px;vertical-align:middle}
+.dma-tool-actions{display:inline-flex;align-items:center;gap:2px;margin-inline-start:6px;vertical-align:middle}
 .dma-btn{display:inline-flex;align-items:center;justify-content:center;width:calc(28px + var(--dsh-content-font-delta,0px));height:calc(28px + var(--dsh-content-font-delta,0px));padding:0;border:0;border-radius:var(--dsw-radius-sm,6px);background:transparent;color:var(--dsw-alias-label-tertiary,#8a919e);cursor:pointer;line-height:1;transition:background 80ms ease,color 80ms ease}
 .dma-btn svg{display:block;width:calc(15px + var(--dsh-content-font-delta,0px));height:calc(15px + var(--dsh-content-font-delta,0px))}
 .dma-btn:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(0,0,0,.06));color:var(--dsw-alias-label-secondary,#5b6472)}
@@ -1158,6 +1574,7 @@ const CSS = `
 .dma-panel-foot .dma-primary{background:var(--dsw-alias-button-primary-fill,#4c8dff);color:var(--dsw-alias-label-primary-inverted,#fff);border-color:transparent}
 .dma-panel-foot .dma-primary.dma-danger{background:var(--dsw-alias-state-error-primary,#e5484d);color:#fff}
 .dma-panel-foot .dma-primary:disabled{background:var(--dsw-alias-bg-layer-2,#f2f3f5);color:var(--dsw-alias-label-dimmed,#a0a6b0)}
+.dma-panel-foot .dma-btn:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary,#4c8dff);outline-offset:2px}
 .dma-toast{position:fixed;left:50%;bottom:32px;transform:translateX(-50%);z-index:2147483100;padding:8px 16px;border-radius:999px;background:var(--dsw-alias-toast-bg,rgba(32,35,42,.96));box-shadow:0 6px 20px rgba(0,0,0,.22);font-size:12px;line-height:1.6;color:var(--dsw-alias-toast-label,#fff);pointer-events:none}
 `;
 
@@ -1171,22 +1588,42 @@ module.exports = {
   ERROR_LABELS,
   contentText,
   textOf,
+  messageRoleOf,
+  messageIdOf,
+  usageSummaryOf,
+  toolCallIdOf,
+  toolCallIdFromNodeKey,
+  toolNodeKeysToHide,
+  findToolRowByCallId,
+  tombstonedSeqsOf,
+  liveNodesOf,
+  goneToolsOf,
+  resolveKeyAction,
+  isEditableTarget,
+  TOOL_NODE_KEY_PREFIX,
   wordCount,
   previewText,
   formatTokens,
   isTombstone,
   buildTurnIndex,
+  buildTurnSeqMap,
+  createTurnLookup,
   turnOf,
+  turnOfLookup,
   stepNodesOf,
   planAction,
   turnSpan,
   buildPlan,
   roundsOf,
   goneTurnsOf,
+  messagesSummaryOf,
   markdownOf,
   exportFilename,
   railTurnOf,
+  railTurnOfAttributes,
   collapseRail,
+  createScheduler,
+  createRequestGate,
   escapeHtml,
   MAX_BODY_BYTES,
   isLoopbackHost,
@@ -1216,6 +1653,10 @@ module.exports = {
   routeOfMessage,
   routeOfUsage,
   routingOfProvider,
+  costSwitches,
+  COST_LAYOUTS,
+  DEFAULT_COST_LAYOUT,
+  normalizeCostLayout,
   normalizeCostUsage,
   stepUsageOf,
   deriveTurnUsage,

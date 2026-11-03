@@ -1,6 +1,6 @@
 {
   "name": "dsh-message-actions",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "消息费用：撤回、删除、删至末尾、分享、导出、回答统计与 DeepSeek 费用统计（DSH 插件）。",
   "private": true,
   "type": "module",
@@ -11,11 +11,16 @@
     "./locale/*.json": "./locale/*.json",
     "./icon": "./icon.svg"
   },
+  "scripts": {
+    "build": "node build.mjs",
+    "test": "node test/check.mjs"
+  },
   "files": [
     "lib/index.js",
     "lib/client.js",
     "lib/shared.cjs",
     "lib/store.cjs",
+    "lib/http.cjs",
     "cordis.patch.yml",
     "locale/*.json",
     "icon.svg"

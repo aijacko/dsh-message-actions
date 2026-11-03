@@ -6,6 +6,7 @@
 // 覆盖《开发需求与重写提示词.md》§7「离线测试必须覆盖」的全部行为。
 
 import { createRequire } from "node:module";
+import { fileURLToPath } from "node:url";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -13,6 +14,8 @@ import path from "node:path";
 const require = createRequire(import.meta.url);
 const s = require("../src/shared.cjs");
 const store = require("../src/store.cjs");
+const http = require("../src/http.cjs");
+const i18n = require("../src/i18n.cjs");
 
 const {
   planAction,
@@ -21,12 +24,37 @@ const {
   markdownOf,
   exportFilename,
   railTurnOf,
+  railTurnOfAttributes,
+  buildTurnIndex,
+  buildTurnSeqMap,
+  createTurnLookup,
+  turnOf,
+  turnOfLookup,
+  costSwitches,
+  createScheduler,
+  createRequestGate,
   collapseRail,
   isTombstone,
   textOf,
+  messageRoleOf,
+  messageIdOf,
+  usageSummaryOf,
+  toolCallIdOf,
+  toolCallIdFromNodeKey,
+  toolNodeKeysToHide,
+  findToolRowByCallId,
+  tombstonedSeqsOf,
+  liveNodesOf,
+  goneToolsOf,
+  resolveKeyAction,
+  TOOL_NODE_KEY_PREFIX,
+  messagesSummaryOf,
   wordCount,
   previewText,
   formatTokens,
+  COST_LAYOUTS,
+  DEFAULT_COST_LAYOUT,
+  normalizeCostLayout,
   isLoopbackHost,
   isTrustedRequest,
   statusCodeOf,
@@ -409,6 +437,136 @@ function makeEvents() {
   eq("roundsOf 首问末答 回答", rounds[0].answer, "最终回答");
   ok("roundsOf 不含注入上下文", !markdownOf(rounds, {}).includes("运行时注入上下文"));
   ok("roundsOf 不含中间步骤", !markdownOf(rounds, {}).includes("中间步骤"));
+}
+
+// ---------------------------------------------------------------------------
+// 15.1 /messages 摘要契约 + 工具行稳定映射
+// ---------------------------------------------------------------------------
+// 宿主工具行 DOM 的 data-chat-node-key = conversationContextKey("tool-call", id)
+// = `9:tool-call<id>`，id 来自服务端 tool/call / tool/result 的 callId。
+// 摘要行必须同时带 seq / callId，客户端才能从 DOM 稳定映射回服务端节点。
+
+{
+  const events = [
+    ev("system/message", { message: { content: [{ type: "text", text: "sys" }] } }),
+    ev("turn/start", { turn: 1 }),
+    ev("user/message", {
+      role: "user",
+      id: "u1",
+      content: [{ type: "text", text: "这是一个比较长的问题，用来验证预览截断行为。" }],
+      source: { kind: "user" }
+    }),
+    ev("tool/call", { callId: "call_abc" }),
+    ev("tool/result", {
+      turn: 1,
+      step: 1,
+      message: {
+        content: [{ type: "text", text: "工具输出的完整正文，不应进入摘要。" }],
+        source: { callId: "call_abc" }
+      }
+    }),
+    ev("assistant/message", {
+      turn: 1,
+      step: 2,
+      message: { id: "a1", content: [{ type: "text", text: "最终回答正文" }] },
+      usage: { inputTokens: 10, outputTokens: 321 }
+    }),
+    ev("turn/end", { turn: 1 })
+  ];
+  const { events: bag, nodes } = session(events);
+  const summary = messagesSummaryOf(bag, nodes, undefined, { previewLimit: 12 });
+
+  ok("摘要行不携带完整正文", summary.rows.every((row) => !Object.prototype.hasOwnProperty.call(row, "text")));
+  eq("摘要版本为最后一个表面 seq", summary.version, nodes[nodes.length - 1]);
+  eq("摘要节点数", summary.nodeCount, nodes.length);
+  eq("摘要轮次", summary.rounds.map((round) => round.turn), [1]);
+  ok("摘要轮次只有预览字段", summary.rounds.every((round) =>
+    !Object.prototype.hasOwnProperty.call(round, "question") &&
+    !Object.prototype.hasOwnProperty.call(round, "answer")
+  ));
+  ok("摘要问行预览已截断", /^…|…$/.test(summary.rounds[0].questionPreview));
+  eq("摘要答行预览", summary.rounds[0].answerPreview, "最终回答正文");
+
+  const userRow = summary.rows.find((row) => row.type === "user/message");
+  eq("摘要问行 words", userRow.words, wordCount("这是一个比较长的问题，用来验证预览截断行为。"));
+  eq("摘要问行 role", userRow.role, "user");
+  eq("摘要问行 id", userRow.id, "u1");
+
+  const toolRow = summary.rows.find((row) => row.type === "tool/result");
+  eq("摘要工具行 callId", toolRow.callId, "call_abc");
+  eq("摘要工具行 preview 为空", toolRow.preview, "");
+  eq("toolCallIdOf 从 tool/result 取 callId", toolCallIdOf(bag[4]), "call_abc");
+  eq("toolCallIdOf 从 tool/call 取 callId", toolCallIdOf(bag[3]), "call_abc");
+
+  const assistantRow = summary.rows.find((row) => row.type === "assistant/message");
+  eq("摘要答行用量", assistantRow.usage, { outputTokens: 321 });
+  eq("摘要答行 id", assistantRow.id, "a1");
+
+  eq("工具节点 key 前缀", TOOL_NODE_KEY_PREFIX, "9:tool-call");
+  eq("从宿主 node key 解析 callId", toolCallIdFromNodeKey("9:tool-callcall_abc"), "call_abc");
+  eq("空 callId 不解析", toolCallIdFromNodeKey("9:tool-call"), null);
+  eq("非工具节点不解析", toolCallIdFromNodeKey("9:assistant-messagea1"), null);
+
+  const found = findToolRowByCallId(summary.rows, "call_abc");
+  ok("按 callId 找到工具行", found !== null);
+  eq("工具行映射到服务端 seq", found.seq, 4);
+  eq("找不到 callId 返回 null", findToolRowByCallId(summary.rows, "missing"), null);
+
+  // 映射到 seq 后仍走服务端已有 step 删除分支：单工具行 = 该 step 的节点。
+  const plan = planAction(bag, nodes, { action: "delete", seq: found.seq });
+  ok("工具行删除返回 ok", plan.ok === true);
+  eq("工具行删除 via", plan.via, "tool");
+  eq("工具行删除 step", plan.step, 1);
+  eq("工具行删除 removed", plan.removed, [4]);
+  eq("工具行删除 turn", plan.turn, 1);
+
+  eq("messageRoleOf tool", messageRoleOf(bag[4]), "tool");
+  eq("messageIdOf 缺失返回 undefined", messageIdOf(bag[4]), undefined);
+  eq("usageSummaryOf 只回传 outputTokens", usageSummaryOf(bag[5]), { outputTokens: 321 });
+  eq("usageSummaryOf 非答行返回 undefined", usageSummaryOf(bag[2]), undefined);
+}
+
+// ---------------------------------------------------------------------------
+// 15.2 /messages 摘要只回传真实提问与回答预览
+// ---------------------------------------------------------------------------
+// system / developer 消息、运行时注入上下文（user/message + 非 user 来源）
+// 与工具结果都不得进入 rows 的 preview / words。
+
+{
+  const events = [
+    ev("system/message", { message: { content: [{ type: "text", text: "系统提示正文" }] } }),
+    ev("developer/message", { message: { content: [{ type: "text", text: "开发者提示正文" }] } }),
+    ev("turn/start", { turn: 1 }),
+    ev("user/message", {
+      role: "user",
+      id: "ctx",
+      content: [{ type: "text", text: "运行时注入上下文正文" }],
+      source: { kind: "runtime-context" }
+    }),
+    ev("user/message", { role: "user", id: "u1", content: [{ type: "text", text: "真正的问题" }], source: { kind: "user" } }),
+    ev("assistant/message", { turn: 1, step: 1, message: { content: [{ type: "text", text: "回答" }] } }),
+    ev("turn/end", { turn: 1 })
+  ];
+  const { events: bag, nodes } = session(events);
+  const summary = messagesSummaryOf(bag, nodes, undefined, { previewLimit: 200 });
+
+  const sysRow = summary.rows.find((row) => row.type === "system/message");
+  eq("system 行预览为空", sysRow.preview, "");
+  eq("system 行字数为零", sysRow.words, 0);
+  const devRow = summary.rows.find((row) => row.type === "developer/message");
+  eq("developer 行预览为空", devRow.preview, "");
+  eq("developer 行字数为零", devRow.words, 0);
+  const ctxRow = summary.rows.find((row) => row.id === "ctx");
+  eq("运行时注入行预览为空", ctxRow.preview, "");
+  eq("运行时注入行字数为零", ctxRow.words, 0);
+  const userRow = summary.rows.find((row) => row.id === "u1");
+  eq("真实提问仍有预览", userRow.preview, "真正的问题");
+  eq("摘要 rounds 只含真实问答应答", summary.rounds.length, 1);
+  eq("摘要 rounds 提问预览", summary.rounds[0].questionPreview, "真正的问题");
+  eq("摘要 rounds 回答预览", summary.rounds[0].answerPreview, "回答");
+  ok("摘要任何行都不含系统 / 开发者正文", !JSON.stringify(summary).includes("系统提示正文")
+    && !JSON.stringify(summary).includes("开发者提示正文")
+    && !JSON.stringify(summary).includes("运行时注入上下文正文"));
 }
 
 // ---------------------------------------------------------------------------
@@ -816,9 +974,25 @@ function bj(y, m, d, hh, mm) {
     ok("损坏文件改名保留", badFiles.length === 1);
 
     fs.writeFileSync(file, JSON.stringify(saved), "utf8");
+    const badBefore = fs.readdirSync(path.dirname(file)).filter((name) => name.includes(".bad-")).length;
     const tooLarge = store.loadCostState(file, undefined, 32);
-    eq("超大状态文件不解析", tooLarge.state.baselineBalanceCents, null);
-    eq("超大状态文件不算损坏", tooLarge.recovered, false);
+    eq("超大状态文件重建为默认状态", tooLarge.state.baselineBalanceCents, null);
+    eq("超大状态文件标记为已恢复", tooLarge.recovered, true);
+    eq("超大状态文件恢复可写", tooLarge.readOnly, false);
+    eq(
+      "超大状态文件已原子重建落盘",
+      JSON.parse(fs.readFileSync(file, "utf8")).version,
+      store.STATE_VERSION
+    );
+    eq(
+      "超大状态文件不新增 .bad 副本",
+      fs.readdirSync(path.dirname(file)).filter((name) => name.includes(".bad-")).length,
+      badBefore
+    );
+    // 重建后必须能继续正常持久化（不是本次运行只读）。
+    const rewritten = Object.assign(tooLarge.state, { baselineBalanceCents: 999 });
+    store.saveCostState(file, rewritten);
+    eq("重建后下一次写入成功", store.loadCostState(file).state.baselineBalanceCents, 999);
     ok("状态文件默认上限 4MB", store.MAX_STATE_BYTES === 4 * 1024 * 1024);
 
     const high = store.normalizeCostState({ version: 2, baselineBalanceCents: 100 });
@@ -845,6 +1019,656 @@ function bj(y, m, d, hh, mm) {
   eq("大小写与空白归一", s.routingOfProvider("  DeepSeek-Account "), "account");
   eq("空 provider", s.routingOfProvider(""), null);
   eq("非字符串 provider", s.routingOfProvider(undefined), null);
+}
+
+// ---------------------------------------------------------------------------
+// 32. 轮次索引：seq→turn 映射必须与旧 turnOf 逐条一致
+// ---------------------------------------------------------------------------
+
+{
+  const cases = [
+    session(makeEvents()).events,
+    [
+      ev("system/message", { message: { content: [{ type: "text", text: "sys" }] } }),
+      ev("turn/start", { turn: 1 }),
+      ev("user/message", { id: "u1", content: [{ type: "text", text: "Hi" }] }),
+      ev("turn/end", { turn: 1 })
+    ],
+    // 只有 turn/start、没有 turn/end：不应产生任何归属
+    [
+      ev("turn/start", { turn: 7 }),
+      ev("user/message", { id: "u1", content: [{ type: "text", text: "Hi" }] })
+    ],
+    // 交错的 turn/end 顺序（真实日志里可能因 flush 顺序出现）
+    [
+      ev("turn/start", { turn: 1 }),
+      ev("user/message", { id: "u1", content: [{ type: "text", text: "a" }] }),
+      ev("turn/start", { turn: 2 }),
+      ev("user/message", { id: "u2", content: [{ type: "text", text: "b" }] }),
+      ev("turn/end", { turn: 2 }),
+      ev("turn/end", { turn: 1 })
+    ],
+    // 稀疏数组：中间空 seq 不应影响映射
+    Object.assign([], {
+      0: ev("turn/start", { turn: 3 }),
+      2: ev("user/message", { id: "u3", content: [{ type: "text", text: "c" }] }),
+      4: ev("turn/end", { turn: 3 })
+    })
+  ];
+
+  for (const events of cases) {
+    const index = buildTurnIndex(events);
+    const lookup = createTurnLookup(events);
+    const seqMap = buildTurnSeqMap(index);
+    eq("lookup.index 与 buildTurnIndex 一致", lookup.index, index);
+    const last = events.length + 2;
+    for (let seq = 0; seq <= last; seq += 1) {
+      const legacy = turnOf(index, seq);
+      const viaMap = seqMap.has(seq) ? seqMap.get(seq) : null;
+      ok(`turnOfLookup 与旧实现一致 (seq=${seq})`, turnOfLookup(lookup, seq) === legacy);
+      ok(`buildTurnSeqMap 与旧实现一致 (seq=${seq})`, viaMap === legacy);
+    }
+  }
+
+  eq("turnOfLookup 空 lookup", turnOfLookup(null, 3), null);
+  eq("turnOfLookup 仅 index 回退", turnOfLookup({ index: buildTurnIndex(makeEvents()) }, 2), 1);
+}
+
+// ---------------------------------------------------------------------------
+// 33. 导航轮号：data-index 主路径 + aria-label 兜底（两条路径都覆盖）
+// ---------------------------------------------------------------------------
+
+{
+  // 一致 → 采用 data-index
+  eq("轮号：data-index 与 aria 一致", railTurnOfAttributes("3", "第 3 问，共 5 轮"), 3);
+  eq("轮号：英文一致", railTurnOfAttributes("12", "Turn 12"), 12);
+  // 不一致 → 完全回退旧实现（取 aria-label 最后一个整数）
+  eq("轮号：data-index 不一致回退旧解析", railTurnOfAttributes("9", "第 3 问，共 5 轮"), 5);
+  eq("轮号：data-index 为 0 回退 aria", railTurnOfAttributes("0", "第 3 问"), 3);
+  // 无 aria-label → 只能信 data-index
+  eq("轮号：仅 data-index", railTurnOfAttributes("4", null), 4);
+  eq("轮号：data-index 非数字", railTurnOfAttributes("abc", "第 6 问"), 6);
+  eq("轮号：数字类型 data-index", railTurnOfAttributes(8, "第 8 问"), 8);
+  // 两条都无有效值
+  eq("轮号：两路径皆空", railTurnOfAttributes(null, "no number"), null);
+  eq("轮号：0 且无 aria", railTurnOfAttributes("0", null), null);
+  // 旧行为必须原样保留：'第 10 问，共 5 轮' 仍取最后一个整数 5
+  eq("轮号：旧 aria 行为不变", railTurnOf("第 10 问，共 5 轮"), 5);
+  eq("轮号：无 data-index 时旧行为不变", railTurnOfAttributes(null, "第 10 问，共 5 轮"), 5);
+}
+
+// ---------------------------------------------------------------------------
+// 34. 费用开关：默认值不变，且运行时读取最新配置
+// ---------------------------------------------------------------------------
+
+{
+  eq("开关：空配置默认全开", costSwitches(undefined), { enabled: true, perTurn: true });
+  eq("开关：空对象默认全开", costSwitches({}), { enabled: true, perTurn: true });
+  eq("开关：显式 true", costSwitches({ usageStats: true, costPerTurn: true }), { enabled: true, perTurn: true });
+  eq("开关：总开关关闭", costSwitches({ usageStats: false }), { enabled: false, perTurn: true });
+  eq("开关：单次开关关闭", costSwitches({ costPerTurn: false }), { enabled: true, perTurn: false });
+  eq("开关：两者关闭", costSwitches({ usageStats: false, costPerTurn: false }), { enabled: false, perTurn: false });
+
+  // 运行时生效：同一个 config 对象被宿主改写后，下一次读取必须反映新值
+  const cfg = { usageStats: true, costPerTurn: true };
+  const before = costSwitches(cfg);
+  cfg.usageStats = false;
+  cfg.costPerTurn = false;
+  const after = costSwitches(cfg);
+  eq("开关：运行时关闭立即生效", after, { enabled: false, perTurn: false });
+  eq("开关：默认值未被污染", before, { enabled: true, perTurn: true });
+}
+
+// ---------------------------------------------------------------------------
+// 35. 调度器：卸载后必须取消待执行任务
+// ---------------------------------------------------------------------------
+
+{
+  let pending = null;
+  let cancelled = 0;
+  let runs = 0;
+  const scheduler = createScheduler(() => { runs += 1; }, {
+    schedule(fn) { pending = fn; return 7; },
+    cancel(handle) { ok("调度器取消句柄正确", handle === 7); cancelled += 1; }
+  });
+
+  ok("调度器首次 request", scheduler.request() === true);
+  ok("调度器合并重复 request", scheduler.request() === false);
+  pending();
+  eq("调度器到点执行一次", runs, 1);
+  ok("调度器未 dispose", scheduler.disposed === false);
+
+  // 执行后内部句柄应已清空，因此可以再次排期
+  ok("调度器执行后可再次 request", scheduler.request() === true);
+  scheduler.dispose();
+  eq("调度器 dispose 取消一次", cancelled, 1);
+  pending();
+  eq("调度器卸载后不再执行", runs, 1);
+  ok("调度器 disposed 标记", scheduler.disposed === true);
+  ok("调度器卸载后拒绝 request", scheduler.request() === false);
+
+  // 默认实现（setTimeout）也应能正常请求与取消，不依赖 fake timer
+  const real = createScheduler(() => { runs += 1; }, { delay: 0 });
+  ok("调度器默认实现 request", real.request() === true);
+  real.dispose();
+}
+
+// ---------------------------------------------------------------------------
+// 36. 请求代际栅栏：后发先至的旧快照必须被丢弃
+// ---------------------------------------------------------------------------
+
+{
+  const gate = createRequestGate();
+  const first = gate.begin();
+  const second = gate.begin();
+  ok("请求代际：第一条已过期", gate.isLatest(first) === false);
+  ok("请求代际：最新一条有效", gate.isLatest(second) === true);
+  const third = gate.begin();
+  ok("请求代际：再次发起后第二条过期", gate.isLatest(second) === false);
+  ok("请求代际：第三条有效", gate.isLatest(third) === true);
+  ok("请求代际：未知 token 拒绝", gate.isLatest(999) === false);
+}
+
+// ---------------------------------------------------------------------------
+// 37. HTTP：413 先排空请求体（content-length 与流式两条路径）
+// ---------------------------------------------------------------------------
+
+function fakeRes() {
+  return {
+    headersSent: false,
+    status: 0,
+    headers: null,
+    body: null,
+    writeHead(status, headers) {
+      this.status = status;
+      this.headers = headers;
+      this.headersSent = true;
+    },
+    end(body) {
+      this.body = body;
+    }
+  };
+}
+
+{
+  // 路径一：content-length 提前超限
+  const reqA = {
+    headers: { "content-length": String(s.MAX_BODY_BYTES + 100) },
+    resumeCalled: false,
+    resume() { this.resumeCalled = true; },
+    on() {}
+  };
+  const resA = fakeRes();
+  eq("413 超长 content-length 返回 null", await http.readJsonBody(reqA, resA), null);
+  eq("413 状态码", resA.status, 413);
+  ok("413 content-length 路径先排空", reqA.resumeCalled === true);
+  eq("413 错误码", JSON.parse(resA.body).error.code, "PAYLOAD_TOO_LARGE");
+  eq("413 安全头 no-store", resA.headers["cache-control"], "no-store");
+  eq("413 content-type", resA.headers["content-type"], "application/json; charset=utf-8");
+
+  // 路径二：流式读取累计超限
+  const big = Buffer.alloc(s.MAX_BODY_BYTES + 1, 0x20);
+  const reqB = {
+    headers: {},
+    resumeCalled: false,
+    resume() { this.resumeCalled = true; },
+    on() {},
+    async *[Symbol.asyncIterator]() {
+      yield big;
+    }
+  };
+  const resB = fakeRes();
+  eq("413 流式超限返回 null", await http.readJsonBody(reqB, resB), null);
+  eq("413 流式状态码", resB.status, 413);
+  ok("413 流式路径先排空", reqB.resumeCalled === true);
+
+  // 合法请求不应产生任何提前响应
+  const reqC = {
+    headers: { "content-length": "7" },
+    on() {},
+    async *[Symbol.asyncIterator]() {
+      yield Buffer.from('{"a":1}');
+    }
+  };
+  const resC = fakeRes();
+  eq("合法 JSON 正常解析", await http.readJsonBody(reqC, resC), { a: 1 });
+  eq("合法 JSON 不提前响应", resC.status, 0);
+  ok("合法 JSON 不排空", resC.headersSent === false);
+
+  // 非法 JSON → 400
+  const reqD = {
+    headers: {},
+    on() {},
+    async *[Symbol.asyncIterator]() {
+      yield Buffer.from("{");
+    }
+  };
+  const resD = fakeRes();
+  eq("非法 JSON 返回 null", await http.readJsonBody(reqD, resD), null);
+  eq("非法 JSON 400", resD.status, 400);
+  eq("非法 JSON 错误码", JSON.parse(resD.body).error.code, "INVALID_REQUEST");
+
+  // 405 也走统一 JSON 与安全头
+  const resE = fakeRes();
+  http.sendMethodNotAllowed(resE, "POST");
+  eq("405 状态码", resE.status, 405);
+  eq("405 allow 头", resE.headers.allow, "POST");
+  eq("405 错误码", JSON.parse(resE.body).error.code, "METHOD_NOT_ALLOWED");
+  eq("405 安全头 nosniff", resE.headers["x-content-type-options"], "nosniff");
+}
+
+// ---------------------------------------------------------------------------
+// 38. 本地化单一来源：zh / en 键一致，locale meta 与源码一致
+// ---------------------------------------------------------------------------
+
+{
+  const zhKeys = Object.keys(i18n.zh).sort();
+  const enKeys = Object.keys(i18n.en).sort();
+  eq("i18n zh / en 键完全一致", zhKeys, enKeys);
+  ok("i18n zh 非空", zhKeys.length > 50);
+  ok("i18n en 非空", enKeys.length > 50);
+  ok("i18n meta.zh.title", typeof i18n.meta.zh.title === "string" && i18n.meta.zh.title.length > 0);
+  ok("i18n meta.en.title", typeof i18n.meta.en.title === "string" && i18n.meta.en.title.length > 0);
+
+  const localeDir = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "locale");
+  for (const lang of ["zh", "en"]) {
+    const file = path.join(localeDir, lang + ".json");
+    const parsed = JSON.parse(fs.readFileSync(file, "utf8"));
+    eq(`locale/${lang}.json meta 与 i18n.cjs 同步`, parsed.meta, i18n.meta[lang]);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 39. 导出文件名：会话 id 不得含路径分隔符
+// ---------------------------------------------------------------------------
+
+{
+  const name = exportFilename("../../etc/passwd", new Date(2026, 10, 2, 12, 30));
+  ok("导出文件名无路径分隔符", !name.includes("/") && !name.includes("\\"));
+  ok("导出文件名以 dsh- 开头", name.startsWith("dsh-"));
+  ok("导出文件名以 .md 结尾", name.endsWith(".md"));
+  ok("导出文件名长度受限", name.length < 120);
+  ok("空 sessionId 可生成", exportFilename(null, new Date(2026, 10, 2, 12, 30)).endsWith(".md"));
+}
+
+// ---------------------------------------------------------------------------
+// 40. 计费样式默认值 / 选项顺序 / 旧配置映射 / 版本号注入
+// ---------------------------------------------------------------------------
+
+{
+  const rootDir = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+  const pkg = JSON.parse(fs.readFileSync(path.join(rootDir, "package.json"), "utf8"));
+  const indexSource = fs.readFileSync(path.join(rootDir, "src", "index.mjs"), "utf8");
+
+  // 默认值与顺序：内部存储值仍为 compact / default，只改可见顺序与默认。
+  eq("计费样式默认值为单行", DEFAULT_COST_LAYOUT, "compact");
+  eq("计费样式选项顺序为单行在前", COST_LAYOUTS, ["compact", "default"]);
+  eq("Config 计费样式默认单行", /costLayout:\s*z\.string\(\)\.default\("compact"\)\.volatile\(\)/.test(indexSource), true);
+  ok(
+    "Config 中计费样式排在单次消耗之前",
+    indexSource.indexOf("costLayout:") !== -1
+      && indexSource.indexOf("costPerTurn:") !== -1
+      && indexSource.indexOf("costLayout:") < indexSource.indexOf("costPerTurn:")
+  );
+
+  // 旧配置映射：已保存的 default 仍是多行，compact 仍是单行。
+  eq("旧配置 default 映射多行样式", normalizeCostLayout("default"), "default");
+  eq("旧配置 compact 映射单行样式", normalizeCostLayout("compact"), "compact");
+  eq("未配置时回退单行样式", normalizeCostLayout(undefined), DEFAULT_COST_LAYOUT);
+  eq("非法值回退单行样式", normalizeCostLayout("unknown"), DEFAULT_COST_LAYOUT);
+
+  // 可见文案：标签、描述与选项名必须与内部枚举一一对应。
+  eq("计费样式中文标签", i18n.zh["cost.settings.layout"], "计费样式");
+  eq("计费样式英文标签", i18n.en["cost.settings.layout"], "Style");
+  eq("单行样式中文文案", i18n.zh["cost.layout.compact"], "单行样式");
+  eq("单行样式英文文案", i18n.en["cost.layout.compact"], "Single-line");
+  eq("多行样式中文文案", i18n.zh["cost.layout.default"], "多行样式");
+  eq("多行样式英文文案", i18n.en["cost.layout.default"], "Multi-line");
+
+  // 版本号：源码保留占位符，构建产物必须换成 package.json 的 version。
+  const srcClient = fs.readFileSync(path.join(rootDir, "src", "client.js"), "utf8");
+  ok("客户端源码包含版本占位符", srcClient.includes("__DMA_VERSION__"));
+  const libClient = fs.readFileSync(path.join(rootDir, "lib", "client.js"), "utf8");
+  ok("构建产物注入 package.json 版本", libClient.includes(`const VERSION = "${pkg.version}";`));
+  ok("构建产物无 __DMA_VERSION__ 占位符", !libClient.includes("__DMA_VERSION__"));
+  ok("构建产物无 __DMA_BUILD_TIME__ 占位符", !libClient.includes("__DMA_BUILD_TIME__"));
+  ok(
+    "lib/index.js 与 src/index.mjs 一致",
+    fs.readFileSync(path.join(rootDir, "lib", "index.js"), "utf8")
+      === fs.readFileSync(path.join(rootDir, "src", "index.mjs"), "utf8")
+  );
+}
+
+// ---------------------------------------------------------------------------
+// 41. 删除 → 销毁会话控制器 → 重新拉 /messages：被删内容不得恢复
+// ---------------------------------------------------------------------------
+// 复现路径：删除工具行 → 切换对话（宿主卸载并重建 DOM / 丢弃控制器）→
+// 用同一 sessionId 重新拉 /messages。最坏情况是宿主重建表面时忽略 surfaceOp，
+// 原始节点仍在 nodes 里；/messages 必须按持久化墓碑的 removed 自行剔除。
+
+{
+  const events = [
+    ev("system/message", { message: { content: [{ type: "text", text: "sys" }] } }),
+    ev("turn/start", { turn: 1 }),
+    ev("user/message", { role: "user", id: "u1", content: [{ type: "text", text: "问题" }], source: { kind: "user" } }),
+    ev("assistant/message", { turn: 1, step: 1, message: { content: [{ type: "text", text: "答" }] } }),
+    ev("tool/call", { callId: "call_abc" }),
+    ev("tool/result", {
+      turn: 1,
+      step: 1,
+      message: { content: [{ type: "text", text: "工具结果" }], source: { callId: "call_abc" } }
+    }),
+    ev("turn/end", { turn: 1 })
+  ];
+  const { events: bag, nodes } = session(events);
+  const plan = planAction(bag, nodes, { action: "delete", seq: 5 });
+  eq("回归：工具行删除计划 ok", plan.ok, true);
+  eq("回归：工具行删除区间", plan.removed, [3, 5]);
+
+  // 与服务端 index.mjs 完全一致的墓碑字段（会随事件日志持久化）。
+  const tombSeq = bag.length;
+  bag.push({
+    type: "user/message",
+    seq: tombSeq,
+    data: {
+      role: "user",
+      id: "dma-test",
+      content: [{ type: "text", text: "[已删除]" }],
+      source: {
+        kind: "user",
+        producer: PRODUCER,
+        action: "delete",
+        via: "tool",
+        removed: plan.removed,
+        kinds: plan.kinds,
+        turn: plan.turn
+      }
+    },
+    sourceEventSeqs: plan.removed,
+    surfaceOp: { op: "replace", startSeq: plan.startSeq, endSeq: plan.endSeq }
+  });
+
+  // 模拟宿主重建表面时未重放 surfaceOp：原节点与墓碑同时出现在 nodes。
+  const staleNodes = nodes.concat([tombSeq]);
+  const refreshed = messagesSummaryOf(bag, staleNodes, undefined, { previewLimit: 200 });
+  ok(
+    "回归：切换回会话后摘要不再含被删工具行",
+    !refreshed.rows.some((row) => row.callId === "call_abc")
+  );
+  eq("回归：goneTools 含被删工具 callId", refreshed.goneTools, ["call_abc"]);
+  eq("liveNodesOf 剔除墓碑覆盖节点", liveNodesOf(bag, staleNodes).includes(5), false);
+  eq("goneToolsOf 只回 callId", goneToolsOf(bag), ["call_abc"]);
+  eq("tombstonedSeqsOf 覆盖区间", [...tombstonedSeqsOf(bag)].sort((a, b) => a - b), [3, 5]);
+
+  // 再拉一次（模拟第二次切回）：结果必须稳定。
+  const again = messagesSummaryOf(bag, staleNodes, undefined, { previewLimit: 200 });
+  eq("回归：重复拉取结果稳定", again.rows.length, refreshed.rows.length);
+  ok("回归：第二次拉取仍无被删工具行", !again.rows.some((row) => row.callId === "call_abc"));
+}
+
+{
+  // 整轮删除同样不能被「切回后旧表面」复活。
+  const { events: bag, nodes } = session(makeEvents());
+  const plan = planAction(bag, nodes, { action: "delete", seq: 8 });
+  eq("回归：整轮删除计划 ok", plan.ok, true);
+  const tombSeq = bag.length;
+  bag.push({
+    type: "user/message",
+    seq: tombSeq,
+    data: {
+      role: "user",
+      id: "dma-test-turn",
+      content: [{ type: "text", text: "[已删除]" }],
+      source: {
+        kind: "user",
+        producer: PRODUCER,
+        action: "delete",
+        via: "user",
+        removed: plan.removed,
+        kinds: plan.kinds,
+        turn: plan.turn
+      }
+    },
+    sourceEventSeqs: plan.removed,
+    surfaceOp: { op: "replace", startSeq: plan.startSeq, endSeq: plan.endSeq }
+  });
+  const staleNodes = nodes.concat([tombSeq]);
+  const refreshed = messagesSummaryOf(bag, staleNodes, undefined, { previewLimit: 200 });
+  ok("回归：整轮删除后摘要不含第二轮", !refreshed.rows.some((row) => row.turn === 2));
+  eq("回归：整轮删除记入 goneTurns", refreshed.goneTurns, [2]);
+  ok("回归：导出轮次也不含第二轮", !roundsOf(bag, staleNodes).some((round) => round.turn === 2));
+}
+
+// ---------------------------------------------------------------------------
+// 42. 浮层键盘判定：Enter 主操作 / Esc 关闭 / 输入框与 busy 不触发
+// ---------------------------------------------------------------------------
+
+{
+  const div = { tagName: "DIV" };
+  const input = { tagName: "INPUT" };
+  const area = { tagName: "TEXTAREA" };
+  const editable = { tagName: "DIV", isContentEditable: true };
+  const base = { overlayOpen: true, primaryEnabled: true, busy: false };
+  eq("浮层内 Enter 触发主操作", resolveKeyAction({ ...base, key: "Enter", target: div }), "primary");
+  eq("焦点在 input 时不触发", resolveKeyAction({ ...base, key: "Enter", target: input }), "none");
+  eq("焦点在 textarea 时不触发", resolveKeyAction({ ...base, key: "Enter", target: area }), "none");
+  eq("contenteditable 内不触发", resolveKeyAction({ ...base, key: "Enter", target: editable }), "none");
+  eq("busy 时不触发", resolveKeyAction({ ...base, busy: true, key: "Enter", target: div }), "none");
+  eq("主操作 disabled 时不触发", resolveKeyAction({ ...base, primaryEnabled: false, key: "Enter", target: div }), "none");
+  eq("Esc 关闭浮层", resolveKeyAction({ ...base, key: "Escape", target: div }), "dismiss");
+  eq("浮层未打开时不触发 Enter", resolveKeyAction({ ...base, overlayOpen: false, key: "Enter", target: div }), "none");
+  eq("浮层未打开时不处理 Esc", resolveKeyAction({ ...base, overlayOpen: false, key: "Escape", target: div }), "none");
+  eq("其它按键不触发", resolveKeyAction({ ...base, key: "a", target: div }), "none");
+}
+
+// ---------------------------------------------------------------------------
+// 43. 英文短文案长度上限（防止侧边栏 / 设置项再次溢出）
+// ---------------------------------------------------------------------------
+
+{
+  // 上限来自实测布局：侧边栏卡片标签 6、设置项标签 18、按钮 12。
+  const limits = [
+    ["cost.balance", 6],
+    ["cost.perTurn", 6],
+    ["cost.hide", 12],
+    ["btn.deleteTool", 12],
+    ["settings.confirm", 18],
+    ["cost.settings.layout", 8],
+    ["cost.settings.perTurn", 12],
+    ["cost.settings.autoClose", 12],
+    ["cost.settings.peakValley", 15],
+    ["cost.local", 20],
+    ["cost.correction.title", 20],
+    ["cost.correction.debit", 18],
+    ["cost.correction.preview", 18],
+    ["cost.correction.pending", 14],
+    ["pick.share", 12]
+  ];
+  for (const [key, max] of limits) {
+    const text = i18n.en[key];
+    ok(`英文文案 ${key} 不超过 ${max} 字符（实际 ${text.length}）`, text.length <= max);
+  }
+  // 中文文案不得因英文缩写而改动。
+  eq("中文余额标签未改", i18n.zh["cost.balance"], "余额");
+  eq("中文计费样式标签未改", i18n.zh["cost.settings.layout"], "计费样式");
+  eq("中文单次标签未改", i18n.zh["cost.perTurn"], "单次");
+}
+
+// ---------------------------------------------------------------------------
+// 44. 跨边界：撤回 / 删除后「刷新 / 切换会话」与「继续对话」
+// ---------------------------------------------------------------------------
+// 模拟方式：写墓碑（与 index.mjs 字段一致）→ 假设宿主重建表面时忽略
+// surfaceOp（staleNodes 同时含原节点与墓碑）→ 重新调用摘要 / 导出纯函数。
+// 这等价于「销毁 SessionController → 用同一 sessionId 再拉一次 /messages」，
+// 因为控制器只是快照的持有者，重建后的结果完全由这些纯函数决定。
+
+{
+  // —— 撤回整轮 → 刷新：内容不得恢复，原文仍可取回 ——
+  const { events: bag, nodes } = session(makeEvents());
+  const plan = planAction(bag, nodes, { action: "recall", seq: 2 });
+  eq("跨边界：撤回计划 ok", plan.ok, true);
+  eq("跨边界：撤回原文可取回", plan.refillText, "Hi");
+  const tombSeq = bag.length;
+  bag.push({
+    type: "user/message",
+    seq: tombSeq,
+    data: {
+      role: "user",
+      id: "dma-recall",
+      content: [{ type: "text", text: "[已撤回]" }],
+      source: {
+        kind: "user",
+        producer: PRODUCER,
+        action: "recall",
+        via: plan.via,
+        removed: plan.removed,
+        kinds: plan.kinds,
+        turn: plan.turn
+      }
+    },
+    sourceEventSeqs: plan.removed,
+    surfaceOp: { op: "replace", startSeq: plan.startSeq, endSeq: plan.endSeq }
+  });
+  const staleNodes = nodes.concat([tombSeq]);
+  const refreshed = messagesSummaryOf(bag, staleNodes, undefined, { previewLimit: 200 });
+  ok("跨边界：撤回后刷新不再有第一轮行", !refreshed.rows.some((row) => row.turn === 1));
+  eq("跨边界：撤回后刷新 goneTurns", refreshed.goneTurns, [1]);
+  eq("跨边界：撤回后导出轮次只剩第二轮", roundsOf(bag, staleNodes).map((r) => r.turn), [2]);
+  ok("跨边界：撤回原文不出现在导出", !markdownOf(roundsOf(bag, staleNodes), {}).includes("Hello"));
+  // 重复撤回：已墓碑节点从可见集合移除，必须拒绝而不是写第二块墓碑。
+  eq(
+    "跨边界：重复撤回被拒绝",
+    planAction(bag, staleNodes, { action: "recall", seq: 2 }).code,
+    "TARGET_NOT_FOUND"
+  );
+}
+
+{
+  // —— 删除工具行 → 继续对话（新轮次）→ 再删另一步 ——
+  const { events: bag, nodes } = session(makeEvents());
+  // 给工具结果补上宿主真实字段（message.source.callId），才能按 callId 重放隐藏。
+  bag[4].data.message.source = { kind: "tool", callId: "call_abc" };
+  const first = planAction(bag, nodes, { action: "delete", seq: 4 });
+  eq("跨边界：工具行删除 ok", first.ok, true);
+  const firstTomb = bag.length;
+  bag.push({
+    type: "user/message",
+    seq: firstTomb,
+    data: {
+      role: "user",
+      id: "dma-tool-1",
+      content: [{ type: "text", text: "[已删除]" }],
+      source: {
+        kind: "user",
+        producer: PRODUCER,
+        action: "delete",
+        via: "tool",
+        removed: first.removed,
+        kinds: first.kinds,
+        turn: first.turn
+      }
+    },
+    sourceEventSeqs: first.removed,
+    surfaceOp: { op: "replace", startSeq: first.startSeq, endSeq: first.endSeq }
+  });
+
+  bag.push(ev("turn/start", { turn: 3 }));
+  const q3 = bag.length;
+  bag.push(ev("user/message", {
+    role: "user",
+    id: "u3",
+    content: [{ type: "text", text: "第三问" }],
+    source: { kind: "user" }
+  }));
+  const a3 = bag.length;
+  bag.push(ev("assistant/message", {
+    turn: 3,
+    step: 1,
+    message: { content: [{ type: "text", text: "第三答" }] }
+  }));
+  bag.push(ev("turn/end", { turn: 3 }));
+
+  const nodes2 = nodes.concat([q3, a3]);
+  const second = planAction(bag, nodes2, { action: "delete", seq: a3 });
+  eq("跨边界：续聊后删除另一步 ok", second.ok, true);
+  eq("跨边界：续聊后删除区间只含该答行", second.removed, [a3]);
+  const secondTomb = bag.length;
+  bag.push({
+    type: "user/message",
+    seq: secondTomb,
+    data: {
+      role: "user",
+      id: "dma-tool-2",
+      content: [{ type: "text", text: "[已删除]" }],
+      source: {
+        kind: "user",
+        producer: PRODUCER,
+        action: "delete",
+        via: "assistant",
+        removed: second.removed,
+        kinds: second.kinds,
+        turn: second.turn
+      }
+    },
+    sourceEventSeqs: second.removed,
+    surfaceOp: { op: "replace", startSeq: second.startSeq, endSeq: second.endSeq }
+  });
+
+  const stale2 = nodes2.concat([firstTomb, secondTomb]);
+  const summary = messagesSummaryOf(bag, stale2, undefined, { previewLimit: 200 });
+  ok("跨边界：两次删除后刷新仍无被删工具行", !summary.rows.some((row) => row.callId === "call_abc"));
+  eq("跨边界：多次删除后 goneTools 仍只含一遍", summary.goneTools, ["call_abc"]);
+  ok("跨边界：续聊新提问保留", summary.rows.some((row) => row.seq === q3));
+  ok("跨边界：第二次删除的答行已消失", !summary.rows.some((row) => row.seq === a3));
+  eq("跨边界：轮次仍活着时 goneTurns 为空", summary.goneTurns, []);
+  const rounds = roundsOf(bag, stale2);
+  eq("跨边界：第一轮仍保留最后一条回答", rounds[0].answer, "Done");
+  eq("跨边界：第三轮提问保留", rounds[2].question, "第三问");
+  eq("跨边界：第三轮回答已删空", rounds[2].answer, "");
+  ok("跨边界：导出不含第二次删除的正文", !markdownOf(rounds, {}).includes("第三答"));
+}
+
+{
+  // —— DOM 重建后的工具行重放：按 callId 选中新节点的 nodeKey ——
+  const keys = [
+    TOOL_NODE_KEY_PREFIX + "call_abc",
+    TOOL_NODE_KEY_PREFIX + "call_live",
+    "9:assistant-messagex"
+  ];
+  eq("跨边界：重建后只隐藏被删工具行", toolNodeKeysToHide(keys, ["call_abc"]), [keys[0]]);
+  eq("跨边界：无墓碑时不隐藏任何行", toolNodeKeysToHide(keys, []), []);
+  eq("跨边界：隐藏其它已删工具行", toolNodeKeysToHide(keys, ["call_live"]), [keys[1]]);
+  eq("跨边界：空节点列表返回空", toolNodeKeysToHide([], ["call_abc"]), []);
+}
+
+{
+  // —— 空会话 / 超长文本预览截断 ——
+  const empty = messagesSummaryOf([], []);
+  eq("跨边界：空会话 version", empty.version, 0);
+  eq("跨边界：空会话 nodeCount", empty.nodeCount, 0);
+  eq("跨边界：空会话 rows", empty.rows, []);
+  eq("跨边界：空会话 rounds", empty.rounds, []);
+  eq("跨边界：空会话 goneTurns", empty.goneTurns, []);
+  eq("跨边界：空会话 goneTools", empty.goneTools, []);
+
+  const longQ = "问".repeat(500);
+  const longA = "答".repeat(600);
+  const longEvents = [
+    ev("system/message", { message: { content: [{ type: "text", text: "sys" }] } }),
+    ev("turn/start", { turn: 1 }),
+    ev("user/message", { role: "user", id: "uq", content: [{ type: "text", text: longQ }], source: { kind: "user" } }),
+    ev("assistant/message", { turn: 1, step: 1, message: { content: [{ type: "text", text: longA }] } }),
+    ev("turn/end", { turn: 1 })
+  ];
+  const { events: bag, nodes } = session(longEvents);
+  const summary = messagesSummaryOf(bag, nodes, undefined, { previewLimit: 200 });
+  const qRow = summary.rows.find((row) => row.type === "user/message");
+  const aRow = summary.rows.find((row) => row.type === "assistant/message");
+  ok("跨边界：超长提问预览被截断", qRow.preview.length <= 201 && qRow.preview.endsWith("…"));
+  ok("跨边界：超长回答预览被截断", aRow.preview.length <= 201 && aRow.preview.endsWith("…"));
+  eq("跨边界：摘要仍回传完整字数", [qRow.words, aRow.words], [500, 600]);
+  const rounds = roundsOf(bag, nodes);
+  eq("跨边界：分享/导出拿到全文", [rounds[0].question.length, rounds[0].answer.length], [500, 600]);
 }
 
 // ---------------------------------------------------------------------------

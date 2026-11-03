@@ -26,8 +26,12 @@ window.__ModuleLoader__.load({
       PRIMITIVES = null;
     }
 
-    const shared = /*__DMA_SHARED__*/;
+    // 占位符写成合法表达式，保证 src/client.js 可被 lint/typecheck 直接解析；
+    // build.mjs 会把 `null` 整体替换为 shared.cjs 的 IIFE。
+    const shared = /*__DMA_SHARED__*/ null;
     const BUILD = "__DMA_BUILD_TIME__";
+    // 构建时由 build.mjs 用 package.json 的 version 替换，避免设置页显示旧版本。
+    const VERSION = "__DMA_VERSION__";
 
     if (typeof console !== "undefined" && typeof console.info === "function") {
       console.info("[dsh-message-actions] build", BUILD);
@@ -40,10 +44,14 @@ window.__ModuleLoader__.load({
       escapeHtml,
       markdownOf,
       exportFilename,
-      wordCount,
-      previewText,
+      toolCallIdFromNodeKey,
+      toolNodeKeysToHide,
+      findToolRowByCallId,
+      resolveKeyAction,
       formatTokens,
-      railTurnOf,
+      railTurnOfAttributes,
+      createScheduler,
+      createRequestGate,
       formatCents,
       formatYuanCents,
       formatCostMicros,
@@ -52,7 +60,10 @@ window.__ModuleLoader__.load({
       autoCloseAt,
       easeOutCubic,
       validateCorrectionAmount,
-      yuanToCents
+      yuanToCents,
+      COST_LAYOUTS,
+      DEFAULT_COST_LAYOUT,
+      normalizeCostLayout
     } = shared;
 
     const NS = "dsh-message-actions";
@@ -61,189 +72,11 @@ window.__ModuleLoader__.load({
     // 本地化字典（客户端 UI 文案）
     // -------------------------------------------------------------------------
 
-    const zh = {
-      nav: "消息费用",
-      "btn.recall": "撤回",
-      "btn.share": "分享",
-      "btn.export": "导出",
-      "btn.delete": "删除",
-      "btn.deleteFrom": "删至末尾",
-      "confirm.title": "确认操作",
-      "confirm.recall": "撤回该提问及其整轮回答？原文将回填到输入框。",
-      "confirm.delete": "删除该提问及其整轮回答？删除后不可恢复。",
-      "confirm.deleteFrom": "删除从该提问到对话末尾的全部内容？删除后不可恢复。",
-      "confirm.step": "删除该回答及其工具结果？删除后不可恢复。",
-      "confirm.ok": "确认",
-      "confirm.cancel": "取消",
-      "pick.title.share": "选择对话",
-      "pick.title.export": "导出对话",
-      "pick.all": "全选",
-      "pick.cancel": "取消",
-      "pick.share": "生成图片",
-      "pick.export": "导出",
-      "pick.turn": "问",
-      "pick.answer": "答",
-      "pick.session": "会话",
-      "export.title": "导出对话",
-      "toast.empty": "没有可导出的内容",
-      "toast.busy": "正在生成回复，请稍后再试",
-      "toast.failed": "操作失败",
-      "toast.tooMuch": "内容过多，无法生成图片",
-      "stats.unit": "字",
-      "stats.title": "回答 {tokens} tokens · {words} 字",
-      "settings.recall": "撤回",
-      "settings.recallDesc": "把自己发错的消息撤回（整轮），原文回填输入框",
-      "settings.share": "分享",
-      "settings.shareDesc": "选择对话并生成分享图片",
-      "settings.export": "导出",
-      "settings.exportDesc": "在问行提供入口，选择对话后导出 Markdown",
-      "settings.delete": "删除",
-      "settings.deleteDesc": "在问行删除整轮对话",
-      "settings.deleteFrom": "删至末尾",
-      "settings.deleteFromDesc": "从该条起截断到会话末尾",
-      "settings.confirm": "操作确认",
-      "settings.confirmDesc": "撤回/删除前弹出确认框；关闭后直接执行",
-      "settings.stats": "回答统计",
-      "settings.statsDesc": "答行显示本次回答的 tokens 与字数",
-      "settings.soon": "即将推出",
-      "settings.saveFailed": "无法保存设置",
-      "cost.tab.actions": "消息操作",
-      "cost.tab.billing": "费用统计",
-      "cost.balance": "余额",
-      "cost.daily": "日用",
-      "cost.perTurn": "单次",
-      "cost.peak": "高峰价",
-      "cost.valley": "谷价",
-      "cost.title": "费用统计卡片",
-      "cost.refresh": "刷新余额",
-      "cost.refreshing": "正在刷新余额",
-      "cost.pending": "待核对",
-      "cost.pendingTitle": "余额有增加，请到 设置 → 消息费用 → 费用统计 → 余额校正 核对",
-      "cost.signedOut": "未登录",
-      "cost.apiKey": "API key",
-      "cost.unavailable": "不可用",
-      "cost.local": "本地模型 · 无需计费",
-      "cost.stale": "沿用中",
-      "cost.staleTitle": "最近更新 {time}",
-      "cost.railTitle": "余额 {balance}",
-      "cost.hide": "隐藏单次",
-      "cost.settings.usageStats": "费用统计",
-      "cost.settings.usageStatsDesc": "侧边栏显示余额 / 日用 / 单次",
-      "cost.settings.perTurn": "单次消耗",
-      "cost.settings.perTurnDesc": "每轮对话结束后显示本轮换算金额",
-      "cost.settings.autoClose": "自动关闭",
-      "cost.settings.autoCloseDesc": "本轮金额显示多少秒后整组隐藏（0 = 不自动关闭）",
-      "cost.settings.peakValley": "峰谷定价行",
-      "cost.settings.peakValleyDesc": "在卡片中显示当前高峰 / 谷价与下一跳时间",
-      "cost.settings.layout": "界面样式",
-      "cost.settings.layoutDesc": "默认界面带背景与峰谷文字行；简洁界面去背景、单行居左",
-      "cost.layout.default": "默认界面",
-      "cost.layout.compact": "简洁界面",
-      "cost.correction.title": "余额校正（DeepSeek 账户口径）",
-      "cost.correction.credit": "实际累计到账",
-      "cost.correction.debit": "非调用扣减",
-      "cost.correction.preview": "校正后余额（推导）",
-      "cost.correction.pending": "待核对调整",
-      "cost.correction.save": "保存校正",
-      "cost.correction.saving": "保存中…",
-      "cost.correction.invalid": "金额不合法：最多两位小数、≥ 0、≤ 10000000",
-      "cost.correction.failed": "保存失败，请稍后再试",
-      "cost.correction.negative": "与账户实际余额差异较大，请复核校正值",
-      "cost.correction.yuan": "¥",
-      "cost.note": "「单次」按官方价目换算，「日用」按账户额度实际下降观测；两者口径不同，不要求逐轮对齐。"
-    };
+    // 文案单一来源：src/i18n.cjs（构建时内联为 IIFE，同时生成 locale/*.json）。
+    const I18N = /*__DMA_I18N__*/ null;
 
-    const en = {
-      nav: "Messages & Cost",
-      "btn.recall": "Recall",
-      "btn.share": "Share",
-      "btn.export": "Export",
-      "btn.delete": "Delete",
-      "btn.deleteFrom": "Delete to end",
-      "confirm.title": "Confirm action",
-      "confirm.recall": "Recall this question and its whole reply? The text will be restored to the composer.",
-      "confirm.delete": "Delete this question and its whole reply? This cannot be undone.",
-      "confirm.deleteFrom": "Delete everything from this question to the end? This cannot be undone.",
-      "confirm.step": "Delete this answer and its tool results? This cannot be undone.",
-      "confirm.ok": "Confirm",
-      "confirm.cancel": "Cancel",
-      "pick.title.share": "Choose conversations",
-      "pick.title.export": "Export conversations",
-      "pick.all": "Select all",
-      "pick.cancel": "Cancel",
-      "pick.share": "Generate image",
-      "pick.export": "Export",
-      "pick.turn": "Q",
-      "pick.answer": "A",
-      "pick.session": "Session",
-      "export.title": "Exported conversations",
-      "toast.empty": "Nothing to export",
-      "toast.busy": "A reply is being generated; try again later",
-      "toast.failed": "Operation failed",
-      "toast.tooMuch": "Too much content to render as an image",
-      "stats.unit": "chars",
-      "stats.title": "Reply {tokens} tokens · {words} chars",
-      "settings.recall": "Recall",
-      "settings.recallDesc": "Recall a message you sent (whole turn); the text returns to the composer",
-      "settings.share": "Share",
-      "settings.shareDesc": "Choose conversations and generate a share image",
-      "settings.export": "Export",
-      "settings.exportDesc": "Offer an entry on question rows; export selected conversations as Markdown",
-      "settings.delete": "Delete",
-      "settings.deleteDesc": "Delete a whole exchange from the question row",
-      "settings.deleteFrom": "Delete to end",
-      "settings.deleteFromDesc": "Truncate the session from this message onward",
-      "settings.confirm": "Action confirmation",
-      "settings.confirmDesc": "Ask before recall/delete; when off, actions run immediately",
-      "settings.stats": "Reply statistics",
-      "settings.statsDesc": "Show tokens and character count on reply rows",
-      "settings.soon": "Coming soon",
-      "settings.saveFailed": "Could not save the setting",
-      "cost.tab.actions": "Message Actions",
-      "cost.tab.billing": "Cost Statistics",
-      "cost.balance": "Balance",
-      "cost.daily": "Today",
-      "cost.perTurn": "Last turn",
-      "cost.peak": "Peak",
-      "cost.valley": "Off-peak",
-      "cost.title": "Cost statistics card",
-      "cost.refresh": "Refresh balance",
-      "cost.refreshing": "Refreshing balance",
-      "cost.pending": "Check",
-      "cost.pendingTitle": "Balance increased. Review it in Settings → Messages & Cost → Cost Statistics → Balance correction.",
-      "cost.signedOut": "Signed out",
-      "cost.apiKey": "API key",
-      "cost.unavailable": "Unavailable",
-      "cost.local": "Local model · no billing",
-      "cost.stale": "Cached",
-      "cost.staleTitle": "Last updated {time}",
-      "cost.railTitle": "Balance {balance}",
-      "cost.hide": "Hide last turn",
-      "cost.settings.usageStats": "Cost statistics",
-      "cost.settings.usageStatsDesc": "Show balance / today / last turn in the sidebar",
-      "cost.settings.perTurn": "Per-turn cost",
-      "cost.settings.perTurnDesc": "Show the converted cost of each finished turn",
-      "cost.settings.autoClose": "Auto close",
-      "cost.settings.autoCloseDesc": "Seconds before the last-turn group hides (0 = never)",
-      "cost.settings.peakValley": "Peak / off-peak row",
-      "cost.settings.peakValleyDesc": "Show current pricing period and the next switch",
-      "cost.settings.layout": "Layout",
-      "cost.settings.layoutDesc": "Default shows a card with a period line; compact is transparent and left-aligned",
-      "cost.layout.default": "Default",
-      "cost.layout.compact": "Compact",
-      "cost.correction.title": "Balance correction (DeepSeek account basis)",
-      "cost.correction.credit": "Total credited",
-      "cost.correction.debit": "Non-usage deductions",
-      "cost.correction.preview": "Corrected balance (derived)",
-      "cost.correction.pending": "Unchecked adjustment",
-      "cost.correction.save": "Save correction",
-      "cost.correction.saving": "Saving…",
-      "cost.correction.invalid": "Invalid amount: at most two decimals, ≥ 0, ≤ 10000000",
-      "cost.correction.failed": "Could not save; try again later",
-      "cost.correction.negative": "Far from the actual balance; please review the correction values",
-      "cost.correction.yuan": "¥",
-      "cost.note": "Per-turn uses official list prices; today is observed from the actual account balance drop. They use different bases and need not match turn by turn."
-    };
+    const zh = I18N.zh;
+    const en = I18N.en;
 
     const DICTS = { zh, en };
 
@@ -530,6 +363,23 @@ window.__ModuleLoader__.load({
       return controller;
     }
 
+    /**
+     * 回收已从 DOM 消失的会话控制器：快照里含完整正文，长期累积会占用内存。
+     * 只删除当前页面找不到对应容器且没有在途请求的控制器，避免误删正在切换的会话。
+     */
+    function evictStaleControllers() {
+      if (typeof document === "undefined" || controllers.size === 0) return;
+      const alive = new Set();
+      for (const el of document.querySelectorAll("[data-conversation-session]")) {
+        const id = el.getAttribute("data-conversation-session");
+        if (id) alive.add(id);
+      }
+      for (const [id, controller] of controllers) {
+        if (alive.has(id) || controller.messagesPromise) continue;
+        controllers.delete(id);
+      }
+    }
+
     class SessionController {
       constructor(ctx, sessionId) {
         this.ctx = ctx;
@@ -539,6 +389,7 @@ window.__ModuleLoader__.load({
         this.messagesPromise = null;
         this.fetchedAt = 0; // 上次成功拉取快照的时间，用于 TTL 失效（避免永久缓存旧对话）
         this.hiddenTurns = new Set(); // 乐观隐藏的轮次（本地，用于导航与导出过滤）
+        this.requestGate = createRequestGate(); // 丢弃后发先至的旧快照
         this.data = createStore({ messages: null, hidden: [] });
         this.overlay = createStore({ view: null });
       }
@@ -569,16 +420,21 @@ window.__ModuleLoader__.load({
         const TTL = 3000;
         if (!force && this.messages && Date.now() - this.fetchedAt < TTL) return this.messages;
         if (this.messagesPromise && !force) return this.messagesPromise;
+        // force 会绕过在途请求；用代际栅栏保证只有最新请求能写回快照。
+        const token = this.requestGate.begin();
         const promise = (async () => {
           try {
             const { data } = await getJson(
               "/dsh-message-actions/messages",
               "sessionId=" + encodeURIComponent(this.sessionId)
             );
-            if (data && data.ok && data.value) {
+            if (data && data.ok && data.value && this.requestGate.isLatest(token)) {
               this.messages = data.value;
               this.fetchedAt = Date.now();
               this.refreshData();
+              // 切换会话 / 刷新后重新挂载的 DOM 没有 data-dma-hidden，
+              // 拿到最新快照后立刻按 goneTurns / goneTools 重放隐藏。
+              syncRail();
             }
             return this.messages;
           } finally {
@@ -587,6 +443,29 @@ window.__ModuleLoader__.load({
         })();
         this.messagesPromise = promise;
         return promise;
+      }
+
+      /**
+       * 按需拉取指定轮次的完整正文（分享图 / 导出使用）。
+       * 摘要轮询不带正文，避免每 3 秒传整份对话；这里只拉用户实际选中的轮次。
+       * @param {number[]} turns
+       * @returns {Promise<Array<{ turn, question, answer }> | null>} 失败返回 null
+       */
+      async fetchRoundText(turns) {
+        const list = (turns || []).filter(Number.isSafeInteger);
+        if (list.length === 0) return [];
+        const query =
+          "sessionId=" + encodeURIComponent(this.sessionId) +
+          "&full=1&turns=" + list.join(",");
+        try {
+          const { status, data } = await getJson("/dsh-message-actions/messages", query);
+          if (status === 200 && data && data.ok && data.value && Array.isArray(data.value.rounds)) {
+            return data.value.rounds;
+          }
+        } catch {
+          /* 网络失败由调用方统一提示 */
+        }
+        return null;
       }
 
       /** 按 turn 找到真实提问的 seq（问行按钮据此定位）。 */
@@ -636,7 +515,14 @@ window.__ModuleLoader__.load({
         if (opts && opts.seq != null) body.seq = opts.seq;
         else if (opts && opts.messageId != null) body.messageId = opts.messageId;
 
-        const { data } = await postJson("/dsh-message-actions", body);
+        let data;
+        try {
+          ({ data } = await postJson("/dsh-message-actions", body));
+        } catch {
+          // 网络中断 / 宿主 15s 超时：必须给用户可理解的反馈，且不留下未捕获 rejection。
+          showToast(t("toast.failed"));
+          return false;
+        }
         if (!data || !data.ok) {
           const code = data && data.error && data.error.code;
           const labels = ERROR_LABELS[detectLang()] || ERROR_LABELS.zh;
@@ -649,6 +535,9 @@ window.__ModuleLoader__.load({
         const removedTurn = value.turn;
         if (value.via === "user" && Number.isFinite(removedTurn)) {
           this.addHiddenTurn(removedTurn);
+        } else if (value.via === "tool" && opts && opts.nodeKey) {
+          // 工具行删除只遮蔽该工具节点，不影响同轮其它内容。
+          applyHiddenTool(this.sessionId, opts.nodeKey);
         }
         if (action === "recall" && value.refillText) {
           refillComposer(this.sessionId, value.refillText);
@@ -688,8 +577,15 @@ window.__ModuleLoader__.load({
         "[data-conversation-region='composer'] [contenteditable='true']"
       );
       if (!editable) {
+        // 找不到输入框时退回剪贴板；给用户明确反馈，避免“复制成功却提示失败”。
         try {
-          if (navigator.clipboard) navigator.clipboard.writeText(text);
+          if (navigator.clipboard) {
+            Promise.resolve(navigator.clipboard.writeText(text)).then(
+              () => showToast(t("toast.copied")),
+              () => showToast(t("toast.failed"))
+            );
+            return;
+          }
         } catch {
           /* ignore */
         }
@@ -798,6 +694,91 @@ window.__ModuleLoader__.load({
     }
 
     // -------------------------------------------------------------------------
+    // 工具行按钮 DOM 注入
+    // -------------------------------------------------------------------------
+
+    /**
+     * 工具行定位依据（宿主 `@deepseek-ai/dsh-client-ui-chat`）：
+     *   - `data-chat-flow-kind="tool-call"`：toolDefinition 的 kind；
+     *   - `data-chat-node-key`：conversationContextKey("tool-call", id) = `9:tool-call<id>`；
+     *   - id 来自服务端 `tool/call.data.callId` / `tool/result.data.message.source.callId`。
+     * 因此可以稳定映射到服务端 tool/result 的 seq，不依赖子节点序号或点击坐标。
+     */
+    function injectToolButtons(ctx) {
+      if (typeof document === "undefined") return;
+      const rows = document.querySelectorAll(
+        "[data-chat-flow-kind='tool-call'][data-chat-node-key]"
+      );
+      for (const row of rows) {
+        const nodeKey = row.getAttribute("data-chat-node-key");
+        const callId = toolCallIdFromNodeKey(nodeKey);
+        if (!callId) continue;
+        const sessionEl = row.closest("[data-conversation-session]");
+        const sessionId = sessionEl ? sessionEl.getAttribute("data-conversation-session") : null;
+        if (!sessionId) continue;
+        if (row.closest("[data-dma-hidden='1']") || row.hasAttribute("hidden")) continue;
+
+        const controller = sessionFor(ctx, sessionId);
+        const config = controller.config();
+        const existing = row.querySelector("[data-dma-tool-actions]");
+        if (config.delete === false) {
+          if (existing) existing.remove();
+          continue;
+        }
+
+        const running = isRunning(sessionId);
+        const lang = detectLang();
+        const signature = (running ? "R" : "I") + (lang === "zh" ? "Z" : "E");
+        if (existing && existing.getAttribute("data-dma-sig") === signature) continue;
+        if (existing) existing.remove();
+
+        const wrap = document.createElement("span");
+        wrap.className = "dma-tool-actions";
+        wrap.setAttribute("data-dma-tool-actions", "1");
+        wrap.setAttribute("data-dma-sig", signature);
+
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "dma-btn dma-danger";
+        btn.setAttribute("data-dma-action", "deleteTool");
+        btn.setAttribute("aria-label", t("btn.deleteTool"));
+        btn.title = t("btn.deleteTool");
+        if (!paintButtonIcon(btn, "delete")) btn.innerHTML = ICONS.delete || "";
+        if (running) btn.disabled = true;
+        btn.addEventListener("click", (event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          handleToolAction(ctx, controller, nodeKey);
+        });
+        wrap.appendChild(btn);
+        row.appendChild(wrap);
+      }
+    }
+
+    async function handleToolAction(ctx, controller, nodeKey) {
+      const callId = toolCallIdFromNodeKey(nodeKey);
+      if (!callId) {
+        showToast(t("toast.failed"));
+        return;
+      }
+      // 摘要快照必须含最新 tool/result 行，否则拿不到稳定的服务端 seq。
+      await controller.fetchMessages(true).catch(() => {});
+      const rows = controller.messages && controller.messages.rows;
+      const row = findToolRowByCallId(rows, callId);
+      if (!row) {
+        showToast(t("toast.failed"));
+        return;
+      }
+      controller.requestAction("delete", {
+        seq: row.seq,
+        turn: row.turn,
+        step: row.step,
+        target: "tool",
+        nodeKey
+      });
+    }
+
+    // -------------------------------------------------------------------------
     // 导航刻度隐藏与压缩
     // -------------------------------------------------------------------------
 
@@ -825,6 +806,36 @@ window.__ModuleLoader__.load({
       }
     }
 
+    /** 工具行删除成功后，只隐藏该工具节点（按宿主稳定的 data-chat-node-key）。 */
+    function applyHiddenTool(sessionId, nodeKey) {
+      const sessionEl = sessionElement(sessionId);
+      if (!sessionEl || typeof nodeKey !== "string" || nodeKey === "") return;
+      for (const row of sessionEl.querySelectorAll("[data-chat-flow-kind='tool-call'][data-chat-node-key]")) {
+        if (row.getAttribute("data-chat-node-key") !== nodeKey) continue;
+        row.setAttribute("data-dma-hidden", "1");
+      }
+    }
+
+    /**
+     * 按「已删除工具行 callId」重新隐藏。
+     * 删除成功当下隐藏一次是不够的：切换会话 / 刷新页面会让宿主重建 DOM，
+     * 新节点不带 data-dma-hidden，于是被删内容又出现。这里每次同步都重放。
+     */
+    function applyHiddenTools(sessionId, callIds) {
+      const sessionEl = sessionElement(sessionId);
+      if (!sessionEl || !callIds || callIds.length === 0) return;
+      const rows = [...sessionEl.querySelectorAll("[data-chat-flow-kind='tool-call'][data-chat-node-key]")];
+      if (rows.length === 0) return;
+      const keys = rows.map((row) => row.getAttribute("data-chat-node-key"));
+      const hide = new Set(toolNodeKeysToHide(keys, callIds));
+      if (hide.size === 0) return;
+      for (let i = 0; i < rows.length; i += 1) {
+        if (!hide.has(keys[i])) continue;
+        if (rows[i].getAttribute("data-dma-hidden") === "1") continue;
+        rows[i].setAttribute("data-dma-hidden", "1");
+      }
+    }
+
     function visibleRowsExist(sessionId, turn) {
       const sessionEl = sessionElement(sessionId);
       if (!sessionEl) return false;
@@ -849,20 +860,28 @@ window.__ModuleLoader__.load({
         const sessionId = sessionNode.getAttribute("data-conversation-session");
 
         const goneTurns = new Set();
+        const goneTools = [];
         const controller = controllers.get(sessionId);
         if (controller) {
           for (const turn of controller.hiddenTurns) goneTurns.add(turn);
           const hostGone = controller.messages && controller.messages.goneTurns;
           if (Array.isArray(hostGone)) for (const turn of hostGone) goneTurns.add(turn);
+          const hostGoneTools = controller.messages && controller.messages.goneTools;
+          if (Array.isArray(hostGoneTools)) goneTools.push(...hostGoneTools);
         }
         applyHiddenRows(sessionId, goneTurns);
+        applyHiddenTools(sessionId, goneTools);
 
         const rail = findRail(sessionNode);
         if (!rail) continue;
 
         const items = [];
         for (const btn of railButtons(rail)) {
-          const turn = railTurnOf(btn.getAttribute("aria-label"));
+          // data-index 语义未验证：与 aria-label 解析一致时才采用，否则回退旧逻辑。
+          const turn = railTurnOfAttributes(
+            btn.getAttribute("data-index"),
+            btn.getAttribute("aria-label")
+          );
           const gone = turn != null && goneTurns.has(turn);
           const hidden = gone && (!visibleRowsExist(sessionId, turn));
           items.push({ btn, hidden });
@@ -932,8 +951,33 @@ window.__ModuleLoader__.load({
       );
     }
 
-    function doExport(controller, selected) {
-      const content = markdownOf(selected, {
+    /**
+     * 摘要快照里的 round 只有预览；分享图 / 导出必须先按需拉全文。
+     * 只请求用户实际选中的轮次（`full=1&turns=`），失败返回 null，绝不用预览生成产物。
+     * @returns {Promise<Array<{ turn, question, answer }> | null>}
+     */
+    async function resolveFullRounds(controller, selected) {
+      const turns = (selected || [])
+        .map((round) => round && round.turn)
+        .filter(Number.isSafeInteger);
+      if (turns.length === 0) return [];
+      const rounds = await controller.fetchRoundText(turns);
+      if (!Array.isArray(rounds)) return null;
+      const byTurn = new Map(rounds.map((round) => [round.turn, round]));
+      // 保持用户在列表里的选择顺序，按轮次升序输出。
+      return turns
+        .map((turn) => byTurn.get(turn))
+        .filter(Boolean)
+        .sort((a, b) => a.turn - b.turn);
+    }
+
+    async function doExport(controller, selected) {
+      const full = await resolveFullRounds(controller, selected);
+      if (full === null) {
+        showToast(t("toast.failed"));
+        return false;
+      }
+      const content = markdownOf(full, {
         title: t("export.title"),
         sessionId: controller.sessionId,
         exportedAt: formatNow(),
@@ -942,9 +986,10 @@ window.__ModuleLoader__.load({
       });
       if (!content.trim()) {
         showToast(t("toast.empty"));
-        return;
+        return false;
       }
       downloadBlob(content, exportFilename(controller.sessionId, new Date()), "text/markdown;charset=utf-8");
+      return true;
     }
 
     const SHARE_FONT = "-apple-system,BlinkMacSystemFont,'Segoe UI','Microsoft YaHei','PingFang SC',sans-serif";
@@ -999,8 +1044,13 @@ window.__ModuleLoader__.load({
       );
     }
 
-    function generateSharePng(controller, selected) {
-      const html = buildShareHtml(controller, selected);
+    async function generateSharePng(controller, selected) {
+      const full = await resolveFullRounds(controller, selected);
+      if (full === null) {
+        showToast(t("toast.failed"));
+        return false;
+      }
+      const html = buildShareHtml(controller, full);
       const holder = document.createElement("div");
       holder.style.cssText = "position:fixed;left:-10000px;top:0;width:0;height:0;overflow:hidden;pointer-events:none";
       holder.innerHTML = html;
@@ -1020,12 +1070,17 @@ window.__ModuleLoader__.load({
       const url = "data:image/svg+xml;charset=utf-8," + encodeURIComponent(svg);
       const img = new Image();
       img.onload = () => {
-        // 2x 缩放导出，避免文字发糊。
-        const scale = 2;
+        // 目标 2x；但按面积上限回落，避免长会话触发部分 WebView 的 canvas 面积限制。
+        const MAX_CANVAS_PIXELS = 16 * 1000 * 1000;
+        const scale = Math.max(1, Math.min(2, Math.sqrt(MAX_CANVAS_PIXELS / (720 * height))));
         const canvas = document.createElement("canvas");
-        canvas.width = 720 * scale;
-        canvas.height = height * scale;
+        canvas.width = Math.ceil(720 * scale);
+        canvas.height = Math.ceil(height * scale);
         const ctx = canvas.getContext("2d");
+        if (!ctx) {
+          showToast(t("toast.failed"));
+          return;
+        }
         ctx.fillStyle = "#ffffff";
         ctx.fillRect(0, 0, canvas.width, canvas.height);
         ctx.scale(scale, scale);
@@ -1042,7 +1097,8 @@ window.__ModuleLoader__.load({
           document.body.appendChild(a);
           a.click();
           a.remove();
-          setTimeout(() => URL.revokeObjectURL(pngUrl), 1000);
+          // 留足下载启动时间，避免慢磁盘/大图时提前释放。
+          setTimeout(() => URL.revokeObjectURL(pngUrl), 10000);
         }, "image/png");
       };
       img.onerror = () => showToast(t("toast.failed"));
@@ -1095,7 +1151,8 @@ window.__ModuleLoader__.load({
         );
         if (sameTurn.length > 0) tokens = sameTurn[sameTurn.length - 1].usage.outputTokens;
       }
-      const words = row ? wordCount(row.text || "") : 0;
+      // 摘要快照只带 words，不带正文；字数由服务端一次算好，客户端不再重复统计。
+      const words = row && Number.isFinite(row.words) ? row.words : 0;
 
       if (config && config.stats === false) return null;
       if (!row || words === 0) return null;
@@ -1111,45 +1168,92 @@ window.__ModuleLoader__.load({
       }, label);
     }
 
+    /**
+     * 浮层键盘支持：仅在浮层打开期间挂监听，关闭 / 卸载时由 effect 清理。
+     * 捕获阶段处理并阻止冒泡：确认框是模态的，同一个 Enter 不应再触发宿主的
+     * 其它快捷键；焦点在输入框时不拦截（交给控件自己处理）。
+     */
+    function useOverlayKeys(options) {
+      const { active, primaryEnabled, busy, onDismiss, onPrimary } = options;
+      const handlers = React.useRef({ onDismiss, onPrimary });
+      handlers.current = { onDismiss, onPrimary };
+      React.useEffect(() => {
+        if (!active) return undefined;
+        function onKey(event) {
+          const action = resolveKeyAction({
+            key: event.key,
+            target: event.target,
+            overlayOpen: true,
+            primaryEnabled,
+            busy
+          });
+          if (action === "none") return;
+          event.preventDefault();
+          event.stopPropagation();
+          if (action === "dismiss") handlers.current.onDismiss();
+          else if (action === "primary") handlers.current.onPrimary();
+        }
+        window.addEventListener("keydown", onKey, true);
+        return () => window.removeEventListener("keydown", onKey, true);
+      }, [active, primaryEnabled, busy]);
+    }
+
+    // 确认弹窗（Enter = 确认，Esc = 取消）
+    function ConfirmOverlay({ t: tt, view, onDismiss, confirmAction }) {
+      const firing = React.useRef(false);
+      // 工具行删除与答行 step 删除共用服务端 step 分支，但文案必须能区分入口。
+      const message = view.target === "tool"
+        ? tt("confirm.tool")
+        : (view.step ? tt("confirm.step") : tt("confirm." + String(view.action)));
+      const danger = view.action !== "recall";
+      function primary() {
+        // 与点击「确认」完全同一个处理函数，避免键盘与鼠标行为分叉。
+        if (firing.current) return;
+        firing.current = true;
+        confirmAction(view.action, {
+          seq: view.seq,
+          messageId: view.messageId,
+          nodeKey: view.nodeKey,
+          target: view.target
+        });
+      }
+      useOverlayKeys({ active: true, primaryEnabled: true, busy: false, onDismiss, onPrimary: primary });
+      return e("div", {
+        className: "dma-overlay",
+        onClick: (ev) => {
+          if (ev.target === ev.currentTarget) onDismiss();
+        }
+      },
+      e("div", { className: "dma-panel dma-confirm" },
+        e("div", { className: "dma-panel-head" }, tt("confirm.title")),
+        e("div", { className: "dma-panel-body" }, message),
+        e("div", { className: "dma-panel-foot" },
+          e("button", { type: "button", className: "dma-btn", onClick: () => onDismiss() }, tt("confirm.cancel")),
+          e("button", {
+            type: "button",
+            autoFocus: true,
+            className: "dma-btn dma-primary" + (danger ? " dma-danger" : ""),
+            onClick: primary
+          }, tt("confirm.ok"))
+        )
+      ));
+    }
+
     // 确认弹窗 + 分享/导出浮层控制器（input.overlay 槽位）
     function OverlayController(props) {
       const { t: tt, useOverlay, useData, confirmAction, dismiss, runShare, runExport } = props;
       const view = useOverlay((v) => v.view);
       const data = useData((v) => v);
 
-      React.useEffect(() => {
-        function onKey(event) {
-          if (event.key === "Escape") dismiss();
-        }
-        window.addEventListener("keydown", onKey);
-        return () => window.removeEventListener("keydown", onKey);
-      }, [dismiss]);
-
       if (!view) return null;
 
       if (view.kind === "confirm") {
-        const message = view.step
-          ? tt("confirm.step")
-          : tt("confirm." + String(view.action));
-        const danger = view.action !== "recall";
-        return e("div", {
-          className: "dma-overlay",
-          onClick: (ev) => {
-            if (ev.target === ev.currentTarget) dismiss();
-          }
-        },
-        e("div", { className: "dma-panel dma-confirm" },
-          e("div", { className: "dma-panel-head" }, tt("confirm.title")),
-          e("div", { className: "dma-panel-body" }, message),
-          e("div", { className: "dma-panel-foot" },
-            e("button", { type: "button", className: "dma-btn", onClick: () => dismiss() }, tt("confirm.cancel")),
-            e("button", {
-              type: "button",
-              className: "dma-btn dma-primary" + (danger ? " dma-danger" : ""),
-              onClick: () => confirmAction(view.action, { seq: view.seq, messageId: view.messageId })
-            }, tt("confirm.ok"))
-          )
-        ));
+        return e(ConfirmOverlay, {
+          t: tt,
+          view,
+          onDismiss: dismiss,
+          confirmAction
+        });
       }
 
       if (view.kind === "pick") {
@@ -1194,12 +1298,23 @@ window.__ModuleLoader__.load({
       const chosen = rounds.filter((r) => selected.has(r.turn));
       const primaryLabel = mode === "share" ? t("pick.share") : t("pick.export");
       const primaryDisabled = chosen.length === 0;
+      const [busy, setBusy] = React.useState(false);
 
       function primary() {
-        if (primaryDisabled) return;
+        // 与点击主按钮同一个处理函数；busy 期间忽略重复 Enter，避免重复生成 / 重复下载。
+        if (primaryDisabled || busy) return;
+        setBusy(true);
         if (mode === "share") runShare(chosen);
         else runExport(chosen);
       }
+
+      useOverlayKeys({
+        active: true,
+        primaryEnabled: !primaryDisabled,
+        busy,
+        onDismiss,
+        onPrimary: primary
+      });
 
       return e("div", { className: "dma-overlay", onClick: (ev) => { if (ev.target === ev.currentTarget) onDismiss(); } },
         e("div", { className: "dma-panel" },
@@ -1221,11 +1336,11 @@ window.__ModuleLoader__.load({
                       e("div", { className: "dma-round-line dma-round-q" },
                         e("span", { className: "dma-round-tag" }, t("pick.turn") + " " + round.turn),
                         e("span", { className: "dma-round-text" },
-                          previewText(round.question, 160) || "…")),
+                          round.questionPreview || "…")),
                       e("div", { className: "dma-round-line dma-round-a" },
                         e("span", { className: "dma-round-tag dma-round-tag-a" }, t("pick.answer")),
                         e("span", { className: "dma-round-text" },
-                          previewText(round.answer, 220) || "…"))
+                          round.answerPreview || "…"))
                     )
                   )
                 )
@@ -1236,8 +1351,9 @@ window.__ModuleLoader__.load({
               e("button", { type: "button", className: "dma-btn", onClick: () => onDismiss() }, t("pick.cancel")),
               e("button", {
                 type: "button",
+                autoFocus: true,
                 className: "dma-btn dma-primary",
-                disabled: primaryDisabled,
+                disabled: primaryDisabled || busy,
                 onClick: primary
               }, primaryLabel)
             )
@@ -1321,21 +1437,21 @@ window.__ModuleLoader__.load({
     }
 
     function LayoutRow({ t: tt, value, disabled, onPick }) {
-      const current = value === "compact" ? "compact" : "default";
+      const current = normalizeCostLayout(value);
       return e("div", { className: "dma-setting-row" },
         e("div", { className: "dma-setting-text" },
           e("div", { className: "dma-setting-label" }, tt("cost.settings.layout")),
           e("div", { className: "dma-setting-desc" }, tt("cost.settings.layoutDesc"))
         ),
         e("div", { className: "dma-seg", role: "group", "aria-label": tt("cost.settings.layout") },
-          ["default", "compact"].map((id) => e("button", {
+          COST_LAYOUTS.map((id) => e("button", {
             key: id,
             type: "button",
             className: "dma-seg-btn",
             "aria-pressed": current === id ? "true" : "false",
             disabled,
             onClick: () => onPick(id)
-          }, id === "default" ? tt("cost.layout.default") : tt("cost.layout.compact")))
+          }, tt("cost.layout." + id)))
         )
       );
     }
@@ -1350,6 +1466,12 @@ window.__ModuleLoader__.load({
           descKey: "cost.settings.usageStatsDesc",
           on: enabled,
           onToggle: onToggle("usageStats", enabled)
+        }),
+        e(LayoutRow, {
+          t: tt,
+          value: value && typeof value.costLayout === "string" ? value.costLayout : DEFAULT_COST_LAYOUT,
+          disabled: !enabled,
+          onPick: (id) => save("costLayout", id)
         }),
         e(SettingRow, {
           t: tt,
@@ -1374,12 +1496,6 @@ window.__ModuleLoader__.load({
           on: value ? value.costPeakValley !== false : true,
           disabled: !enabled,
           onToggle: enabled ? onToggle("costPeakValley", value ? value.costPeakValley !== false : true) : null
-        }),
-        e(LayoutRow, {
-          t: tt,
-          value: value && typeof value.costLayout === "string" ? value.costLayout : "default",
-          disabled: !enabled,
-          onPick: (id) => save("costLayout", id)
         }),
         e(CorrectionForm, { t: tt })
       );
@@ -1424,10 +1540,18 @@ window.__ModuleLoader__.load({
         if (invalid || busy) return;
         setBusy(true);
         setError("");
-        const res = await postJson("/dsh-message-actions/cost/correction", {
-          creditYuan: credit,
-          debitYuan: debit
-        });
+        let res;
+        try {
+          res = await postJson("/dsh-message-actions/cost/correction", {
+            creditYuan: credit,
+            debitYuan: debit
+          });
+        } catch {
+          // 网络中断 / 宿主超时：给出可理解的反馈，不留未捕获 rejection。
+          setError(tt("cost.correction.failed"));
+          setBusy(false);
+          return;
+        }
         if (res.status === 200 && res.data && res.data.ok && res.data.value) {
           patchCostState({ status: "ready", value: res.data.value, fetchedAt: Date.now(), error: "" });
           setCredit(centsToInput(res.data.value.account.creditCents));
@@ -1553,17 +1677,21 @@ window.__ModuleLoader__.load({
           tabButton("billing", "cost.tab.billing")
         ),
         tab === "actions"
-          ? SETTING_FIELDS.map(([key, labelKey, descKey]) => {
-            const on = value ? value[key] === true : false;
-            return e(SettingRow, {
-              key,
-              t: tt,
-              labelKey,
-              descKey,
-              on,
-              onToggle: () => save(key, !on)
-            });
-          })
+          ? e("div", { className: "dma-settings-panel" },
+            SETTING_FIELDS.map(([key, labelKey, descKey]) => {
+              const on = value ? value[key] === true : false;
+              return e(SettingRow, {
+                key,
+                t: tt,
+                labelKey,
+                descKey,
+                on,
+                onToggle: () => save(key, !on)
+              });
+            }),
+            // 第一个标签页底部：只读版本号，不抢设置项视觉焦点。
+            e("div", { className: "dma-settings-version" }, "v" + VERSION)
+          )
           : e(BillingTab, { t: tt, form, value, save }),
         error ? e("div", { className: "dma-setting-error" }, error) : null
       );
@@ -1620,6 +1748,7 @@ window.__ModuleLoader__.load({
       const enabled = cfg.usageStats !== false;
       const showPeak = cfg.costPeakValley !== false;
       const showTurn = cfg.costPerTurn !== false;
+      const compact = normalizeCostLayout(cfg.costLayout) === "compact";
 
       const value = costSnap && costSnap.status === "ready" ? costSnap.value : null;
       const balance = value ? value.balance : null;
@@ -1691,7 +1820,7 @@ window.__ModuleLoader__.load({
       if (status === "local") {
         return e("div", { className: "dma-cost-item" },
           e("div", {
-            className: "dma-cost-card dma-cost-local" + (cfg.costLayout === "compact" ? " dma-cost-plain" : ""),
+            className: "dma-cost-card dma-cost-local" + (compact ? " dma-cost-plain" : ""),
             "aria-label": tt("cost.local")
           },
             e("span", {
@@ -1727,7 +1856,6 @@ window.__ModuleLoader__.load({
       const period = periodInfo(Date.now());
       const changeText = periodChangeText(Date.now(), period.nextChangeAt, detectLang());
       const periodLabel = period.period === "peak" ? tt("cost.peak") : tt("cost.valley");
-      const compact = cfg.costLayout === "compact";
       const periodIcon = e("span", {
         className: "dma-cost-period-icon",
         title: periodLabel + " · " + changeText,
@@ -1756,7 +1884,7 @@ window.__ModuleLoader__.load({
               ),
               showTurn && !turnHidden
                 ? e("span", { className: "dma-cost-col" },
-                  e("span", { className: "dma-cost-label" }, tt("cost.perTurn")),
+                  e("span", { className: "dma-cost-label", title: tt("cost.settings.perTurnDesc") }, tt("cost.perTurn")),
                   e("span", { className: "dma-cost-value" }, turnText)
                 )
                 : null,
@@ -1791,7 +1919,7 @@ window.__ModuleLoader__.load({
             ),
             showTurn && !turnHidden
               ? e("div", { className: "dma-cost-col" },
-                e("span", { className: "dma-cost-label" }, tt("cost.perTurn")),
+                e("span", { className: "dma-cost-label", title: tt("cost.settings.perTurnDesc") }, tt("cost.perTurn")),
                 e("span", { className: "dma-cost-value" }, turnText),
                 lastTurn
                   ? e("button", {
@@ -1824,6 +1952,8 @@ window.__ModuleLoader__.load({
 
     const EXTRA_CSS = `
 .dma-settings{max-width:680px;display:flex;flex-direction:column;gap:2px}
+.dma-settings-panel{display:flex;flex-direction:column;gap:2px}
+.dma-settings-version{margin-top:14px;padding-top:10px;font-size:11px;line-height:1.5;color:var(--dsw-alias-label-tertiary,#8a919e);text-align:right;user-select:text}
 .dma-setting-row{display:flex;align-items:flex-start;justify-content:space-between;gap:20px;padding:14px 4px;border-bottom:.5px solid var(--dsw-alias-border-l2,rgba(0,0,0,.08))}
 .dma-setting-text{min-width:0}
 .dma-setting-label{font-size:14px;line-height:1.5;color:var(--dsw-alias-label-primary,#1f2329)}
@@ -1912,10 +2042,10 @@ window.__ModuleLoader__.load({
 
     function startDomObserver(ctx) {
       if (typeof document === "undefined" || !document.body) return () => {};
-      let scheduled = false;
       const run = () => {
-        scheduled = false;
         injectQuestionButtons(ctx);
+        injectToolButtons(ctx);
+        evictStaleControllers();
         syncRail();
         // 对话在流式输出时结构频繁变化：按 TTL 补拉快照，让答行统计与轮次列表跟上。
         for (const el of document.querySelectorAll("[data-conversation-session]")) {
@@ -1923,24 +2053,21 @@ window.__ModuleLoader__.load({
           if (sessionId) sessionFor(ctx, sessionId).fetchMessages(false).catch(() => {});
         }
       };
-      const queue = () => {
-        if (scheduled) return;
-        scheduled = true;
-        setTimeout(run, 120);
-      };
-      const observer = new MutationObserver(queue);
+      const scheduler = createScheduler(run, { delay: 120 });
+      const observer = new MutationObserver(() => scheduler.request());
       observer.observe(document.body, { childList: true, subtree: true });
       run();
-      return () => observer.disconnect();
+      return () => {
+        observer.disconnect();
+        scheduler.dispose();
+      };
     }
 
     function startRailObserver() {
       if (typeof document === "undefined" || !document.body) return () => {};
-      let scheduled = false;
       let running = false;
       let observer = null;
       const run = () => {
-        scheduled = false;
         if (running) return;
         running = true;
         try {
@@ -1951,13 +2078,14 @@ window.__ModuleLoader__.load({
           running = false;
         }
       };
-      const queue = () => {
-        if (scheduled || running) return;
-        scheduled = true;
-        if (typeof requestAnimationFrame === "function") requestAnimationFrame(run);
-        else setTimeout(run, 60);
-      };
-      observer = new MutationObserver(queue);
+      const schedule = typeof requestAnimationFrame === "function"
+        ? (fn) => requestAnimationFrame(fn)
+        : (fn) => setTimeout(fn, 60);
+      const cancel = typeof cancelAnimationFrame === "function"
+        ? (handle) => cancelAnimationFrame(handle)
+        : (handle) => clearTimeout(handle);
+      const scheduler = createScheduler(run, { schedule, cancel });
+      observer = new MutationObserver(() => scheduler.request());
       // 只关心官方刻度自身的重建与标签变化；不监听本插件写入的属性（data-dma-*）。
       observer.observe(document.body, {
         childList: true,
@@ -1968,6 +2096,7 @@ window.__ModuleLoader__.load({
       return () => {
         if (observer) observer.disconnect();
         observer = null;
+        scheduler.dispose();
       };
     }
 
@@ -1980,20 +2109,21 @@ window.__ModuleLoader__.load({
      * 只靠 DOM 观察器时，改设置不会改动会话 DOM，界面要等面板关闭才更新。
      */
     function watchLiveUpdates(ctx, form) {
-      let scheduled = false;
       const run = () => {
-        scheduled = false;
         injectQuestionButtons(ctx);
+        injectToolButtons(ctx);
         syncRail();
       };
-      const queue = () => {
-        if (scheduled) return;
-        scheduled = true;
-        if (typeof requestAnimationFrame === "function") requestAnimationFrame(run);
-        else setTimeout(run, 60);
-      };
+      const schedule = typeof requestAnimationFrame === "function"
+        ? (fn) => requestAnimationFrame(fn)
+        : (fn) => setTimeout(fn, 60);
+      const cancel = typeof cancelAnimationFrame === "function"
+        ? (handle) => cancelAnimationFrame(handle)
+        : (handle) => clearTimeout(handle);
+      const scheduler = createScheduler(run, { schedule, cancel });
+      const queue = () => scheduler.request();
 
-      const stops = [];
+      const stops = [scheduler.dispose];
       if (form && typeof form.subscribe === "function") {
         const off = form.subscribe(queue);
         if (typeof off === "function") stops.push(off);
@@ -2061,12 +2191,21 @@ window.__ModuleLoader__.load({
               hooks: { overlay: controller.overlay, data: controller.data },
               confirmAction: (action, opts) => controller.confirmAction(action, opts),
               dismiss: () => controller.dismiss(),
-              runShare: (rounds) => {
-                generateSharePng(controller, rounds);
+              // 摘要不含正文：先按需拉全文，成功或失败后再关闭浮层。
+              runShare: async (rounds) => {
+                try {
+                  await generateSharePng(controller, rounds);
+                } catch {
+                  showToast(t("toast.failed"));
+                }
                 controller.dismiss();
               },
-              runExport: (rounds) => {
-                doExport(controller, rounds);
+              runExport: async (rounds) => {
+                try {
+                  await doExport(controller, rounds);
+                } catch {
+                  showToast(t("toast.failed"));
+                }
                 controller.dismiss();
               }
             };
@@ -2111,6 +2250,8 @@ window.__ModuleLoader__.load({
         stopCostPolling();
         if (typeof document !== "undefined") {
           document.querySelectorAll("[data-dma-actions]").forEach((node) => disposeActionsRow(node));
+          // 工具行按钮是命令式创建的，卸载时要一并移除（含可能的 React 图标根）。
+          document.querySelectorAll("[data-dma-tool-actions]").forEach((node) => disposeActionsRow(node));
           document.querySelectorAll("[data-dma-toast]").forEach((node) => node.remove());
           document.querySelectorAll('style[data-plugin-css="' + NS + '"]').forEach((node) => node.remove());
         }
