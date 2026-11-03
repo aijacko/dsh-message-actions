@@ -122,8 +122,8 @@ pnpm add "file:/path/to/dsh-message-actions"
 2. Hover over a **tool-call row**: "Delete tool" appears on the right; it deletes the node set for that `(turn, step)` — the answer and other tool results in the same step disappear too; other steps are unaffected.
 3. Under every **answer**, `tok · chars` is shown.
 4. Recall and delete actions ask for confirmation by default; turn off "Confirm actions" to run them immediately. After confirming, the content disappears and the sidebar ticks hide in sync.
-5. Share / export opens a full-screen picker; each card shows the question and answer preview for that turn, and you can select one, several, or all; full text is fetched only when you generate.
-6. While a reply is being generated, all buttons are disabled to avoid conflicting with the running session.
+5. Share / export opens a full-screen picker; each card shows the question and answer preview for that turn, and you can select one, several, or all; full text is fetched only when you generate. If fetching full text or generating the image / file fails, a toast appears and the picker **stays open with your selection**, so you can retry; it closes only after a successful download.
+6. While a reply is being generated, all buttons are disabled to avoid conflicting with the running session; a write that still races the agent returns `423 AGENT_BUSY`.
 
 ### Balance correction
 
@@ -186,6 +186,7 @@ This section only describes what the code actually does. It is risk reduction, n
 **Conversation data**
 
 - `GET /messages` is a **summary** interface: it returns message ids, turn, step, a preview of at most 200 characters, usage, and the tool `callId`; no body text. The client has no fixed polling timer: it refetches when the conversation DOM changes, coalesced by a 120 ms scheduler, with a 3-second TTL to avoid duplicate requests.
+- The summary supports incremental reads: a request with `since=<last version>` returns only rows with `seq > since` (plus `removedSeqs` for rows deleted since then); without `since` it still returns the full snapshot. Deletion state (`goneTurns` / `goneTools`) is always returned in full, so deleted content stays hidden after an incremental refresh.
 - `preview` is only generated for real questions and assistant answers; system / developer messages, runtime-injected context, and tool results are always empty, so their text is never returned by this endpoint (implementation: `messagesSummaryOf` in `src/shared.cjs`).
 - Share images and export fetch full text only for the selected turns via `full=1`, and only questions / answers are returned.
 
@@ -194,6 +195,7 @@ This section only describes what the code actually does. It is risk reduction, n
 - Only one local file: `cost-state.json` under `$DSH_HOME` (default `~/.dsh`), in `plugins/dsh-message-actions/`.
 - Writes are a whole-file replacement: temp file in the same directory (`0600`) → `fsync` → `rename`, so a half-written file can't be left behind; the directory is created with `0700`.
 - Contents are only balance observations, correction values, and per-day spend; no conversation text.
+- Balance correction reports success only after the state file is written: a read-only state file returns `500 READ_ONLY`, a failed write returns `500 WRITE_FAILED` and rolls the in-memory correction back, so the UI shows "save failed" instead of a false success.
 - A file over 4MB is rebuilt as the default state and logged with the reason and size; a corrupt file under the limit is renamed to `cost-state.bad-<timestamp>.json` and kept.
 
 **Network**
@@ -221,7 +223,7 @@ This section only describes what the code actually does. It is risk reduction, n
 
 ```bash
 node build.mjs        # build to lib/
-node test/check.mjs   # offline assertions, 2541 currently
+node test/check.mjs   # offline assertions, 2609 currently
 # plus a real session-log regression: 18/18
 ```
 
