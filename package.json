@@ -4,6 +4,22 @@
   "description": "消息费用：撤回、删除、删至末尾、分享、导出、回答统计与 DeepSeek 费用统计（DSH 插件）。",
   "type": "module",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/aijacko/dsh-message-actions.git"
+  },
+  "homepage": "https://github.com/aijacko/dsh-message-actions#readme",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "deepseek",
+    "plugin"
+  ],
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org",
+    "access": "public"
+  },
   "exports": {
     ".": "./lib/index.js",
     "./client": "./lib/client.js",
