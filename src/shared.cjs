@@ -35,6 +35,8 @@ const ERROR_LABELS = {
     NOT_A_USER_MESSAGE: '仅用户消息可撤回',
     SPAN_NOT_CONTIGUOUS: '目标回答与工具结果不连续，无法整体删除',
     INVALID_AMOUNT: '金额格式不合法',
+    READ_ONLY: '状态文件只读，未保存',
+    WRITE_FAILED: '写入状态文件失败',
     INTERNAL: '内部错误'
   },
   en: {
@@ -48,6 +50,8 @@ const ERROR_LABELS = {
     NOT_A_USER_MESSAGE: 'Only user messages can be recalled',
     SPAN_NOT_CONTIGUOUS: 'Answer and tool results are not contiguous',
     INVALID_AMOUNT: 'Invalid amount',
+    READ_ONLY: 'State file is read-only; nothing saved',
+    WRITE_FAILED: 'Could not write the state file',
     INTERNAL: 'Internal error'
   }
 };
@@ -616,21 +620,30 @@ function goneTurnsOf(events, nodes, lookup) {
  * `/messages` 摘要快照：只返回预览、字数、用量与 callId，不返回正文。
  * 分享图 / 导出需要全文时，走 `full=1&turns=a,b` 的按需接口（见 index.mjs）。
  *
+ * 增量：传入 `since`（上次快照的 version）时，rows 只回 seq > since 的行，
+ * rounds 只回本次有新增行的轮次，并额外回 `removedSeqs`（since 之后墓碑
+ * 覆盖的 seq），供客户端合并并剔除已删行；不带 since 仍是全量快照。
+ * goneTurns / goneTools 始终全量返回，删除同步不受增量影响。
+ *
  * @param events 按 seq 索引的事件数组
  * @param nodes  当前 surface.nodes
  * @param lookup createTurnLookup 的返回值（可缺省）
- * @param options { filter?: Set<number>, previewLimit?: number }
- * @returns {{ version: number, nodeCount: number, rows: Array, rounds: Array, goneTurns: number[] }}
+ * @param options { filter?: Set<number>, since?: number, previewLimit?: number }
+ * @returns {{ version: number, nodeCount: number, rows: Array, rounds: Array, goneTurns: number[], goneTools: string[], removedSeqs: number[] }}
  */
 function messagesSummaryOf(events, nodes, lookup, options) {
   const opts = options || {};
   const turns = lookup || createTurnLookup(events);
   const filter = opts.filter instanceof Set ? opts.filter : null;
+  // 游标 v.s. seqs 列表：seqs 是「包含列表」，且长会话里已持有的 seq 数量会无限增长；
+  // 游标只传一个整数，天然表达「只要新的」。
+  const since = Number.isSafeInteger(opts.since) && opts.since >= 0 ? opts.since : null;
   const previewLimit = Number.isFinite(opts.previewLimit) && opts.previewLimit > 0
     ? Math.floor(opts.previewLimit)
     : 200;
   const rows = [];
   const rounds = new Map();
+  const touched = since === null ? null : new Set();
   const ensure = (turn) => {
     if (!rounds.has(turn)) rounds.set(turn, { turn, questionPreview: '', answerPreview: '' });
     return rounds.get(turn);
@@ -661,7 +674,8 @@ function messagesSummaryOf(events, nodes, lookup, options) {
       usage: usageSummaryOf(event),
       callId: toolCallIdOf(event)
     };
-    if (!filter || filter.has(seq)) rows.push(summary);
+    const beyondCursor = since === null || seq > since;
+    if (beyondCursor && (!filter || filter.has(seq))) rows.push(summary);
 
     if (isUserQuestion) {
       if (turn === null) continue;
@@ -672,17 +686,69 @@ function messagesSummaryOf(events, nodes, lookup, options) {
       const round = ensure(turn);
       if (summary.preview) round.answerPreview = summary.preview;
     }
+    if (touched && beyondCursor && turn !== null) touched.add(turn);
   }
   const lastSeq = liveNodes.length > 0 ? liveNodes[liveNodes.length - 1] : 0;
+  // 增量响应附带 since 之后墓碑覆盖的 seq；全量响应不需要（rows 已不含它们）。
+  const removedSeqs = [];
+  if (since !== null && Array.isArray(events)) {
+    const seen = new Set();
+    for (let seq = since + 1; seq < events.length; seq += 1) {
+      const event = events[seq];
+      if (!isTombstone(event)) continue;
+      const removed = event.data && event.data.source && event.data.source.removed;
+      if (!Array.isArray(removed)) continue;
+      for (const target of removed) {
+        if (!Number.isSafeInteger(target) || target < 0 || seen.has(target)) continue;
+        seen.add(target);
+        removedSeqs.push(target);
+      }
+    }
+  }
+  const sortedRounds = [...rounds.values()].sort((a, b) => a.turn - b.turn);
   return {
     version: Number.isSafeInteger(lastSeq) ? lastSeq : 0,
     nodeCount: liveNodes.length,
     rows,
-    rounds: [...rounds.values()].sort((a, b) => a.turn - b.turn),
+    rounds: touched === null ? sortedRounds : sortedRounds.filter((round) => touched.has(round.turn)),
     goneTurns: goneTurnsOf(events, nodes, turns),
     // 客户端在每次 DOM 重建（切换会话 / 刷新）后据此重新隐藏工具行，
     // 不能只在删除成功当下隐藏一次。
-    goneTools: goneToolsOf(events)
+    goneTools: goneToolsOf(events),
+    removedSeqs
+  };
+}
+
+/**
+ * 合并增量摘要到已持有的快照：按 seq 合并行、按 turn 合并轮次，
+ * 剔除增量确认删除的 seq 以及整轮消失的轮次。
+ * goneTurns / goneTools 以服务端最新结果为准（服务端始终全量返回）。
+ */
+function mergeMessageSummary(base, patch) {
+  const rows = new Map();
+  for (const row of (base && base.rows) || []) rows.set(row.seq, row);
+  for (const row of (patch && patch.rows) || []) rows.set(row.seq, row);
+  for (const seq of (patch && patch.removedSeqs) || []) rows.delete(seq);
+
+  const goneTurns = Array.isArray(patch && patch.goneTurns) ? patch.goneTurns : [];
+  for (const turn of goneTurns) {
+    for (const [seq, row] of rows) {
+      if (row.turn === turn) rows.delete(seq);
+    }
+  }
+
+  const rounds = new Map();
+  for (const round of (base && base.rounds) || []) rounds.set(round.turn, round);
+  for (const round of (patch && patch.rounds) || []) rounds.set(round.turn, round);
+  for (const turn of goneTurns) rounds.delete(turn);
+
+  return {
+    version: patch && Number.isSafeInteger(patch.version) ? patch.version : (base ? base.version : 0),
+    nodeCount: patch && Number.isSafeInteger(patch.nodeCount) ? patch.nodeCount : (base ? base.nodeCount : 0),
+    rows: [...rows.values()].sort((a, b) => a.seq - b.seq),
+    rounds: [...rounds.values()].sort((a, b) => a.turn - b.turn),
+    goneTurns,
+    goneTools: Array.isArray(patch && patch.goneTools) ? patch.goneTools : []
   };
 }
 
@@ -838,6 +904,27 @@ function statusCodeOf(code) {
     case 'INTERNAL': return 500;
     default: return 500;
   }
+}
+
+/**
+ * 判断异常是否为「智能体正忙」。
+ * 优先使用结构化字段（err.code / err.status / err.statusCode），
+ * 文案匹配只作为没有结构化字段时的兜底：
+ * 宿主 @deepseek-ai/dsh-agent-loop 抛出的忙错误目前是普通 Error（无 code），
+ * 因此兜底文案必须保留；但只要带了结构化字段，就以字段判定为准。
+ */
+const BUSY_CODES = new Set(['AGENT_BUSY', 'ALREADY_ACTIVE', 'EBUSY', 'BUSY']);
+
+function isBusyError(err) {
+  if (!err || typeof err !== 'object') return false;
+  const code = typeof err.code === 'string' ? err.code.trim().toUpperCase() : '';
+  const statusRaw = err.status != null ? err.status : err.statusCode;
+  const status = typeof statusRaw === 'number' && Number.isFinite(statusRaw) ? statusRaw : null;
+  if (code !== '' && BUSY_CODES.has(code)) return true;
+  if (status === 423) return true;
+  if (code !== '' || status !== null) return false;
+  const message = err instanceof Error ? err.message : String(err);
+  return message.includes('already has active work');
 }
 
 /** 依据 Content-Length 判断是否超限（离线可测的 413 判据）。 */
@@ -1632,6 +1719,7 @@ module.exports = {
   roundsOf,
   goneTurnsOf,
   messagesSummaryOf,
+  mergeMessageSummary,
   markdownOf,
   exportFilename,
   railTurnOf,
@@ -1644,6 +1732,7 @@ module.exports = {
   isLoopbackHost,
   isTrustedRequest,
   statusCodeOf,
+  isBusyError,
   bodyTooLarge,
   BJ_OFFSET_MS,
   WEEKEND_VALLEY_SINCE,

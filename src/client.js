@@ -48,6 +48,7 @@ window.__ModuleLoader__.load({
       toolNodeKeysToHide,
       findToolRowByCallId,
       resolveKeyAction,
+      mergeMessageSummary,
       formatTokens,
       railTurnOfAttributes,
       createScheduler,
@@ -414,6 +415,7 @@ window.__ModuleLoader__.load({
       /**
        * 拉取会话快照（rows / rounds / goneTurns）。
        * 快照必须随新轮次失效：早期实现把 promise 永久缓存，导致弹窗只看到 1 轮。
+       * 普通刷新只带游标取增量；force（弹窗 / 操作前）仍取全量，覆盖任何变更。
        * @param {boolean} force true 时忽略 TTL 与在途请求，强制重新拉取
        */
       async fetchMessages(force) {
@@ -422,14 +424,29 @@ window.__ModuleLoader__.load({
         if (this.messagesPromise && !force) return this.messagesPromise;
         // force 会绕过在途请求；用代际栅栏保证只有最新请求能写回快照。
         const token = this.requestGate.begin();
+        const base = this.messages;
+        const since = !force && base && Number.isSafeInteger(base.version) && base.version > 0
+          ? base.version
+          : null;
+        const messagesUrl = (cursor) =>
+          "sessionId=" + encodeURIComponent(this.sessionId) +
+          (cursor === null ? "" : "&since=" + cursor);
         const promise = (async () => {
           try {
-            const { data } = await getJson(
-              "/dsh-message-actions/messages",
-              "sessionId=" + encodeURIComponent(this.sessionId)
-            );
+            let cursor = since;
+            let { data } = await getJson("/dsh-message-actions/messages", messagesUrl(cursor));
+            if (
+              cursor !== null &&
+              !(data && data.ok && data.value && Number.isSafeInteger(data.value.version) && data.value.version >= cursor)
+            ) {
+              // 游标回退（宿主重建会话 / 版本跳变）：增量不可信，改为全量重取一次。
+              cursor = null;
+              ({ data } = await getJson("/dsh-message-actions/messages", messagesUrl(cursor)));
+            }
             if (data && data.ok && data.value && this.requestGate.isLatest(token)) {
-              this.messages = data.value;
+              this.messages = cursor === null
+                ? data.value
+                : mergeMessageSummary(base, data.value);
               this.fetchedAt = Date.now();
               this.refreshData();
               // 切换会话 / 刷新后重新挂载的 DOM 没有 data-dma-hidden，
@@ -1044,6 +1061,10 @@ window.__ModuleLoader__.load({
       );
     }
 
+    /**
+     * 生成并下载分享图。
+     * @returns {Promise<boolean>} true = 已成功触发下载；false = 失败（已提示）
+     */
     async function generateSharePng(controller, selected) {
       const full = await resolveFullRounds(controller, selected);
       if (full === null) {
@@ -1061,7 +1082,7 @@ window.__ModuleLoader__.load({
       const MAX_HEIGHT = 12000;
       if (height > MAX_HEIGHT) {
         showToast(t("toast.tooMuch"));
-        return;
+        return false;
       }
 
       const svg =
@@ -1069,40 +1090,50 @@ window.__ModuleLoader__.load({
         '<foreignObject x="0" y="0" width="100%" height="100%">' + html + "</foreignObject></svg>";
       const url = "data:image/svg+xml;charset=utf-8," + encodeURIComponent(svg);
       const img = new Image();
-      img.onload = () => {
-        // 目标 2x；但按面积上限回落，避免长会话触发部分 WebView 的 canvas 面积限制。
-        const MAX_CANVAS_PIXELS = 16 * 1000 * 1000;
-        const scale = Math.max(1, Math.min(2, Math.sqrt(MAX_CANVAS_PIXELS / (720 * height))));
-        const canvas = document.createElement("canvas");
-        canvas.width = Math.ceil(720 * scale);
-        canvas.height = Math.ceil(height * scale);
-        const ctx = canvas.getContext("2d");
-        if (!ctx) {
-          showToast(t("toast.failed"));
-          return;
-        }
-        ctx.fillStyle = "#ffffff";
-        ctx.fillRect(0, 0, canvas.width, canvas.height);
-        ctx.scale(scale, scale);
-        ctx.drawImage(img, 0, 0, 720, height);
-        canvas.toBlob((png) => {
-          if (!png) {
+      // 成功路径原本在 img.onload 里异步完成；用 Promise 包起来，
+      // 调用方才能据返回值决定是否关闭浮层（失败时保留已选轮次）。
+      return new Promise((resolve) => {
+        img.onload = () => {
+          // 目标 2x；但按面积上限回落，避免长会话触发部分 WebView 的 canvas 面积限制。
+          const MAX_CANVAS_PIXELS = 16 * 1000 * 1000;
+          const scale = Math.max(1, Math.min(2, Math.sqrt(MAX_CANVAS_PIXELS / (720 * height))));
+          const canvas = document.createElement("canvas");
+          canvas.width = Math.ceil(720 * scale);
+          canvas.height = Math.ceil(height * scale);
+          const ctx = canvas.getContext("2d");
+          if (!ctx) {
             showToast(t("toast.failed"));
+            resolve(false);
             return;
           }
-          const pngUrl = URL.createObjectURL(png);
-          const a = document.createElement("a");
-          a.href = pngUrl;
-          a.download = exportFilename(controller.sessionId, new Date()).replace(/\.md$/, ".png");
-          document.body.appendChild(a);
-          a.click();
-          a.remove();
-          // 留足下载启动时间，避免慢磁盘/大图时提前释放。
-          setTimeout(() => URL.revokeObjectURL(pngUrl), 10000);
-        }, "image/png");
-      };
-      img.onerror = () => showToast(t("toast.failed"));
-      img.src = url;
+          ctx.fillStyle = "#ffffff";
+          ctx.fillRect(0, 0, canvas.width, canvas.height);
+          ctx.scale(scale, scale);
+          ctx.drawImage(img, 0, 0, 720, height);
+          canvas.toBlob((png) => {
+            if (!png) {
+              showToast(t("toast.failed"));
+              resolve(false);
+              return;
+            }
+            const pngUrl = URL.createObjectURL(png);
+            const a = document.createElement("a");
+            a.href = pngUrl;
+            a.download = exportFilename(controller.sessionId, new Date()).replace(/\.md$/, ".png");
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+            // 留足下载启动时间，避免慢磁盘/大图时提前释放。
+            setTimeout(() => URL.revokeObjectURL(pngUrl), 10000);
+            resolve(true);
+          }, "image/png");
+        };
+        img.onerror = () => {
+          showToast(t("toast.failed"));
+          resolve(false);
+        };
+        img.src = url;
+      });
     }
 
     // -------------------------------------------------------------------------
@@ -1304,8 +1335,20 @@ window.__ModuleLoader__.load({
         // 与点击主按钮同一个处理函数；busy 期间忽略重复 Enter，避免重复生成 / 重复下载。
         if (primaryDisabled || busy) return;
         setBusy(true);
-        if (mode === "share") runShare(chosen);
-        else runExport(chosen);
+        const task = mode === "share" ? runShare(chosen) : runExport(chosen);
+        Promise.resolve(task)
+          .then((done) => {
+            if (done) {
+              onDismiss();
+              return;
+            }
+            // 失败：保留浮层与已选轮次，复位 busy 以便重试；提示由生成函数给出。
+            setBusy(false);
+          })
+          .catch(() => {
+            showToast(t("toast.failed"));
+            setBusy(false);
+          });
       }
 
       useOverlayKeys({
@@ -2191,23 +2234,10 @@ window.__ModuleLoader__.load({
               hooks: { overlay: controller.overlay, data: controller.data },
               confirmAction: (action, opts) => controller.confirmAction(action, opts),
               dismiss: () => controller.dismiss(),
-              // 摘要不含正文：先按需拉全文，成功或失败后再关闭浮层。
-              runShare: async (rounds) => {
-                try {
-                  await generateSharePng(controller, rounds);
-                } catch {
-                  showToast(t("toast.failed"));
-                }
-                controller.dismiss();
-              },
-              runExport: async (rounds) => {
-                try {
-                  await doExport(controller, rounds);
-                } catch {
-                  showToast(t("toast.failed"));
-                }
-                controller.dismiss();
-              }
+              // 摘要不含正文：先按需拉全文。只有成功才关闭浮层，
+              // 失败时由浮层保留已选轮次并复位 busy（提示在生成函数内给出）。
+              runShare: (rounds) => generateSharePng(controller, rounds),
+              runExport: (rounds) => doExport(controller, rounds)
             };
           }
         }, OverlayController)

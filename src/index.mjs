@@ -25,6 +25,7 @@ const {
   messagesSummaryOf,
   isTrustedRequest,
   statusCodeOf,
+  isBusyError,
   beijingDateKey,
   periodInfo,
   PRICE_TABLE,
@@ -46,7 +47,7 @@ const {
 const {
   resolveStatePath,
   loadCostState,
-  saveCostState
+  persistCostState
 } = store;
 
 // ---------------------------------------------------------------------------
@@ -223,11 +224,13 @@ function makeActionHandler(ctx) {
         await ctx.sessions.flush(session);
       });
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      if (message.includes("already has active work")) {
+      // 优先按结构化字段判定 busy（err.code / err.status）；宿主的忙错误目前
+      // 没有 code，此时才回退到文案匹配。
+      if (isBusyError(err)) {
         sendError(res, 423, "AGENT_BUSY");
         return;
       }
+      const message = err instanceof Error ? err.message : String(err);
       if (typeof ctx.logger?.warn === "function") {
         ctx.logger.warn(`[dsh-message-actions] ${action} failed: ${message}`);
       }
@@ -321,11 +324,21 @@ function makeMessagesHandler(ctx) {
       );
     }
 
+    // 增量游标：since=<上次快照 version> 时只回新增行（不带 since 仍为全量）。
+    // 选择游标而非 seqs 列表：seqs 在这里是「包含列表」，且长会话已持有 seq
+    // 会无限增长；游标只传一个整数，语义与追加式事件日志天然吻合。
+    const sinceParam = url.searchParams.get("since");
+    let since = null;
+    if (sinceParam !== null && sinceParam !== "") {
+      const parsed = Number(sinceParam.trim());
+      since = Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : null;
+    }
+
     // 摘要轮询：只回 preview / words / usage / callId，不回正文。
     // 系统 / 开发者提示词与工具结果正文从不进入摘要（预览也只覆盖问 / 答）。
     sendJson(res, 200, {
       ok: true,
-      value: messagesSummaryOf(events, nodes, turns, { filter, previewLimit: 200 })
+      value: messagesSummaryOf(events, nodes, turns, { filter, since, previewLimit: 200 })
     });
   };
 }
@@ -447,15 +460,15 @@ function createCostService(ctx, config) {
     if (typeof ctx.logger?.warn === "function") ctx.logger.warn(`[dsh-message-actions] ${message}`);
   };
 
+  /**
+   * 写盘并返回结果：`{ ok:true }` 或 `{ ok:false, error }`。
+   * 只读 / 写入失败不再被吞掉——调用方（余额校正路由）据此返回 500，
+   * 避免客户端把未落盘的写操作显示为成功。
+   */
   function persist() {
     state.updatedAt = Date.now();
     state.dailySpendCents = pruneDailySpend(state.dailySpendCents, state.updatedAt, shared.DAILY_KEEP_DAYS);
-    if (readOnly) return;
-    try {
-      saveCostState(statePath, state);
-    } catch (err) {
-      warn(`write cost state failed: ${err instanceof Error ? err.message : String(err)}`);
-    }
+    return persistCostState(statePath, state, readOnly, ctx.logger);
   }
 
   async function routingInfo() {
@@ -561,12 +574,29 @@ function createCostService(ctx, config) {
     return inFlight;
   }
 
+  /**
+   * 余额校正：先改内存再落盘；落盘失败时把 4 个字段回滚，
+   * 返回失败结果，避免内存状态与磁盘状态不一致。
+   */
   function applyCorrection(creditCents, debitCents) {
+    const previous = {
+      credit: state.correctionCreditCents,
+      debit: state.correctionDebitCents,
+      pending: state.pendingAdjustmentCents,
+      pendingAt: state.pendingAdjustmentAt
+    };
     state.correctionCreditCents = creditCents;
     state.correctionDebitCents = debitCents;
     state.pendingAdjustmentCents = 0;
     state.pendingAdjustmentAt = 0;
-    persist();
+    const saved = persist();
+    if (!saved.ok) {
+      state.correctionCreditCents = previous.credit;
+      state.correctionDebitCents = previous.debit;
+      state.pendingAdjustmentCents = previous.pending;
+      state.pendingAdjustmentAt = previous.pendingAt;
+    }
+    return saved;
   }
 
   async function stateValue() {
@@ -755,7 +785,11 @@ function makeCostCorrectionHandler(ctx, service) {
       return;
     }
     try {
-      service.applyCorrection(credit.cents, debit.cents);
+      const saved = service.applyCorrection(credit.cents, debit.cents);
+      if (!saved.ok) {
+        sendError(res, 500, saved.error);
+        return;
+      }
       sendJson(res, 200, { ok: true, value: await service.stateValue() });
     } catch (err) {
       if (typeof ctx.logger?.warn === "function") {

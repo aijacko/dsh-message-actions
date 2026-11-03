@@ -227,6 +227,26 @@ function saveCostState(filePath, state) {
   }
 }
 
+/**
+ * 把内存状态写入磁盘，并返回结构化结果（不再吞掉失败）。
+ * 只读模式（状态文件版本高于当前版本）与写入异常都返回 `{ ok:false, error }`，
+ * 供路由据此回 500，避免客户端把未落盘的校正当成已保存。
+ * @returns {{ ok: true } | { ok: false, error: 'READ_ONLY' | 'WRITE_FAILED' }}
+ */
+function persistCostState(filePath, state, readOnly, logger) {
+  if (readOnly) return { ok: false, error: "READ_ONLY" };
+  try {
+    saveCostState(filePath, state);
+    return { ok: true };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (logger && typeof logger.warn === "function") {
+      logger.warn(`[dsh-message-actions] write cost state failed: ${message}`);
+    }
+    return { ok: false, error: "WRITE_FAILED" };
+  }
+}
+
 module.exports = {
   STATE_VERSION,
   MAX_STATE_BYTES,
@@ -236,5 +256,6 @@ module.exports = {
   defaultState,
   normalizeCostState,
   loadCostState,
-  saveCostState
+  saveCostState,
+  persistCostState
 };

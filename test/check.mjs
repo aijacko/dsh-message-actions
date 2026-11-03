@@ -49,6 +49,8 @@ const {
   resolveKeyAction,
   TOOL_NODE_KEY_PREFIX,
   messagesSummaryOf,
+  mergeMessageSummary,
+  isBusyError,
   wordCount,
   previewText,
   formatTokens,
@@ -1682,6 +1684,204 @@ function fakeRes() {
   eq("跨边界：摘要仍回传完整字数", [qRow.words, aRow.words], [500, 600]);
   const rounds = roundsOf(bag, nodes);
   eq("跨边界：分享/导出拿到全文", [rounds[0].question.length, rounds[0].answer.length], [500, 600]);
+}
+
+// ---------------------------------------------------------------------------
+// 45. `/messages` 增量拉取：since 游标 + 客户端合并
+// ---------------------------------------------------------------------------
+// 方案选择：游标（since=<上次 version>），不是已持有 seq 的列表——
+// 现有 seqs 参数是「包含列表」，且长会话里已持有的 seq 会无限增长。
+
+/** 按 index.mjs 的字段写一块墓碑（与本文件其它跨边界用例一致）。 */
+function pushTombstone(bag, plan, id, action) {
+  const seq = bag.length;
+  bag.push({
+    type: "user/message",
+    seq,
+    data: {
+      role: "user",
+      id,
+      content: [{ type: "text", text: "[已删除]" }],
+      source: {
+        kind: "user",
+        producer: PRODUCER,
+        action: action || "delete",
+        via: plan.via,
+        removed: plan.removed,
+        kinds: plan.kinds,
+        turn: plan.turn
+      }
+    },
+    sourceEventSeqs: plan.removed,
+    surfaceOp: { op: "replace", startSeq: plan.startSeq, endSeq: plan.endSeq }
+  });
+  return seq;
+}
+
+{
+  const { events: bag, nodes } = session(makeEvents());
+  const full = messagesSummaryOf(bag, nodes, undefined, { previewLimit: 200 });
+  eq("增量：不带 since 仍是全量（向后兼容）", full.rows.length, 7);
+  eq("增量：全量响应 removedSeqs 为空", full.removedSeqs, []);
+
+  const atEnd = messagesSummaryOf(bag, nodes, undefined, { previewLimit: 200, since: full.version });
+  eq("增量：游标在末尾时无新行", atEnd.rows, []);
+  eq("增量：游标在末尾时无轮次", atEnd.rounds, []);
+  eq("增量：游标在末尾时 version 不变", atEnd.version, full.version);
+  eq("增量：goneTurns 始终全量", atEnd.goneTurns, full.goneTurns);
+  eq("增量：goneTools 始终全量", atEnd.goneTools, full.goneTools);
+
+  const part = messagesSummaryOf(bag, nodes, undefined, { previewLimit: 200, since: 5 });
+  ok("增量：rows 只含 seq > since", part.rows.every((row) => row.seq > 5));
+  eq("增量：rows 只含第二轮两行", part.rows.map((row) => row.seq), [8, 9]);
+  eq("增量：rounds 只含变化的轮次", part.rounds.map((round) => round.turn), [2]);
+  eq("增量：变化轮次的预览仍完整", part.rounds[0].questionPreview, "Next?");
+  eq("增量：变化轮次的回答预览仍完整", part.rounds[0].answerPreview, "Sure");
+
+  const combined = messagesSummaryOf(bag, nodes, undefined, {
+    previewLimit: 200,
+    since: 5,
+    filter: new Set([8])
+  });
+  eq("增量：可与 seqs 包含列表叠加", combined.rows.map((row) => row.seq), [8]);
+}
+
+{
+  // 整轮删除：增量必须带 removedSeqs，合并结果与全量快照逐字段一致。
+  const { events: bag, nodes } = session(makeEvents());
+  const before = messagesSummaryOf(bag, nodes, undefined, { previewLimit: 200 });
+  const plan = planAction(bag, nodes, { action: "delete", seq: 8 });
+  eq("增量删除：计划 ok", plan.ok, true);
+  const tombSeq = pushTombstone(bag, plan, "dma-inc-turn");
+  const staleNodes = nodes.concat([tombSeq]);
+  const inc = messagesSummaryOf(bag, staleNodes, undefined, { previewLimit: 200, since: before.version });
+  eq("增量删除：removedSeqs 含被删行", inc.removedSeqs, plan.removed);
+  eq("增量删除：无新增可见行", inc.rows, []);
+  eq("增量删除：goneTurns 反映整轮消失", inc.goneTurns, [2]);
+  const merged = mergeMessageSummary(before, inc);
+  const fresh = messagesSummaryOf(bag, staleNodes, undefined, { previewLimit: 200 });
+  eq("增量删除：合并后 rows 等于全量", merged.rows, fresh.rows);
+  eq("增量删除：合并后 rounds 等于全量", merged.rounds, fresh.rounds);
+  eq("增量删除：合并后 goneTurns 等于全量", merged.goneTurns, fresh.goneTurns);
+  eq("增量删除：合并后 goneTools 等于全量", merged.goneTools, fresh.goneTools);
+  eq("增量删除：合并后 version 前进", merged.version, fresh.version);
+}
+
+{
+  // 工具行删除：removedSeqs 剔除该行，轮次仍保留（不能误删整轮）。
+  const { events: bag, nodes } = session(makeEvents());
+  bag[4].data.message.source = { kind: "tool", callId: "call_abc" };
+  const before = messagesSummaryOf(bag, nodes, undefined, { previewLimit: 200 });
+  const plan = planAction(bag, nodes, { action: "delete", seq: 4 });
+  eq("增量工具删除：计划 ok", plan.ok, true);
+  const tombSeq = pushTombstone(bag, plan, "dma-inc-tool", "delete");
+  const staleNodes = nodes.concat([tombSeq]);
+  const inc = messagesSummaryOf(bag, staleNodes, undefined, { previewLimit: 200, since: before.version });
+  eq("增量工具删除：removedSeqs 含工具行及其前序答案", inc.removedSeqs, plan.removed);
+  eq("增量工具删除：goneTools 含 callId", inc.goneTools, ["call_abc"]);
+  eq("增量工具删除：轮次未消失", inc.goneTurns, []);
+  const merged = mergeMessageSummary(before, inc);
+  const fresh = messagesSummaryOf(bag, staleNodes, undefined, { previewLimit: 200 });
+  eq("增量工具删除：合并后 rows 等于全量", merged.rows, fresh.rows);
+  eq("增量工具删除：合并后 rounds 等于全量", merged.rounds, fresh.rounds);
+  eq("增量工具删除：被删工具行已剔除", merged.rows.some((row) => row.seq === 4), false);
+  eq("增量工具删除：工具行隐藏信号保留", merged.goneTools, ["call_abc"]);
+}
+
+// ---------------------------------------------------------------------------
+// 46. 写盘失败不再返回成功（持久化结果 + 重启语义）
+// ---------------------------------------------------------------------------
+
+{
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dma-persist-"));
+  const file = path.join(dir, "cost-state.json");
+  const state = store.defaultState();
+  state.correctionCreditCents = 3000;
+  state.correctionDebitCents = 1000;
+
+  eq("持久化：正常写入返回成功", store.persistCostState(file, state, false), { ok: true });
+  const loaded = store.loadCostState(file, null);
+  eq("持久化：重启后校正不丢失（到账）", loaded.state.correctionCreditCents, 3000);
+  eq("持久化：重启后校正不丢失（扣减）", loaded.state.correctionDebitCents, 1000);
+
+  eq(
+    "持久化：只读模式返回 READ_ONLY",
+    store.persistCostState(file, state, true),
+    { ok: false, error: "READ_ONLY" }
+  );
+  eq("持久化：只读模式不改动磁盘", store.loadCostState(file, null).state.correctionCreditCents, 3000);
+
+  // 父路径是普通文件 → mkdir/rename 必然失败，用于模拟写盘异常。
+  fs.writeFileSync(path.join(dir, "blocker"), "x");
+  eq(
+    "持久化：写盘失败返回 WRITE_FAILED",
+    store.persistCostState(path.join(dir, "blocker", "cost-state.json"), state, false),
+    { ok: false, error: "WRITE_FAILED" }
+  );
+  eq("持久化：失败时磁盘仍保留旧值", store.loadCostState(file, null).state.correctionCreditCents, 3000);
+
+  eq("错误码文案：只读（中）", s.ERROR_LABELS.zh.READ_ONLY.length > 0, true);
+  eq("错误码文案：写盘失败（英）", s.ERROR_LABELS.en.WRITE_FAILED.length > 0, true);
+  fs.rmSync(dir, { recursive: true, force: true });
+}
+
+// ---------------------------------------------------------------------------
+// 47. AGENT_BUSY 判定：结构化字段优先，文案兜底
+// ---------------------------------------------------------------------------
+
+{
+  eq(
+    "busy：结构化 code=AGENT_BUSY",
+    isBusyError(Object.assign(new Error("closure failed"), { code: "AGENT_BUSY" })),
+    true
+  );
+  eq("busy：结构化 code=EBUSY", isBusyError({ code: "EBUSY" }), true);
+  eq("busy：结构化 code 大小写不敏感", isBusyError({ code: "agent_busy" }), true);
+  eq("busy：结构化 status=423", isBusyError({ status: 423, message: "other text" }), true);
+  eq("busy：结构化 statusCode=423", isBusyError({ statusCode: 423 }), true);
+  eq("busy：只有文案（宿主现状）", isBusyError(new Error('agent "x" already has active work')), true);
+  eq(
+    "busy：有 code 时以 code 为准（文案不生效）",
+    isBusyError(Object.assign(new Error("already has active work"), { code: "EIO" })),
+    false
+  );
+  eq("busy：普通错误不误判", isBusyError(new Error("something else")), false);
+  eq("busy：非对象不误判", isBusyError(null), false);
+  eq("busy：字符串不误判", isBusyError("already has active work"), false);
+}
+
+// ---------------------------------------------------------------------------
+// 48. 影响面断言：路由 / 客户端用上了上述语义
+// ---------------------------------------------------------------------------
+
+{
+  const root = fileURLToPath(new URL("..", import.meta.url));
+  const indexSrc = fs.readFileSync(path.join(root, "src", "index.mjs"), "utf8");
+  const clientSrc = fs.readFileSync(path.join(root, "src", "client.js"), "utf8");
+
+  ok("路由：busy 判定使用 isBusyError", /if \(isBusyError\(err\)\)/.test(indexSrc));
+  ok("路由：/messages 解析 since 游标", /searchParams\.get\("since"\)/.test(indexSrc));
+  ok(
+    "路由：校正落盘失败返回 500",
+    /if \(!saved\.ok\) \{[\s\S]{0,160}sendError\(res, 500, saved\.error\)/.test(indexSrc)
+  );
+  ok(
+    "路由：校正落盘失败回滚内存字段",
+    /const saved = persist\(\);[\s\S]{0,220}state\.correctionCreditCents = previous\.credit/.test(indexSrc)
+  );
+  ok("store：persist 返回结构化结果", /return persistCostState\(statePath, state, readOnly, ctx\.logger\)/.test(indexSrc));
+
+  ok("浮层：分享/导出不再无条件关闭", !/runShare: async[\s\S]{0,200}controller\.dismiss\(\)/.test(clientSrc));
+  ok("浮层：成功才关闭", /\.then\(\(done\) => \{[\s\S]{0,80}onDismiss\(\);/.test(clientSrc));
+  ok("浮层：失败复位 busy", /\.catch\(\(\) => \{[\s\S]{0,80}setBusy\(false\);/.test(clientSrc));
+  ok(
+    "分享图：成功路径返回 Promise<boolean>",
+    /return new Promise\(\(resolve\) => \{/.test(clientSrc) && /resolve\(true\)/.test(clientSrc)
+  );
+  ok("分享图：失败路径 resolve(false)", /img\.onerror = \(\) => \{[\s\S]{0,60}resolve\(false\);/.test(clientSrc));
+  ok("增量：普通刷新带 since", /"&since=" \+ cursor/.test(clientSrc));
+  ok("增量：版本回退时全量重取", /cursor = null;[\s\S]{0,160}messagesUrl\(cursor\)/.test(clientSrc));
+  ok("增量：客户端合并使用共享纯函数", /mergeMessageSummary\(base, data\.value\)/.test(clientSrc));
 }
 
 // ---------------------------------------------------------------------------
