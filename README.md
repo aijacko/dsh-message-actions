@@ -185,7 +185,7 @@ This section only describes what the code actually does. It is risk reduction, n
 
 **Conversation data**
 
-- The `GET /messages` endpoint polled every 3 seconds is a **summary** interface: it returns message ids, turn, step, a preview of at most 200 characters, usage, and the tool `callId`; no body text.
+- `GET /messages` is a **summary** interface: it returns message ids, turn, step, a preview of at most 200 characters, usage, and the tool `callId`; no body text. The client has no fixed polling timer: it refetches when the conversation DOM changes, coalesced by a 120 ms scheduler, with a 3-second TTL to avoid duplicate requests.
 - `preview` is only generated for real questions and assistant answers; system / developer messages, runtime-injected context, and tool results are always empty, so their text is never returned by this endpoint (implementation: `messagesSummaryOf` in `src/shared.cjs`).
 - Share images and export fetch full text only for the selected turns via `full=1`, and only questions / answers are returned.
 
@@ -230,7 +230,7 @@ src/
 ├── index.mjs    # host: Config + 4 HTTP routes + cost service
 ├── client.js    # client: slots, DOM injection, share / export overlay, cost card
 ├── shared.cjs   # pure functions shared by host and client (offline testable)
-├── store.cjs    # cost state file: atomic read/write, recovery, 90-day pruning
+├── store.cjs    # cost state file: atomic read/write, recovery on corrupt files
 ├── http.cjs     # HTTP helpers: JSON responses, 413 drain, body reading
 └── i18n.cjs     # single source for Chinese/English copy (builds locale/*.json)
 test/check.mjs   # dependency-free assertion script

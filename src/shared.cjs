@@ -264,12 +264,26 @@ function isEditableTarget(target) {
   return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT';
 }
 
+/** 判断键盘事件目标是否落在按钮上（按钮上的 Enter 由原生 click 处理）。 */
+function isButtonTarget(target) {
+  if (!target || typeof target !== 'object') return false;
+  if (typeof target.closest === 'function') {
+    try {
+      if (target.closest('button')) return true;
+    } catch {
+      /* 非 DOM 环境，回退到 tagName */
+    }
+  }
+  const tag = typeof target.tagName === 'string' ? target.tagName.toUpperCase() : '';
+  return tag === 'BUTTON';
+}
+
 /**
  * 浮层键盘行为判定（纯函数，供客户端与离线测试共用）。
  *
  * - 浮层未打开：一律 none（不拦截宿主快捷键）。
  * - Esc：dismiss。
- * - Enter：焦点在输入框 / 可编辑区域、或主操作不可用 / 正在执行时返回 none；
+ * - Enter：焦点在输入框 / 可编辑区域 / 按钮上、或主操作不可用 / 正在执行时返回 none；
  *   否则返回 primary。disabled 时客户端选择「什么都不做」，与点击禁用按钮一致。
  * - 其它键：none。
  *
@@ -281,7 +295,8 @@ function resolveKeyAction(params) {
   if (opts.overlayOpen !== true) return 'none';
   if (opts.key === 'Escape' || opts.key === 'Esc') return 'dismiss';
   if (opts.key !== 'Enter') return 'none';
-  if (isEditableTarget(opts.target)) return 'none';
+  // 焦点落在按钮上时交给原生 click：否则「取消」按钮上按 Enter 会同时触发主操作。
+  if (isEditableTarget(opts.target) || isButtonTarget(opts.target)) return 'none';
   if (opts.busy === true) return 'none';
   if (opts.primaryEnabled === false) return 'none';
   return 'primary';

@@ -185,7 +185,7 @@ pnpm add "file:/path/to/dsh-message-actions"
 
 **会话数据**
 
-- 3 秒轮询的 `GET /messages` 是**摘要接口**：只回消息 id、轮次、step、最多 200 字符的短预览、用量与工具 `callId`，不含正文。
+- `GET /messages` 是**摘要接口**：只回消息 id、轮次、step、最多 200 字符的短预览、用量与工具 `callId`，不含正文。客户端不设固定轮询定时器：会话 DOM 变化时触发，经 120ms 合并调度，并用 3 秒 TTL 避免重复请求。
 - `preview` 只对真实提问与助手回答生成；system / developer 消息、运行时注入的上下文与工具结果一律回空，正文不会被该接口回传（代码位置：`src/shared.cjs` 的 `messagesSummaryOf`）。
 - 分享图与导出需要全文时，才按选中的轮次请求 `full=1`，且只返回问 / 答文本。
 
@@ -230,7 +230,7 @@ src/
 ├── index.mjs    # 宿主：Config + 4 条 HTTP 路由 + 费用服务
 ├── client.js    # 客户端：槽位、DOM 注入、分享 / 导出浮层、费用卡片
 ├── shared.cjs   # 宿主与客户端共用的纯函数（可离线测试）
-├── store.cjs    # 费用状态文件原子读写、损坏恢复、90 天裁剪
+├── store.cjs    # 费用状态文件原子读写、损坏恢复
 ├── http.cjs     # HTTP 工具：JSON 响应、413 排空、请求体读取
 └── i18n.cjs     # 中英文案单一来源（构建时生成 locale/*.json）
 test/check.mjs   # 无依赖的断言脚本

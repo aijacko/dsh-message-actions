@@ -427,10 +427,11 @@ function createCostService(ctx, config) {
   const readOnly = loaded.readOnly;
 
   if (!isEnabled()) {
-    // 总开关关闭：重新开启后从新余额继续，不补记关闭期间的差额。
+    // 启动时总开关关闭：丢掉上次的余额基线，重新开启后首次观测只建基线，不补记关闭期间的差额。
     state.lastBalanceCents = null;
     state.lastBalanceAt = 0;
   }
+  let lastEnabled = isEnabled();
 
   const cache = { rechargeCents: null, bonusCents: null, totalCents: null, updatedAt: 0 };
   const buffers = new Map();
@@ -534,7 +535,18 @@ function createCostService(ctx, config) {
 
   /** 背景 / 强制刷新；单飞 + 60s 节流 + 10s 超时。 */
   function refresh(force) {
-    if (!isEnabled()) return Promise.resolve();
+    const enabled = isEnabled();
+    if (enabled !== lastEnabled) {
+      lastEnabled = enabled;
+      if (!enabled) {
+        // 运行中关闭总开关：与「启动时已关闭」同路径，丢弃余额基线。
+        // 重新开启后首次观测只建基线，不把关闭期间的消费计入「日用」。
+        state.lastBalanceCents = null;
+        state.lastBalanceAt = 0;
+        persist();
+      }
+    }
+    if (!enabled) return Promise.resolve();
     if (inFlight) return inFlight;
     const now = Date.now();
     if (!force && now - state.lastAttemptAt < COST_REFRESH_MIN_INTERVAL_MS) return Promise.resolve();

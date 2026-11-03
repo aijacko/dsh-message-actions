@@ -722,7 +722,7 @@ window.__ModuleLoader__.load({
         const config = controller.config();
         const existing = row.querySelector("[data-dma-tool-actions]");
         if (config.delete === false) {
-          if (existing) existing.remove();
+          if (existing) disposeActionsRow(existing);
           continue;
         }
 
@@ -730,7 +730,7 @@ window.__ModuleLoader__.load({
         const lang = detectLang();
         const signature = (running ? "R" : "I") + (lang === "zh" ? "Z" : "E");
         if (existing && existing.getAttribute("data-dma-sig") === signature) continue;
-        if (existing) existing.remove();
+        if (existing) disposeActionsRow(existing);
 
         const wrap = document.createElement("span");
         wrap.className = "dma-tool-actions";

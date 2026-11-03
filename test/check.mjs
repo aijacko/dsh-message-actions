@@ -874,6 +874,14 @@ function bj(y, m, d, hh, mm) {
   eq("非 account 不更新 lastBalance", apiKey.state.lastBalanceCents, 20000);
 
   eq("非法金额 → invalid", s.observeBalance(store.defaultState(), { cents: Number.NaN, routing: "account", at: at1 }).reason, "invalid");
+
+  // 开 → 关 → 开：关闭时清空基线（lastBalanceCents / lastBalanceAt 置空），
+  // 重新开启后的首次观测只建基线，不补记关闭期间产生的消费。
+  const closed = Object.assign({}, r.state, { lastBalanceCents: null, lastBalanceAt: 0 });
+  const reopened = s.observeBalance(closed, { cents: 1200, routing: "account", at: at1 + 3600000 });
+  eq("关闭再开启 → 首次观测只建基线", reopened.reason, "first");
+  eq("不补记关闭期间消费", reopened.state.observedSpendTotalCents, r.state.observedSpendTotalCents);
+  eq("关闭期间消费不进当日日用", reopened.state.dailySpendCents["2026-11-02"], 84);
 }
 
 // ---------------------------------------------------------------------------
@@ -1304,6 +1312,7 @@ function fakeRes() {
   eq("计费样式默认值为单行", DEFAULT_COST_LAYOUT, "compact");
   eq("计费样式选项顺序为单行在前", COST_LAYOUTS, ["compact", "default"]);
   eq("Config 计费样式默认单行", /costLayout:\s*z\.string\(\)\.default\("compact"\)\.volatile\(\)/.test(indexSource), true);
+  ok("总开关运行时由开启转关闭会丢弃余额基线", /if \(enabled !== lastEnabled\)/.test(indexSource));
   ok(
     "Config 中计费样式排在单次消耗之前",
     indexSource.indexOf("costLayout:") !== -1
@@ -1448,11 +1457,15 @@ function fakeRes() {
   const input = { tagName: "INPUT" };
   const area = { tagName: "TEXTAREA" };
   const editable = { tagName: "DIV", isContentEditable: true };
+  const button = { tagName: "BUTTON" };
+  const buttonChild = { tagName: "SPAN", closest: (sel) => (sel === "button" ? button : null) };
   const base = { overlayOpen: true, primaryEnabled: true, busy: false };
   eq("浮层内 Enter 触发主操作", resolveKeyAction({ ...base, key: "Enter", target: div }), "primary");
   eq("焦点在 input 时不触发", resolveKeyAction({ ...base, key: "Enter", target: input }), "none");
   eq("焦点在 textarea 时不触发", resolveKeyAction({ ...base, key: "Enter", target: area }), "none");
   eq("contenteditable 内不触发", resolveKeyAction({ ...base, key: "Enter", target: editable }), "none");
+  eq("焦点在「取消」按钮上不触发主操作", resolveKeyAction({ ...base, key: "Enter", target: button }), "none");
+  eq("焦点在按钮内的子元素上不触发主操作", resolveKeyAction({ ...base, key: "Enter", target: buttonChild }), "none");
   eq("busy 时不触发", resolveKeyAction({ ...base, busy: true, key: "Enter", target: div }), "none");
   eq("主操作 disabled 时不触发", resolveKeyAction({ ...base, primaryEnabled: false, key: "Enter", target: div }), "none");
   eq("Esc 关闭浮层", resolveKeyAction({ ...base, key: "Escape", target: div }), "dismiss");

@@ -227,25 +227,6 @@ function saveCostState(filePath, state) {
   }
 }
 
-/** 90 天日累计裁剪（就地替换 state.dailySpendCents）。 */
-function pruneDaily(daily, nowMs, keepDays) {
-  const days = Number.isFinite(keepDays) ? keepDays : 90;
-  const beijingKey = (ms) => {
-    const d = new Date(ms + 8 * 3600 * 1000);
-    const pad = (n) => String(n).padStart(2, "0");
-    return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}`;
-  };
-  const cutoff = beijingKey((Number.isFinite(nowMs) ? nowMs : Date.now()) - days * 24 * 3600 * 1000);
-  const out = {};
-  for (const [key, value] of Object.entries(daily || {})) {
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(key)) continue;
-    if (key < cutoff) continue;
-    if (!Number.isFinite(value)) continue;
-    out[key] = Math.round(value);
-  }
-  return out;
-}
-
 module.exports = {
   STATE_VERSION,
   MAX_STATE_BYTES,
@@ -255,6 +236,5 @@ module.exports = {
   defaultState,
   normalizeCostState,
   loadCostState,
-  saveCostState,
-  pruneDaily
+  saveCostState
 };
