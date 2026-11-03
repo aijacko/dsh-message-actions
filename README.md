@@ -90,9 +90,25 @@ New installations default to **single-line**; users who have already saved a pre
 
 ## Installation
 
-### Plugin marketplace
+### From npm
 
-Search for `dsh-message-actions` in the DSH plugin marketplace and install it (if it isn't listed yet, use the local install below), then restart DSH.
+```bash
+npm install dsh-message-actions
+```
+
+The published package is `dsh-message-actions@0.2.1`. In DSH you can also install by package name: Plugins → Installed → **+ Add plugin** → enter `dsh-message-actions` → restart DSH.
+
+### Plugin marketplace index source
+
+The package is listed in this plugin-market index:
+
+```text
+https://raw.githubusercontent.com/aijacko/dsh-message-actions/main/market/index.json
+```
+
+1. Plugins → **Experimental plugins** → More → turn on **Custom plugin marketplace**.
+2. Plugins → **Discover** → **Add index source** → paste the URL above.
+3. Search `dsh-message-actions`, check that the source is the npm package and registry, install, then restart DSH.
 
 ### Local install
 
@@ -240,6 +256,7 @@ test/check.mjs   # dependency-free assertion script
 
 
 - Version: `0.2.1`
+- Release: [v0.2.1](https://github.com/aijacko/dsh-message-actions/releases/tag/v0.2.1)
 - Compatible with: tested on DSH `0.2.1-rc.5` desktop (profile `desktop`)
 - Dependencies: none at runtime
 

@@ -90,9 +90,25 @@ DSH 本身没有撤回和删除，发错一句只能重开会话；想把一段�
 
 ## 安装
 
-### 插件市场
+### 从 npm 安装
 
-在 DSH 插件市场搜索 `dsh-message-actions` 安装；尚未上架时可改用下方的本地安装。安装后重启 DSH。
+```bash
+npm install dsh-message-actions
+```
+
+已发布包为 `dsh-message-actions@0.2.1`。在 DSH 里也可以按包名安装：插件 → 已安装 → **+ 添加插件** → 输入 `dsh-message-actions` → 重启 DSH。
+
+### 插件市场索引源
+
+本插件收录在下面这个市场索引里：
+
+```text
+https://raw.githubusercontent.com/aijacko/dsh-message-actions/main/market/index.json
+```
+
+1. 插件 → **实验性插件** → 更多 → 打开 **自定义插件市场**。
+2. 插件 → **发现** → **添加索引源** → 粘贴上面的 URL。
+3. 搜索 `dsh-message-actions`，确认来源是 npm 包与注册表，安装后重启 DSH。
 
 ### 本地安装
 
@@ -240,6 +256,7 @@ test/check.mjs   # 无依赖的断言脚本
 
 
 - 版本：`0.2.1`
+- 发布说明：[v0.2.1](https://github.com/aijacko/dsh-message-actions/releases/tag/v0.2.1)
 - 兼容：在 DSH `0.2.1-rc.5` 桌面版（profile `desktop`）实测通过
 - 依赖：无运行时第三方依赖
 
