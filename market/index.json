@@ -1,0 +1,66 @@
+{
+  "format": 1,
+  "title": {
+    "en": "Jacko's DSH plugins",
+    "zh": "Jacko 的 DSH 插件"
+  },
+  "metadata": {
+    "categories": {
+      "conversation": {
+        "title": {
+          "en": "Conversation",
+          "zh": "会话"
+        }
+      }
+    },
+    "labels": {
+      "messages": {
+        "title": {
+          "en": "Messages",
+          "zh": "消息增强"
+        }
+      },
+      "cost": {
+        "title": {
+          "en": "Cost",
+          "zh": "费用统计"
+        }
+      }
+    }
+  },
+  "plugins": [
+    {
+      "name": "dsh-message-actions",
+      "title": {
+        "en": "Messages & Cost",
+        "zh": "消息费用"
+      },
+      "description": {
+        "en": "Undo, delete, share and export messages, with DeepSeek balance and cost statistics.",
+        "zh": "撤回、删除、删至末尾、分享、导出消息，并统计 DeepSeek 余额与费用。"
+      },
+      "icon": "../icon.svg",
+      "author": "aijacko",
+      "homepage": "https://github.com/aijacko/dsh-message-actions#readme",
+      "repository": {
+        "url": "https://github.com/aijacko/dsh-message-actions"
+      },
+      "metadata": {
+        "category": "conversation",
+        "labels": [
+          "messages",
+          "cost"
+        ]
+      },
+      "versions": [
+        {
+          "version": "0.2.1",
+          "publishTimestamp": 1793697517,
+          "source": {
+            "type": "npm"
+          }
+        }
+      ]
+    }
+  ]
+}
