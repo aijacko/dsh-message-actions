@@ -90,17 +90,28 @@ DSH 本身没有撤回和删除，发错一句只能重开会话；想把一段�
 
 ## 安装
 
+### 从插件市场安装
+
+1. 插件 → **插件市场** 标签 → 搜索框输入 `dsh-message-actions`。
+2. 卡片右侧点「安装」；装好后同一张卡片显示「已安装」徽标。
+
+### 添加插件（按包名）
+
+1. 插件 → 右上角 **+ 添加插件**。
+2. 输入 `dsh-message-actions`；默认源慢时，「安装源」选 **中国大陆镜像源**。
+3. 点「安装」。已装时会提示「该插件已安装，如需升级，请卸载后重新安装」。
+
 ### 从 npm 安装
 
 ```bash
 npm install dsh-message-actions
 ```
 
-已发布包为 `dsh-message-actions@0.2.1`。在 DSH 里也可以按包名安装：插件 → 已安装 → **+ 添加插件** → 输入 `dsh-message-actions` → 重启 DSH。
+已发布包为 `dsh-message-actions@0.2.1`。
 
-### 插件市场索引源
+### 自建市场索引源（可选）
 
-本插件收录在下面这个市场索引里：
+市场未收录或想固定来源时，可以添加本插件自己的索引：
 
 ```text
 https://raw.githubusercontent.com/aijacko/dsh-message-actions/main/market/index.json

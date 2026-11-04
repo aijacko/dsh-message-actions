@@ -90,17 +90,28 @@ New installations default to **single-line**; users who have already saved a pre
 
 ## Installation
 
-### From npm
+### Install from the plugin marketplace
+
+1. Plugins → **Plugin marketplace** tab → type `dsh-message-actions` in the search box.
+2. Click **Install** on the card. Once installed, the card shows the **Installed** badge.
+
+### Add the plugin by package name
+
+1. Plugins → **+ Add plugin** (top right).
+2. Enter `dsh-message-actions`; if the default registry is slow, choose **Mainland China mirror** as the install source.
+3. Click **Install**. If it is already installed, DSH tells you: "This plugin is already installed. To upgrade, uninstall and reinstall it."
+
+### Install from npm
 
 ```bash
 npm install dsh-message-actions
 ```
 
-The published package is `dsh-message-actions@0.2.1`. In DSH you can also install by package name: Plugins → Installed → **+ Add plugin** → enter `dsh-message-actions` → restart DSH.
+The published package is `dsh-message-actions@0.2.1`.
 
-### Plugin marketplace index source
+### Self-hosted market index source (optional)
 
-The package is listed in this plugin-market index:
+The plugin also has its own market index, useful when a marketplace does not list it or you want a pinned source:
 
 ```text
 https://raw.githubusercontent.com/aijacko/dsh-message-actions/main/market/index.json
