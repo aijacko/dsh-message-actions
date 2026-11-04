@@ -179,6 +179,7 @@ Settings → Plugins → **Messages & Cost**; the page has two tabs, and changes
 | Delete to end | Show "Delete to end" on question rows |
 | Confirm actions | Whether recall and delete actions ask for confirmation |
 | Reply statistics | Whether `tok · chars` is shown under answers |
+| Completion sound | Play a short chime when a reply finishes (on by default) |
 
 **Cost Statistics**
 
@@ -224,6 +225,8 @@ This section only describes what the code actually does. It is risk reduction, n
 - Contents are only balance observations, correction values, and per-day spend; no conversation text.
 - Balance correction reports success only after the state file is written: a read-only state file returns `500 READ_ONLY`, a failed write returns `500 WRITE_FAILED` and rolls the in-memory correction back, so the UI shows "save failed" instead of a false success.
 - A file over 4MB is rebuilt as the default state and logged with the reason and size; a corrupt file under the limit is renamed to `cost-state.bad-<timestamp>.json` and kept.
+- Settlement is pushed: the client long-polls `/cost/state` with `wait=<lastTurn.at>` (up to 10 seconds), and the host answers as soon as `turn/end` is processed, so the per-turn cost does not wait for the next 5-second poll; the chime fires in the same state update as the number.
+- The chime is synthesised in the client with Web Audio (880→660 Hz sine, about 0.36 s); no audio file, no network request, no state file. It plays once per turn and is skipped silently when the `AudioContext` is suspended by browser policy.
 
 **Network**
 
@@ -250,7 +253,7 @@ This section only describes what the code actually does. It is risk reduction, n
 
 ```bash
 node build.mjs        # build to lib/
-node test/check.mjs   # offline assertions, 2609 currently
+node test/check.mjs   # offline assertions, 2626 currently
 # plus a real session-log regression: 18/18
 ```
 

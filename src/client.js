@@ -49,6 +49,8 @@ window.__ModuleLoader__.load({
       findToolRowByCallId,
       resolveKeyAction,
       mergeMessageSummary,
+      completionSoundEnabled,
+      shouldPlayCompletionSound,
       formatTokens,
       railTurnOfAttributes,
       createScheduler,
@@ -282,6 +284,83 @@ window.__ModuleLoader__.load({
       return snap.value.usageStats !== false;
     }
 
+    let lastTurnAtApplied = null;
+    let lastPlayedTurnAt = null;
+    let audioCtx = null;
+
+    /** 提示音开关（默认 true）；设置快照未就绪时按开启处理。 */
+    function soundEnabledNow() {
+      if (!costForm || typeof costForm.getSnapshot !== "function") return true;
+      const snap = costForm.getSnapshot();
+      if (!snap || snap.status !== "ready" || typeof snap.value !== "object" || !snap.value) return true;
+      return completionSoundEnabled(snap.value);
+    }
+
+    function perTurnNow() {
+      if (!costForm || typeof costForm.getSnapshot !== "function") return true;
+      const snap = costForm.getSnapshot();
+      if (!snap || snap.status !== "ready" || typeof snap.value !== "object" || !snap.value) return true;
+      return snap.value.costPerTurn !== false;
+    }
+
+    /**
+     * Web Audio 现场合成，不依赖音频文件或网络：
+     * 880Hz → 660Hz 两段正弦，约 0.36s，音量约 0.09。
+     * 任何失败（无 AudioContext、被浏览器策略挂起、节点创建失败）都静默返回 false。
+     */
+    function playCompletionSound() {
+      try {
+        const Ctor = typeof window !== "undefined" ? window.AudioContext || window.webkitAudioContext : null;
+        if (!Ctor) return false;
+        if (!audioCtx) audioCtx = new Ctor();
+        if (audioCtx.state !== "running") {
+          // 挂起时静默跳过：不弹 toast、不影响费用数字。
+          if (typeof audioCtx.resume === "function") audioCtx.resume().catch(() => {});
+          return false;
+        }
+        const now = audioCtx.currentTime;
+        const gain = audioCtx.createGain();
+        gain.gain.setValueAtTime(0.0001, now);
+        gain.gain.exponentialRampToValueAtTime(0.09, now + 0.03);
+        gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.34);
+        gain.connect(audioCtx.destination);
+        const osc = audioCtx.createOscillator();
+        osc.type = "sine";
+        osc.frequency.setValueAtTime(880, now);
+        osc.frequency.setValueAtTime(660, now + 0.14);
+        osc.connect(gain);
+        osc.start(now);
+        osc.stop(now + 0.36);
+        return true;
+      } catch {
+        return false;
+      }
+    }
+
+    /** 单次费用写明的那一刻判定提示音：同一状态更新里出数字、响一次。 */
+    function maybeCompletionSound(value) {
+      const turn = value && value.lastTurn ? value.lastTurn : null;
+      const at = turn && Number.isFinite(turn.at) ? turn.at : null;
+      if (at === null) return;
+      const previousAt = lastTurnAtApplied;
+      lastTurnAtApplied = at;
+      if (previousAt === null) return; // 首次快照只记基线，刷新页面不补响
+      if (!shouldPlayCompletionSound({
+        enabled: costEnabledNow() && soundEnabledNow(),
+        settled: true,
+        previousAt,
+        at,
+        lastPlayedAt: lastPlayedTurnAt
+      })) return;
+      lastPlayedTurnAt = at;
+      playCompletionSound();
+    }
+
+    function applyCostState(value) {
+      patchCostState({ status: "ready", value, fetchedAt: Date.now(), error: "" });
+      maybeCompletionSound(value);
+    }
+
     async function fetchCostState(force) {
       try {
         const { status, data } = await getJson(
@@ -289,7 +368,7 @@ window.__ModuleLoader__.load({
           force ? "refresh=1" : undefined
         );
         if (status === 200 && data && data.ok && data.value) {
-          patchCostState({ status: "ready", value: data.value, fetchedAt: Date.now(), error: "" });
+          applyCostState(data.value);
           return data.value;
         }
         patchCostState({ status: "error", error: "request" });
@@ -305,6 +384,39 @@ window.__ModuleLoader__.load({
       }
     }
 
+    // 结算推送：带 wait=<已知 lastTurn.at> 的长轮询，宿主结算后立即返回。
+    let costWaitTimer = null;
+    let costWaitActive = false;
+
+    function costWaitStep() {
+      costWaitTimer = null;
+      if (!costPolling || !costWaitActive) return;
+      if (typeof document !== "undefined" && document.hidden) {
+        costWaitTimer = setTimeout(costWaitStep, 1500);
+        return;
+      }
+      if (!costEnabledNow() || !perTurnNow()) {
+        costWaitTimer = setTimeout(costWaitStep, 1500);
+        return;
+      }
+      const wait = lastTurnAtApplied === null ? 0 : lastTurnAtApplied;
+      getJson("/dsh-message-actions/cost/state", "wait=" + wait)
+        .then(({ status, data }) => {
+          if (!costPolling || !costWaitActive) return;
+          if (status === 200 && data && data.ok && data.value) applyCostState(data.value);
+          costWaitTimer = setTimeout(costWaitStep, 0);
+        })
+        .catch(() => {
+          costWaitTimer = setTimeout(costWaitStep, 2000);
+        });
+    }
+
+    function startCostWaitLoop() {
+      if (costWaitActive) return;
+      costWaitActive = true;
+      costWaitStep();
+    }
+
     function startCostPolling(form) {
       costForm = form;
       if (costPolling) return;
@@ -316,6 +428,7 @@ window.__ModuleLoader__.load({
       };
       tick();
       costPollTimer = setInterval(tick, COST_POLL_MS);
+      startCostWaitLoop();
       if (typeof document !== "undefined" && !costVisibilityBound) {
         costVisibilityBound = true;
         document.addEventListener("visibilitychange", onCostVisibility);
@@ -324,6 +437,11 @@ window.__ModuleLoader__.load({
 
     function stopCostPolling() {
       costPolling = false;
+      costWaitActive = false;
+      if (costWaitTimer !== null) {
+        clearTimeout(costWaitTimer);
+        costWaitTimer = null;
+      }
       if (costPollTimer !== null) {
         clearInterval(costPollTimer);
         costPollTimer = null;
@@ -1413,7 +1531,8 @@ window.__ModuleLoader__.load({
       ["delete", "settings.delete", "settings.deleteDesc"],
       ["deleteFrom", "settings.deleteFrom", "settings.deleteFromDesc"],
       ["confirm", "settings.confirm", "settings.confirmDesc"],
-      ["stats", "settings.stats", "settings.statsDesc"]
+      ["stats", "settings.stats", "settings.statsDesc"],
+      ["sound", "settings.sound", "settings.soundDesc", true]
     ];
 
     function SettingRow({ t: tt, labelKey, descKey, on, disabled, onToggle }) {
@@ -1721,8 +1840,8 @@ window.__ModuleLoader__.load({
         ),
         tab === "actions"
           ? e("div", { className: "dma-settings-panel" },
-            SETTING_FIELDS.map(([key, labelKey, descKey]) => {
-              const on = value ? value[key] === true : false;
+            SETTING_FIELDS.map(([key, labelKey, descKey, defaultOn]) => {
+              const on = value ? (defaultOn ? value[key] !== false : value[key] === true) : defaultOn === true;
               return e(SettingRow, {
                 key,
                 t: tt,

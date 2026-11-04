@@ -1235,6 +1235,33 @@ function costSwitches(config) {
   };
 }
 
+/** 完成提示音开关：默认开启，只有显式 `false` 才关闭。 */
+function completionSoundEnabled(config) {
+  const cfg = config || {};
+  return cfg.sound !== false;
+}
+
+/**
+ * 判断这一轮是否该播放完成提示音。
+ * - 开关必须开启、本轮已结算（`settled !== false`）且拿到有效结算时间；
+ * - `previousAt` 相同说明还是上一轮（重渲染 / 重复拉取），不重复响；
+ * - `lastPlayedAt` 记录已响过的轮次，迟到回调不补响；
+ * - 宿主仍忙（`busy === true`）时不响。
+ * @param {{enabled?:boolean, busy?:boolean, settled?:boolean, previousAt?:number|null, at?:number|null, lastPlayedAt?:number|null}} options
+ * @returns {boolean}
+ */
+function shouldPlayCompletionSound(options) {
+  const opt = options || {};
+  if (opt.enabled !== true) return false;
+  if (opt.busy === true) return false;
+  if (opt.settled === false) return false;
+  const at = opt.at;
+  if (!Number.isFinite(at) || at <= 0) return false;
+  if (Number.isFinite(opt.previousAt) && opt.previousAt === at) return false;
+  if (Number.isFinite(opt.lastPlayedAt) && opt.lastPlayedAt === at) return false;
+  return true;
+}
+
 /**
  * 聚合一轮（turn/start…turn/end）内各 step 的 usage。
  * 每个 step 只取最后一个有效 assistant 结果（message 优先，其次 attempt），
@@ -1758,6 +1785,8 @@ module.exports = {
   routeOfUsage,
   routingOfProvider,
   costSwitches,
+  completionSoundEnabled,
+  shouldPlayCompletionSound,
   COST_LAYOUTS,
   DEFAULT_COST_LAYOUT,
   normalizeCostLayout,

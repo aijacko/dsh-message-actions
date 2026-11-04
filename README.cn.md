@@ -179,6 +179,7 @@ pnpm add "file:/path/to/dsh-message-actions"
 | 删至末尾 | 提问行显示「删至末尾」 |
 | 操作确认 | 撤回与删除类操作是否弹确认框 |
 | 回答统计 | 回答下方是否显示 `tok · 字` |
+| 完成提示音 | 每轮回答结束时播放一次简短提示音（默认开启） |
 
 **费用统计**
 
@@ -224,6 +225,8 @@ pnpm add "file:/path/to/dsh-message-actions"
 - 内容只有余额观测、校正值与按日消费，没有对话正文。
 - 余额校正只在状态文件写成功后才算成功：只读状态文件返回 `500 READ_ONLY`，写盘失败返回 `500 WRITE_FAILED` 并回滚内存中的校正值，界面提示「保存失败」而不是假装成功。
 - 文件超过 4MB 会自动重建为默认状态，并记一条含原因与大小的诊断日志；未超限但 JSON 损坏时，原文件改名为 `cost-state.bad-<时间戳>.json` 留档。
+- 结算完成即推送：客户端用 `wait=<lastTurn.at>` 的长轮询（最长 10 秒）挂在 `/cost/state` 上，宿主处理 `turn/end` 后立刻返回，单次费用不用等下一次 5 秒轮询；提示音在同一次状态更新里触发，和数字同时出现。
+- 提示音由客户端用 Web Audio 现场合成（880→660Hz 两段正弦，约 0.36 秒），不加载音频文件、不联网、不写状态文件；同一轮只响一次，`AudioContext` 被浏览器策略挂起时静默跳过，不弹提示。
 
 **网络**
 
@@ -250,7 +253,7 @@ pnpm add "file:/path/to/dsh-message-actions"
 
 ```bash
 node build.mjs        # 构建到 lib/
-node test/check.mjs   # 离线断言，当前 2609 项
+node test/check.mjs   # 离线断言，当前 2626 项
 # 另有真实会话日志回归：18/18
 ```
 

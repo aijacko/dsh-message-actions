@@ -70,6 +70,7 @@ const Config = z.object({
   deleteFrom: z.boolean().default(true).volatile(),
   confirm: z.boolean().default(true).volatile(),
   stats: z.boolean().default(true).volatile(),
+  sound: z.boolean().default(true).volatile(),
 
   // —— 费用统计（新增）——
   usageStats: z.boolean().default(true).volatile(),
@@ -348,6 +349,8 @@ function makeMessagesHandler(ctx) {
 // ---------------------------------------------------------------------------
 
 const COST_REFRESH_MIN_INTERVAL_MS = 60 * 1000;
+// 结算推送：客户端长轮询最长等待时长，必须小于客户端 15s 请求超时。
+const COST_SETTLE_WAIT_MS = 10 * 1000;
 const COST_BALANCE_TIMEOUT_MS = 10 * 1000;
 const ROUTING_TIMEOUT_MS = 3 * 1000;
 const ROUTING_CACHE_MS = 5 * 1000;
@@ -450,6 +453,31 @@ function createCostService(ctx, config) {
   const buffers = new Map();
   const MAX_BUFFERS = 200;
   let lastTurn = null;
+  // 结算事件：客户端长轮询靠它即时唤醒，避免等下一次 5 秒轮询。
+  const settleWaiters = new Set();
+  function notifyTurnSettled() {
+    for (const wake of [...settleWaiters]) {
+      try {
+        wake();
+      } catch {
+        // 单个等待者出错不影响其它客户端
+      }
+    }
+  }
+  function waitTurnSettled(ms) {
+    return new Promise((resolve) => {
+      let done = false;
+      const finish = () => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        settleWaiters.delete(finish);
+        resolve();
+      };
+      const timer = setTimeout(finish, ms);
+      settleWaiters.add(finish);
+    });
+  }
   let inFlight = null;
   let lastFetchFailed = false;
   let lastMessageProvider;
@@ -701,6 +729,7 @@ function createCostService(ctx, config) {
       costMicros: turnCostOfGroups(usage.groups, period, PRICE_TABLE),
       turn: Number.isSafeInteger(usage.turn) ? usage.turn : buffer.turn
     };
+    notifyTurnSettled();
   }
 
   function dispose() {
@@ -711,6 +740,8 @@ function createCostService(ctx, config) {
   return {
     isEnabled,
     isPerTurn: () => switches().perTurn,
+    lastTurnAt: () => (lastTurn && Number.isFinite(lastTurn.at) ? lastTurn.at : null),
+    waitTurnSettled,
     refresh,
     stateValue,
     applyCorrection,
@@ -740,10 +771,18 @@ function makeCostStateHandler(ctx, service) {
     try {
       const url = new URL(req.url || "/", "http://x");
       const force = url.searchParams.get("refresh") === "1";
+      // wait=<lastTurn.at>：长轮询挂起，结算完成立即返回（上限 10s，短于客户端 15s 超时）。
+      const waitRaw = url.searchParams.get("wait");
+      const waitAt = waitRaw === null || waitRaw === "" ? null : Number(waitRaw);
       if (service.isEnabled()) {
         if (force) await service.refresh(true);
         else service.refresh(false).catch(() => {});
       }
+      if (!force && Number.isFinite(waitAt) && service.isPerTurn()) {
+        const lastAt = service.lastTurnAt();
+        if (lastAt === null || lastAt === waitAt) await service.waitTurnSettled(COST_SETTLE_WAIT_MS);
+      }
+      if (res.destroyed) return;
       sendJson(res, 200, { ok: true, value: await service.stateValue() });
     } catch (err) {
       if (typeof ctx.logger?.warn === "function") {

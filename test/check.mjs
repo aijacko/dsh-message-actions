@@ -1882,6 +1882,26 @@ function pushTombstone(bag, plan, id, action) {
   ok("增量：普通刷新带 since", /"&since=" \+ cursor/.test(clientSrc));
   ok("增量：版本回退时全量重取", /cursor = null;[\s\S]{0,160}messagesUrl\(cursor\)/.test(clientSrc));
   ok("增量：客户端合并使用共享纯函数", /mergeMessageSummary\(base, data\.value\)/.test(clientSrc));
+
+  // 49) 完成提示音：开关默认值、去重、busy/结算失败门控
+  ok("提示音：默认开启", s.completionSoundEnabled({}) === true);
+  ok("提示音：显式 false 关闭", s.completionSoundEnabled({ sound: false }) === false);
+  ok("提示音：显式 true 开启", s.completionSoundEnabled({ sound: true }) === true);
+  const soundBase = { enabled: true, settled: true, previousAt: 100, at: 200, lastPlayedAt: null, busy: false };
+  ok("提示音：新一轮应播放", s.shouldPlayCompletionSound(soundBase) === true);
+  ok("提示音：同一轮不重复", s.shouldPlayCompletionSound({ ...soundBase, previousAt: 200 }) === false);
+  ok("提示音：已响过不补响", s.shouldPlayCompletionSound({ ...soundBase, lastPlayedAt: 200 }) === false);
+  ok("提示音：开关关闭不响", s.shouldPlayCompletionSound({ ...soundBase, enabled: false }) === false);
+  ok("提示音：宿主 busy 不响", s.shouldPlayCompletionSound({ ...soundBase, busy: true }) === false);
+  ok("提示音：结算失败不响", s.shouldPlayCompletionSound({ ...soundBase, settled: false }) === false);
+  ok("提示音：无结算时间不响", s.shouldPlayCompletionSound({ ...soundBase, at: null }) === false);
+  ok("提示音：非法时间不响", s.shouldPlayCompletionSound({ ...soundBase, at: NaN }) === false);
+  ok("提示音：Web Audio 现场合成", /createOscillator\(\)/.test(clientSrc) && !/new Audio\(/.test(clientSrc));
+  ok("提示音：AudioContext 挂起静默跳过", /state !== "running"[\s\S]{0,220}return false;/.test(clientSrc));
+  ok("提示音：过滤首次快照基线", /if \(previousAt === null\) return;/.test(clientSrc));
+  ok("结算推送：客户端 wait 长轮询", /"wait=" \+ wait/.test(clientSrc));
+  ok("结算推送：宿主 wait 挂起接口", /waitTurnSettled\(COST_SETTLE_WAIT_MS\)/.test(indexSrc) && /notifyTurnSettled\(\)/.test(indexSrc));
+  ok("设置：提示音默认开启分支", /defaultOn \? value\[key\] !== false/.test(clientSrc));
 }
 
 // ---------------------------------------------------------------------------
