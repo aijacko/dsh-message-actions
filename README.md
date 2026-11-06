@@ -260,7 +260,7 @@ This section only describes what the code actually does. It is risk reduction, n
 
 ```bash
 node build.mjs        # build to lib/
-node test/check.mjs   # offline assertions, 2782 currently
+node test/check.mjs   # offline assertions, 2897 currently
 # plus a real session-log regression: 18/18
 ```
 
@@ -276,122 +276,10 @@ test/check.mjs   # dependency-free assertion script
 ```
 
 
-- Version: `0.2.2` (npm latest is still `0.2.1`; 0.2.2 is not published yet)
-- Release: [v0.2.1](https://github.com/aijacko/dsh-message-actions/releases/tag/v0.2.1)
+- Version: `0.2.2` (published on both npm and GitHub Releases)
+- Release: [v0.2.2](https://github.com/aijacko/dsh-message-actions/releases/tag/v0.2.2)
 - Compatible with: tested on DSH `0.2.1-rc.5` desktop (profile `desktop`)
 - Dependencies: none at runtime
-
----
-
-## Changelog
-
-### 0.2.2 · 2026-11-04
-
-All 16 commits from this day (old → new): `53552dc`, `f830b12`, `78cb270`, `4978c2e`, `ba60691`, `f8e0c67`, `d221953`, `4faa989`, `1bf7ffc`, `51bfdf5`, `50c67fa`, `67f195a`, `f9eb238`, `a18e6ee`, `5156514`, `88873c2`; docs `9041816`, `ace30b3`, `6e813a2` and this round's docs commit. The first 15 commits are on `origin/main` (remote HEAD `84d5af5`); `88873c2` and this round's docs commit are **local only, not pushed**.
-
-**Completion sound & instant settlement** (`f830b12` / `f8e0c67` / `4faa989`)
-- Symptom: after the per-turn figure appeared, "today" lagged up to 5 s; the chime was often inaudible and had a single fixed tone with no volume control.
-- Cause: the client polled on a fixed 5 s timer; `AudioContext` was only resumed when the turn finished, so autoplay policy blocked it; gain was fixed at 0.09 with no tone or volume config.
-- Fix: `/cost/state?wait=<lastTurn.at>` long-polling, with the host returning right after `turn/end` settles, so the per-turn figure and the chime land in the same state update; pre-unlock audio on `pointerdown` / `keydown` at module load and retry silently after `resume()`; base gain 0.09 → 0.18, plus tones (double / bell / soft / off) and a 0–100 volume slider.
-
-**Settings layout & interaction** (`78cb270` / `4faa989`)
-- Symptom: rows were tall and loosely spaced; the sound block expressed on/off twice (a switch plus an "Off" tone).
-- Cause: row `padding` 14px, description `margin-top` 3px and block gaps 14px were too large; `sound` boolean and `soundTone` both encoded the switch.
-- Fix: row `padding` 14 → 10px, description margin 3 → 2px, block/button gaps tightened to 8–10px; removed the "Completion sound" switch row, `soundTone = "off"` now means off, legacy `sound = false` maps to "Off"; added a volume row.
-
-**Session statistics merged in** (`4978c2e` / `ba60691`)
-- Symptom: token usage, timeline and per-session cost were needed; the separate `session-stats` plugin also added a top-level nav entry and CPU / memory / load / uptime sampling that duplicated the cost card.
-- Cause: stats lived in a separate plugin, so entry points and cost data were split.
-- Fix: reads through `sessionQuery` / `sessionPersistence`, a small icon at the end of the cost row, a body-level stats overlay with four KPI cards, a 24 h / 30 d timeline, a session table and a budget (default ¥5, stored in the same `cost-state.json`); dropped the nav entry and system samplers; the over-budget ratio is no longer capped at 100% and shows the true ratio.
-
-**Data consistency fixes** (`f8e0c67`)
-- Symptom: ① "today" lagged behind the per-turn figure; ② balance was off by one cent (`¥5.99` rendered as `¥6.00`); ③ the stats panel showed no balance / today / turn figures; ④ the chime did not play.
-- Cause: today was only accumulated passively from balance observations; amounts went through float rounding; the budget row only had an input; audio nodes were skipped while the context was suspended.
-- Fix: `settleSpend()` accumulates at `turn/end` (bucketed by `endedAt`, idempotent by `key`), while balance observations only add the `diff - settled` remainder; all amounts are integer cents with numbers parsed via decimal strings, the primary balance uses the official recharge balance and bonus is listed separately; the budget row shows all three figures from the same state and formatters as the sidebar; pre-unlock + 0.18 gain + `resume()` retry + tone preview.
-
-**Boot failure fix** (`d221953`)
-- Symptom: restarting DSH reported `web boot: 1 entry did not activate` / `dsh-message-actions: import failed`, with `client.js:4615 Uncaught SyntaxError: Unexpected token ','`.
-- Cause: an extra closing parenthesis in the budget three-figure ternary made `lib/client.js` fail to parse as a whole.
-- Fix: rewrote the closure; `test/check.mjs` now guards the artifacts three ways — `node --check lib/client.js`, every shared symbol destructured by the client must really be exported, and every literal key passed to `tt()` must exist in both zh and en.
-
-**Copy & entry adjustments** (`4faa989`)
-- Symptom: the stats row in Settings repeated the panel's budget explanation; the button and panel title used different names; the budget block was a single input row that did not match the KPI cards.
-- Cause: Settings was explaining budget semantics that belong to the panel; the button reused the row label; the budget block did not reuse card styles.
-- Fix: Settings keeps only "Token usage, usage timeline and per-session cost" and the budget note lives only in the panel; the button reads "Open stats table"; panel title / `aria-label` / hover all say "Statistics"; the budget block became a budget card (in-place amount editing, remaining · used sub-line, progress bar) plus balance / today / turn cards, matching the KPI cards in size and hierarchy, wrapping to 2×2 on narrow windows.
-
-**Stats cards & volume slider** (`51bfdf5`)
-- Symptom: the budget card only had the hidden "click the amount" entry; the budget and budget-usage cards were not in the expected positions; dragging the volume slider in Settings stuttered and did not follow the pointer.
-- Cause: the budget card had no explicit button; the two cards were grouped by function rather than by editable / read-only; the volume slider called `save("soundVolume", n)` on every `onChange` (one input event per pixel), which wrote host config, persisted it and updated the `useSyncExternalStore` snapshot, re-rendering the whole settings panel — and the slider `value` came straight from the host snapshot, so the delayed write caused jumps.
-- Fix: the budget card gained an **Edit budget** text button as the primary entry (the hidden amount click stays; both call the same `openBudgetEdit`); the edit state is still input + Save / Cancel, Enter saves and Esc cancels, and `READ_ONLY` / `WRITE_FAILED` keep the existing "save failed" feedback. The budget card moved to the fourth slot of row one and budget usage to the first slot of row two — DOM order only, same styling and sub-line. Volume now uses a local `draft` state plus refs: dragging only updates the displayed number; release / key up / blur / native `change` all funnel into a 120 ms debounce that saves once and previews once, and external snapshot updates cannot overwrite the draft mid-drag.
-
-**Budget button, card order & settings divider** (`50c67fa`)
-- Symptom: the Edit budget link sat on its own line and did not match the settings button; estimated cost was still in row one; the settings page showed two dividers between the Statistics row and the Balance correction heading.
-- Cause: the trigger was a text-link rendered as a separate row; cards were grouped by function; the last `.dma-setting-row` already has `border-bottom`, and `.dma-correction` added a `border-top` plus a 10 px `margin-top`, producing a double line and doubled spacing.
-- Fix: Edit budget is now a compact filled button matching the settings save button, placed in `.dma-stats-money-value-row` beside the amount, and the standalone `.dma-stats-money-trigger` row was removed (clicking the amount still works). Row one is now total tokens → sessions → budget → budget usage; row two is balance → today → turn → estimated cost. `.dma-correction` lost `border-top` and `margin-top`, leaving the row's `.5px` `border-bottom` as the only divider (same colour and indent).
-
-**Balance scope: correction removed & one-cent mismatch fixed** (`67f195a`)
-- Symptom: editing the two Balance correction inputs and clicking Save changed nothing (the derived balance stayed `¥6.82`, pending `¥0.00`); the sidebar balance showed `¥6.00` while the official **Account & balance** page showed `¥5.99` even after the previous round switched the card to the recharge figure.
-- Cause: (1) `correctedBalanceCents` was only consumed by `stateValue()` and the settings preview — the sidebar card read `balance.rechargeCents` and never looked at the correction; `pendingAdjustmentCents` was only incremented by `observeBalance` on a balance rise and had no renderer, so saving could not move any visible number. The correction layer was pure display dead weight on top of data that already comes straight from the account API. (2) `yuanToCents` rounded half-up, while the official page **truncates positive amounts to the cent**; the wallet API returns a raw string with more than two decimals (e.g. `5.999…`), so the plugin got `600` and the official page showed `599`.
-- Fix: the whole correction block was removed — `/dsh-message-actions/cost/correction` route, `applyCorrection`, `correctedBalanceCents`, `pendingAdjustmentCents` / `pendingAdjustmentAt`, `correctionCreditCents` / `correctionDebitCents` (state, normalization and tests), the settings form, the "Check" badge and the dead CSS; the settings page now keeps a short account-scope note (`cost.balanceNote`). `yuanToCents` gained a `truncate` mode used only for CNY wallets, so the card matches the official page cent for cent; ordinary amount parsing keeps round-half-up.
-
-**Budget card button parity & compact edit row** (`f9eb238`)
-- Symptom: **Edit budget** was a black filled 22 px button (11 px text) while **Save budget** was taller and wider (≈28 px, 12–13 px); the edit row's full-width input plus buttons overflowed the card and pushed Cancel onto its own line.
-- Cause: the two buttons used different classes (`.dma-stats-money-apply` vs `.dma-stats-money-save`) with independent height / padding / font / radius; the input had no fixed width and the row had no `min-width:0`, so it could exceed the card.
-- Fix: **both buttons now use the same `.dma-setting-primary` class** — identical height 32 px, padding 0 16 px, 13 px font, radius 8 px, primary fill and weight; `.dma-stats-money-apply` and `.dma-stats-money-save` were deleted. Edit budget sits at the right end of the amount row (amount button is `flex:1`, action `flex:none`, `white-space:nowrap`). The edit row is `[¥ fixed 88 px input] [Save] [Cancel]` with `flex-wrap:wrap` and `min-width:0`, so it never overflows and only wraps on very narrow cards; Save is now "保存 / Save", Cancel is a secondary outlined button with the same 32 px height immediately after Save. Enter still saves, Esc still cancels, and the sub-line "Left ¥x · used y%" and progress bar are unchanged. (Superseded by `a18e6ee`: the settings-sized 32 px pair was still visually louder than the amount, so the next round shrank it to a dedicated 25 px class (gap tuned in `5156514`).)
-
-**Compact budget controls & local-model billing scope** (`a18e6ee` / `5156514` / `88873c2`)
-- Symptom: **Edit budget** still took more than half the card width (32 px tall, `0 16px` padding, 13 px text); in the edit state the `[¥ 5.00 CNY]` input was too wide and Cancel fell onto a second line; the statistics table billed local-model tokens at DeepSeek prices.
-- Cause: the last round reused the settings primary button (`.dma-setting-primary`, sized for full-width settings rows) inside a 160 px card; the edit input still had no fixed width and the row allowed wrapping. For billing, `foldSessionStats` recorded `provider` but `statsPointCostMicros` priced every point through `turnCost(point.model)`, whose unknown-model fallback is the DeepSeek Flash row, so a `ninfer-27b` local session (102 points in the real logs on this machine) was charged as if it were DeepSeek.
-- Fix: (1) both budget actions now use a dedicated `.dma-stats-money-mini` (25 px height, `0 9px` padding, 11.5 px label, radius 6 px, primary fill); the edit row is `flex-wrap:nowrap` with `gap:7px` (no margin stacking), a 25 px Save and a 25 px outlined Cancel, so all three keep clear spacing and stay on one line; the hint shrank to one 10 px line with ellipsis instead of wrapping. (Input sizing was tuned twice: 64 px in `a18e6ee`, then 92 px with a container-query fallback in `88873c2`.) (2) `isBillableRoute(provider, model)` was added: `deepseek-account` / `deepseek-*` providers are billable, any other known provider is local and unbilled, and a missing provider is billable only when the model name is `deepseek-*` (unknown sources are never guessed into a price). Folded points carry `billable`; `statsPointCostMicros` returns 0 for local points; timeline buckets / rows / totals gained `billableTokens` and `localTokens`; turn settlement filters billable groups before `turnCostOfGroups`, so local usage never enters "Today". The timeline draws a separate 3 px billing bar (deep blue `#2f6bd8` = DeepSeek billed, gray `#a8aeb8` = local unbilled) with its own legend row, because the four token-category colors already use blue; local-only session rows show **Local** instead of `¥0.00` and are excluded from the total. Follow-up `5156514`: the first pass packed the three controls with a 3 px gap and read as cramped, so the row now uses a uniform `gap:7px` (input↔Save and Save↔Cancel); Save / Cancel keep 25 px height (`0 9px` / `0 7px` padding). Follow-up `88873c2`: the input was then too small, so it was widened to 92 px (`flex:0 1 92px`, `min-width:64px`, 13 px text, 2×6 px padding); a container query on the budget card (`≤181px`) tightens the gap to 4 px and button paddings to 5 px / 4 px, keeping the row at ≈135 px inside 136 px and never wrapping, while the billing legend moved onto the same row as the four-colour legend, right-aligned.
-
-## Acceptance checklist (0.2.2)
-
-**Cost card & data consistency**
-- [ ] The sidebar cost row shows balance / today / turn in both layouts (single-line and multi-line) with correct alignment.
-- [ ] Run one turn: the per-turn figure and today update together with no visible lag; midnight buckets by end time.
-- [ ] The primary balance matches the official recharge balance to the cent (e.g. a raw `5.999…` shows `¥5.99`, not `¥6.00`); bonus appears only in the hover hint.
-- [ ] Peak / off-peak icon and pricing switch correctly (peak / off-peak / auto).
-- [ ] There is no Balance correction block and no "Check" badge; Settings shows only the account-scope note, and top-ups / refunds never alter recorded spend.
-
-**Statistics**
-- [ ] The small icon at the end of the cost row is always visible and hover says "Statistics"; Settings → Messages & Cost → Cost Statistics → "Open stats table" opens it too.
-- [ ] Panel title and `aria-label` both say "Statistics"; `Esc` closes and returns focus to the opener.
-- [ ] The first row's four KPI cards read total tokens / sessions / budget / budget usage, with sensible values and the cache share noted.
-- [ ] The second row reads balance / today / turn / estimated cost; the 2×2 wrap puts cards 1–2, 3–4, 5–6 and 7–8 on their own lines.
-- [ ] Edit budget and Save share the same compact button (25 px height, `0 9px` padding, 11.5 px font, 6 px radius, primary fill) at the right end of the amount row, no clipping, no half-row spill; the amount itself is still clickable.
-- [ ] The edit row reads `[¥ 92 px input] [Save] [Cancel]` in one no-wrap line with a uniform 7 px gap (4 px under the ≤181 px container query): Save is "保存 / Save", Cancel is a 25 px outlined button right after it, Enter saves, Esc cancels, the sub-line "Left ¥x · used y%" and progress bar stay put, and the card height matches its neighbours.
-- [ ] The balance / today / turn cards match the sidebar character for character.
-- [ ] The 24 h ↔ 30 d switch works; timeline buckets, legend, billing bar and peak marker are correct; the billing legend sits on the same row as the four-colour legend, right-aligned, and wraps as a whole group on narrow widths.
-- [ ] The session table is sorted by usage; running and subagent sessions are tagged; local-only rows show **Local** in the cost column.
-- [ ] Run a local-model turn: tokens count, estimated cost / budget usage / today do not move; the banner note and DeepSeek-blue / local-gray billing legend are visible.
-
-**Settings page**
-- [ ] Exactly one divider sits under the Statistics row — no double line, no doubled spacing; the account-scope note follows it; other groups are unchanged.
-
-**Completion sound**
-- [ ] Tone "Off": no sound at end of turn. Any other tone: previews immediately and plays once at end of turn.
-- [ ] A legacy config (old `sound = false`) opens Settings showing "Off".
-- [ ] Volume 0% is completely silent, 50% matches the previous level, 100% is clearly louder; the number follows the drag with no stutter, nothing is persisted or previewed mid-drag, and release saves and previews once.
-- [ ] Tone and volume survive a DSH restart.
-
-**Settings**
-- [ ] "Message actions" has no "Completion sound" switch row — only "Sound tone" and "Volume".
-- [ ] The Cost Statistics row has a single data-purpose line, no long budget note; the button reads "Open stats table".
-- [ ] Order: usage-stats switch → cost layout → per-turn switch → auto-close → peak pricing → Statistics → account-scope note.
-- [ ] Switching tabs keeps state; the version line at the bottom of tab 1 reads `v0.2.2`.
-
-**Message actions & error handling**
-- [ ] Recall / delete / delete-from / share / export all work; deletions survive refresh, session switch and restart.
-- [ ] Recall a message with an image and a file: both return to the composer as real draft attachments (thumbnail + file card), not as `[图片]` / `[文件]` text.
-- [ ] The stats line under each answer ends with `¥0.0023` (4 decimals); a local-model reply shows `Local`; a multi-step turn does not double-count.
-- [ ] Recall / delete / delete-to-end dialogs have the same width (~420px in a 1280 window); at 390px they go edge-to-edge with the button row fitting on one line.
-- [ ] Acting while a reply is generating returns `423` with a "try again later" message.
-- [ ] A read-only state file or failed write shows "Save failed".
-
-**Build & install**
-- [ ] `node test/check.mjs` passes (2897 checks, 0 failures).
-- [ ] `node build.mjs` succeeds and `node --check lib/client.js` passes.
-- [ ] The profile copy's five artifacts hash-match; after restart `v0.2.2` shows and there is no `import failed`.
 
 ---
 
