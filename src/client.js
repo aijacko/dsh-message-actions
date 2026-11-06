@@ -50,6 +50,12 @@ window.__ModuleLoader__.load({
       resolveKeyAction,
       mergeMessageSummary,
       completionSoundEnabled,
+      normalizeSoundTone,
+      completionSoundTone,
+      soundToneOptions,
+      DEFAULT_SOUND_VOLUME,
+      clampSoundVolume,
+      soundGainScale,
       shouldPlayCompletionSound,
       formatTokens,
       railTurnOfAttributes,
@@ -58,6 +64,7 @@ window.__ModuleLoader__.load({
       formatCents,
       formatYuanCents,
       formatCostMicros,
+      formatReplyCost,
       periodInfo,
       periodChangeText,
       autoCloseAt,
@@ -287,6 +294,7 @@ window.__ModuleLoader__.load({
     let lastTurnAtApplied = null;
     let lastPlayedTurnAt = null;
     let audioCtx = null;
+    let audioUnlockBound = false;
 
     /** 提示音开关（默认 true）；设置快照未就绪时按开启处理。 */
     function soundEnabledNow() {
@@ -296,45 +304,128 @@ window.__ModuleLoader__.load({
       return completionSoundEnabled(snap.value);
     }
 
+    /** 当前音色（关闭时返回 'off'）；设置快照未就绪时按默认双音。 */
+    function soundToneNow() {
+      if (!costForm || typeof costForm.getSnapshot !== "function") return "double";
+      const snap = costForm.getSnapshot();
+      if (!snap || snap.status !== "ready" || typeof snap.value !== "object" || !snap.value) return "double";
+      return completionSoundTone(snap.value);
+    }
+
+    /** 当前音量（0–100，默认 50）；设置快照未就绪时按默认值。 */
+    function soundVolumeNow() {
+      if (!costForm || typeof costForm.getSnapshot !== "function") return DEFAULT_SOUND_VOLUME;
+      const snap = costForm.getSnapshot();
+      if (!snap || snap.status !== "ready" || typeof snap.value !== "object" || !snap.value) {
+        return DEFAULT_SOUND_VOLUME;
+      }
+      return clampSoundVolume(snap.value.soundVolume);
+    }
+
+    /**
+     * 创建 / 唤醒 AudioContext。浏览器要求一次用户手势后才能发声：
+     * 模块加载时注册一次全局首次点击/按键监听，提前解锁，避免任务完成时才 resume 而错过。
+     */
+    function ensureAudio() {
+      try {
+        const Ctor = typeof window !== "undefined" ? window.AudioContext || window.webkitAudioContext : null;
+        if (!Ctor) return null;
+        if (!audioCtx) audioCtx = new Ctor();
+        if (audioCtx.state !== "running" && typeof audioCtx.resume === "function") {
+          audioCtx.resume().catch(() => {});
+        }
+        return audioCtx;
+      } catch {
+        return null;
+      }
+    }
+
+    function unlockAudio() {
+      ensureAudio();
+    }
+
+    function installAudioUnlock() {
+      if (audioUnlockBound) return;
+      if (typeof window === "undefined" || typeof window.addEventListener !== "function") return;
+      audioUnlockBound = true;
+      window.addEventListener("pointerdown", unlockAudio, { passive: true, capture: true });
+      window.addEventListener("keydown", unlockAudio, { passive: true, capture: true });
+    }
+
+    // 插件加载即挂载首次交互解锁：用户点任何按钮/发消息后再播放就不会被策略拦截。
+    installAudioUnlock();
+
+    /**
+     * 音色参数：按「双音 / 短铃 / 轻提示」给出频率与包络。
+     * `gain` 是音量 50% 时的基准（0.12–0.18），实际峰值 = gain × soundGainScale(音量)。
+     */
+    const TONE_SPECS = {
+      double: { gain: 0.18, notes: [{ freq: 880, at: 0, dur: 0.16, type: "sine" }, { freq: 660, at: 0.15, dur: 0.2, type: "sine" }] },
+      bell: { gain: 0.16, notes: [{ freq: 1046, at: 0, dur: 0.1, type: "triangle" }, { freq: 784, at: 0.11, dur: 0.16, type: "triangle" }] },
+      soft: { gain: 0.12, notes: [{ freq: 523, at: 0, dur: 0.24, type: "sine" }] }
+    };
+
+    function emitTone(ctx, tone, volume) {
+      const spec = TONE_SPECS[normalizeSoundTone(tone)];
+      if (!spec) return false;
+      const scale = soundGainScale(volume);
+      // 0% 音量直接不发声，避免出现「静音档仍在响」。
+      if (!(scale > 0)) return false;
+      const now = ctx.currentTime;
+      const body = Math.max(...spec.notes.map((note) => note.at + note.dur));
+      const peak = Math.max(0.0001, spec.gain * scale);
+      const gain = ctx.createGain();
+      gain.gain.setValueAtTime(0.0001, now);
+      gain.gain.exponentialRampToValueAtTime(peak, now + 0.03);
+      gain.gain.exponentialRampToValueAtTime(0.0001, now + body);
+      gain.connect(ctx.destination);
+      for (const note of spec.notes) {
+        const osc = ctx.createOscillator();
+        osc.type = note.type;
+        osc.frequency.setValueAtTime(note.freq, now + note.at);
+        osc.connect(gain);
+        osc.start(now + note.at);
+        osc.stop(now + note.at + note.dur);
+      }
+      return true;
+    }
+
+    /**
+     * 播放完成提示音。挂起时 resume 后静默重试一次（不弹 toast）：
+     * 用户已交互过就一定能听到；仍被策略拦截则安静放弃。
+     * @param tone 指定音色（试听用）；省略时读设置快照。
+     * @param volume 指定音量（试听用）；省略时读设置快照。
+     */
+    function playCompletionSound(tone, volume) {
+      const id = typeof tone === "string" ? tone : soundToneNow();
+      if (id === "off") return false;
+      const vol = Number.isFinite(volume) ? clampSoundVolume(volume) : soundVolumeNow();
+      if (!(soundGainScale(vol) > 0)) return false;
+      const ctx = ensureAudio();
+      if (!ctx) return false;
+      if (ctx.state !== "running") {
+        const retry = () => {
+          try {
+            if (ctx.state === "running") emitTone(ctx, id, vol);
+          } catch {
+            /* 静默放弃 */
+          }
+        };
+        if (typeof ctx.resume === "function") ctx.resume().then(retry).catch(() => {});
+        return false;
+      }
+      try {
+        return emitTone(ctx, id, vol);
+      } catch {
+        return false;
+      }
+    }
+
     function perTurnNow() {
       if (!costForm || typeof costForm.getSnapshot !== "function") return true;
       const snap = costForm.getSnapshot();
       if (!snap || snap.status !== "ready" || typeof snap.value !== "object" || !snap.value) return true;
       return snap.value.costPerTurn !== false;
-    }
-
-    /**
-     * Web Audio 现场合成，不依赖音频文件或网络：
-     * 880Hz → 660Hz 两段正弦，约 0.36s，音量约 0.09。
-     * 任何失败（无 AudioContext、被浏览器策略挂起、节点创建失败）都静默返回 false。
-     */
-    function playCompletionSound() {
-      try {
-        const Ctor = typeof window !== "undefined" ? window.AudioContext || window.webkitAudioContext : null;
-        if (!Ctor) return false;
-        if (!audioCtx) audioCtx = new Ctor();
-        if (audioCtx.state !== "running") {
-          // 挂起时静默跳过：不弹 toast、不影响费用数字。
-          if (typeof audioCtx.resume === "function") audioCtx.resume().catch(() => {});
-          return false;
-        }
-        const now = audioCtx.currentTime;
-        const gain = audioCtx.createGain();
-        gain.gain.setValueAtTime(0.0001, now);
-        gain.gain.exponentialRampToValueAtTime(0.09, now + 0.03);
-        gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.34);
-        gain.connect(audioCtx.destination);
-        const osc = audioCtx.createOscillator();
-        osc.type = "sine";
-        osc.frequency.setValueAtTime(880, now);
-        osc.frequency.setValueAtTime(660, now + 0.14);
-        osc.connect(gain);
-        osc.start(now);
-        osc.stop(now + 0.36);
-        return true;
-      } catch {
-        return false;
-      }
     }
 
     /** 单次费用写明的那一刻判定提示音：同一状态更新里出数字、响一次。 */
@@ -674,8 +765,10 @@ window.__ModuleLoader__.load({
           // 工具行删除只遮蔽该工具节点，不影响同轮其它内容。
           applyHiddenTool(this.sessionId, opts.nodeKey);
         }
-        if (action === "recall" && value.refillText) {
-          refillComposer(this.sessionId, value.refillText);
+        if (action === "recall") {
+          if (value.refillText) refillComposer(this.sessionId, value.refillText);
+          // 图片 / 文件：按附件 id 取回字节，交给官方输入框的 drop 通道恢复成真实附件。
+          restoreRecallAttachments(this.sessionId, value.attachments).catch(() => {});
         }
         // 刷新消息快照（拿到最新 goneTurns），再重放导航隐藏。
         await this.fetchMessages(true).catch(() => {});
@@ -743,6 +836,49 @@ window.__ModuleLoader__.load({
           showToast(t("toast.failed"));
         }
       }
+    }
+
+    // 附件回读路由：撤回后按 id 取回字节（image 为宿主归一化后的图片）。
+    const ATTACHMENT_PATH = "/dsh-message-actions/attachment";
+
+    /**
+     * 撤回后恢复图片 / 文件附件。
+     * 取回字节 -> 构造 File -> 在 document 上派发 drop 事件，
+     * 交给官方输入框的 `onAddFiles`（createDrafts + addFiles）恢复成真实附件。
+     * 无附件、环境不支持 DataTransfer 或全部取回失败时静默跳过。
+     */
+    async function restoreRecallAttachments(sessionId, attachments) {
+      if (!Array.isArray(attachments) || attachments.length === 0) return;
+      if (typeof document === "undefined" || typeof DataTransfer !== "function") return;
+      const files = [];
+      for (const meta of attachments) {
+        if (!meta || typeof meta.attachmentId !== "string") continue;
+        try {
+          const query =
+            "sessionId=" + encodeURIComponent(sessionId) +
+            "&attachmentId=" + encodeURIComponent(meta.attachmentId);
+          const res = await fetchWithTimeout(apiUrl(ATTACHMENT_PATH, query), { cache: "no-store" });
+          if (!res.ok) continue;
+          const blob = await res.blob();
+          const name = typeof meta.name === "string" && meta.name.length > 0
+            ? meta.name
+            : (meta.kind === "image" ? "image.png" : "attachment");
+          files.push(new File([blob], name, { type: meta.mediaType || blob.type || "" }));
+        } catch {
+          /* 单个附件失败不影响其它附件 */
+        }
+      }
+      if (files.length === 0) return;
+      const transfer = new DataTransfer();
+      for (const file of files) transfer.items.add(file);
+      let event;
+      try {
+        event = new DragEvent("drop", { bubbles: true, cancelable: true, dataTransfer: transfer });
+      } catch {
+        event = new Event("drop", { bubbles: true, cancelable: true });
+        Object.defineProperty(event, "dataTransfer", { value: transfer });
+      }
+      document.dispatchEvent(event);
     }
 
     // -------------------------------------------------------------------------
@@ -1306,14 +1442,22 @@ window.__ModuleLoader__.load({
       if (config && config.stats === false) return null;
       if (!row || words === 0) return null;
 
+      // 单条回答金额：只认该条自己的 usage（服务端已算好 costMicros），
+      // 中间步骤没有 usage 时不拿同轮其它回答的金额兜底，避免重复计价。
+      const replyCost = row && Number.isFinite(row.costMicros)
+        ? (row.billable === false ? tt("stats.localCost") : formatReplyCost(row.costMicros))
+        : null;
+
       const label = [
         tokens == null ? null : formatTokens(tokens) + " tok",
-        words + " " + tt("stats.unit")
+        words + " " + tt("stats.unit"),
+        replyCost
       ].filter(Boolean).join(" \u00b7 ");
 
       return e("span", {
         className: "dma-stats",
-        title: tt("stats.title", { tokens: tokens == null ? "?" : tokens, words })
+        title: tt("stats.title", { tokens: tokens == null ? "?" : tokens, words }) +
+          (replyCost ? " \u00b7 " + tt("stats.replyCostTitle", { cost: replyCost }) : "")
       }, label);
     }
 
@@ -1523,7 +1667,598 @@ window.__ModuleLoader__.load({
       );
     }
 
+    // -------------------------------------------------------------------------
+    // 会话统计浮层：body 级挂载，会话页与设置页都能打开
+    // -------------------------------------------------------------------------
+
+    const STATS_ROUTE = "/dsh-message-actions/stats";
+    const STATS_BUDGET_ROUTE = "/dsh-message-actions/stats/budget";
+    const STATS_POLL_MS = 10000;
+
+    const STATS_ICON = '<svg viewBox="0 0 16 16" fill="none" aria-hidden="true">' +
+      '<path d="M3 13V9M6.7 13V6M10.4 13V8.5M14 13V3" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>';
+    const REFRESH_ICON = '<svg viewBox="0 0 16 16" fill="none" aria-hidden="true">' +
+      '<path d="M13 8a5 5 0 1 1-1.6-3.7M13 2.6V5.4h-2.8" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+
+    let statsHost = null;
+    let statsOpener = null;
+    const statsStore = createStore({ open: false, seq: 0 });
+
+    function openStatsPanel(opener) {
+      if (typeof document === "undefined" || !document.body) return;
+      if (!ReactDOMClient || typeof ReactDOMClient.createRoot !== "function") return;
+      statsOpener = opener || (document.activeElement instanceof HTMLElement ? document.activeElement : null);
+      if (!statsHost) {
+        statsHost = document.createElement("div");
+        statsHost.className = "dma-stats-root";
+        document.body.appendChild(statsHost);
+        ReactDOMClient.createRoot(statsHost).render(e(StatsOverlay));
+      }
+      const snapshot = statsStore.getSnapshot();
+      statsStore.set({ open: true, seq: snapshot.seq + 1 });
+    }
+
+    function closeStatsPanel() {
+      const snapshot = statsStore.getSnapshot();
+      if (!snapshot.open) return;
+      statsStore.set({ open: false, seq: snapshot.seq + 1 });
+      const opener = statsOpener;
+      statsOpener = null;
+      if (opener && typeof opener.focus === "function" && opener.isConnected) {
+        try {
+          opener.focus({ preventScroll: true });
+        } catch {
+          /* ignore */
+        }
+      }
+    }
+
+    function StatsOverlay() {
+      const snapshot = React.useSyncExternalStore(statsStore.subscribe, statsStore.getSnapshot, statsStore.getSnapshot);
+      if (!snapshot.open) return null;
+      return e(StatsPanel, { key: snapshot.seq, onClose: closeStatsPanel });
+    }
+
+    function statsPct(value) {
+      const n = Number.isFinite(value) ? Math.max(0, Math.min(100, value)) : 0;
+      return (Math.round(n * 10) / 10) + "%";
+    }
+
+    /** 比例文本不封顶（超预算时仍显示真实百分比）。 */
+    function statsRatioText(value) {
+      const n = Number.isFinite(value) ? Math.max(0, value) : 0;
+      return (Math.round(n * 10) / 10) + "%";
+    }
+
+    function statsShare(part, total) {
+      if (!Number.isFinite(part) || !Number.isFinite(total) || total <= 0) return 0;
+      return (part / total) * 100;
+    }
+
+    function statsClock(ts) {
+      const date = new Date(ts);
+      const pad = (n) => (n < 10 ? "0" + n : String(n));
+      return pad(date.getMonth() + 1) + "-" + pad(date.getDate()) + " " + pad(date.getHours()) + ":" + pad(date.getMinutes());
+    }
+
+    function statsRelative(ts, tt) {
+      if (!Number.isFinite(ts) || ts <= 0) return "—";
+      const diff = Math.max(0, Date.now() - ts);
+      if (diff < 60 * 1000) return tt("stats.now");
+      if (diff < 60 * 60 * 1000) return tt("stats.minutesAgo", { n: Math.floor(diff / 60000) });
+      if (diff < 24 * 60 * 60 * 1000) return tt("stats.hoursAgo", { n: Math.floor(diff / 3600000) });
+      return tt("stats.daysAgo", { n: Math.floor(diff / 86400000) });
+    }
+
+    function StatsLegend({ t: tt }) {
+      const rows = [
+        ["input", "dma-stats-seg-input"],
+        ["cacheRead", "dma-stats-seg-cacheRead"],
+        ["cacheWrite", "dma-stats-seg-cacheWrite"],
+        ["output", "dma-stats-seg-output"]
+      ];
+      return e("div", { className: "dma-stats-legend" },
+        rows.map(([key, cls]) => e("span", { key },
+          e("i", { className: "dma-stats-swatch " + cls }),
+          tt("stats." + key))
+        )
+      );
+    }
+
+    function StatsStack({ bucket, max, className }) {
+      const total = Number.isFinite(bucket.tokens) ? bucket.tokens : 0;
+      const height = max > 0 ? statsShare(total, max) : 0;
+      // 计费口径细条：DeepSeek 计费（深蓝）/ 本地 · 不计费（中性灰）。
+      // 四色分类已占用蓝色系，因此不重上分类色，而是另加一条独立细条与独立图例。
+      const billableTokens = Number.isFinite(bucket.billableTokens) ? bucket.billableTokens : total;
+      const localTokens = Number.isFinite(bucket.localTokens) ? bucket.localTokens : 0;
+      const segments = [
+        ["input", "dma-stats-seg-input"],
+        ["cacheRead", "dma-stats-seg-cacheRead"],
+        ["cacheWrite", "dma-stats-seg-cacheWrite"],
+        ["output", "dma-stats-seg-output"]
+      ];
+      return e("div", { className: "dma-stats-col" },
+        e("div", {
+          className: "dma-stats-stack" + (className ? " " + className : ""),
+          style: { height: statsPct(height) }
+        },
+          segments.map(([key, cls]) => {
+            const part = Number.isFinite(bucket[key]) ? bucket[key] : 0;
+            if (part <= 0 || total <= 0) return null;
+            return e("i", {
+              key,
+              className: "dma-stats-seg " + cls,
+              style: { height: statsPct(statsShare(part, total)) }
+            });
+          })
+        ),
+        total > 0
+          ? e("div", { className: "dma-stats-billing-bar" },
+            billableTokens > 0
+              ? e("i", { className: "dma-stats-billing-deepseek", style: { width: statsPct(statsShare(billableTokens, total)) } })
+              : null,
+            localTokens > 0
+              ? e("i", { className: "dma-stats-billing-local", style: { width: statsPct(statsShare(localTokens, total)) } })
+              : null
+          )
+          : null
+      );
+    }
+
+    function StatsTimeline({ t: tt, series, range, onRange }) {
+      const buckets = range === "hour" ? (series.hourly || []).slice(-24) : (series.daily || []);
+      let max = 0;
+      let billableTotal = 0;
+      let localTotal = 0;
+      for (const bucket of buckets) {
+        if (bucket.tokens > max) max = bucket.tokens;
+        billableTotal += Number.isFinite(bucket.billableTokens) ? bucket.billableTokens : bucket.tokens;
+        localTotal += Number.isFinite(bucket.localTokens) ? bucket.localTokens : 0;
+      }
+      const first = buckets.length > 0 ? buckets[0].t : 0;
+      const last = buckets.length > 0 ? buckets[buckets.length - 1].t : 0;
+      return e("div", { className: "dma-stats-section" },
+        e("div", { className: "dma-stats-section-head" },
+          e("h4", { className: "dma-stats-section-title" }, tt("stats.timeline")),
+          e("div", { className: "dma-stats-range", role: "group", "aria-label": tt("stats.timeline") },
+            e("button", {
+              type: "button",
+              "aria-pressed": range === "hour" ? "true" : "false",
+              onClick: () => onRange("hour")
+            }, tt("stats.range24")),
+            e("button", {
+              type: "button",
+              "aria-pressed": range === "day" ? "true" : "false",
+              onClick: () => onRange("day")
+            }, tt("stats.range30"))
+          )
+        ),
+        e("div", { className: "dma-stats-chart-card" },
+          e("div", { className: "dma-stats-chart-meta" },
+            e("span", {}, statsClock(first) + " → " + statsClock(last)),
+            e("span", {}, tt("stats.peak") + " " + formatTokens(max))
+          ),
+          e("div", {
+            className: "dma-stats-chart",
+            role: "img",
+            "aria-label": tt("stats.timeline") + ": " + tt("stats.total") + " " + formatTokens(
+              buckets.reduce((sum, bucket) => sum + (Number.isFinite(bucket.tokens) ? bucket.tokens : 0), 0)
+            )
+          },
+            buckets.map((bucket, index) => e("div", {
+              key: bucket.t,
+              title: statsClock(bucket.t) + " · " + formatTokens(bucket.tokens) + " · " + formatCostMicros(bucket.costMicros)
+                + (Number.isFinite(bucket.localTokens) && bucket.localTokens > 0
+                  ? " · " + tt("stats.billingLocal") + " " + formatTokens(bucket.localTokens)
+                  : "")
+            }, e(StatsStack, { bucket, max })))
+          ),
+          e("div", { className: "dma-stats-axis" },
+            [0, Math.floor(buckets.length / 3), Math.floor((buckets.length * 2) / 3), Math.max(0, buckets.length - 1)]
+              .map((position, index) => e("span", { key: index },
+                buckets[position] ? statsClock(buckets[position].t).slice(0, 5) : ""))
+          ),
+          e("div", { className: "dma-stats-legend-row" },
+            e(StatsLegend, { t: tt }),
+            e("div", { className: "dma-stats-legend dma-stats-legend-billing" },
+              e("span", {},
+                e("i", { className: "dma-stats-swatch dma-stats-billing-deepseek" }),
+                tt("stats.billingDeepseek") + " " + formatTokens(billableTotal)),
+              e("span", {},
+                e("i", { className: "dma-stats-swatch dma-stats-billing-local" }),
+                tt("stats.billingLocal") + " " + formatTokens(localTotal))
+            )
+          )
+        )
+      );
+    }
+
+    function StatsSessionRows({ t: tt, rows, truncated, total }) {
+      return e("div", { className: "dma-stats-section" },
+        e("div", { className: "dma-stats-section-head" },
+          e("h4", { className: "dma-stats-section-title" }, tt("stats.sessionsSection")),
+          e("span", { className: "dma-stats-note" }, truncated ? tt("stats.truncated") : total + " / " + total)
+        ),
+        e("div", { className: "dma-stats-rows" },
+          e("div", { className: "dma-stats-row dma-stats-row-head", "aria-hidden": "true" },
+            e("span", {}, tt("stats.colSession")),
+            e("span", { className: "dma-stats-cell-right" }, tt("stats.colTokens")),
+            e("span", { className: "dma-stats-cell-right" }, tt("stats.colCost")),
+            e("span", { className: "dma-stats-cell-right" }, tt("stats.colUpdated"))
+          ),
+          rows.length === 0
+            ? e("div", { className: "dma-stats-empty" }, tt("stats.empty"))
+            : rows.map((row) => {
+              // 只有本地用量时成本显示「本地」而不是 ¥0.00，避免误读为「花了 0 元」。
+              const localOnly = Number.isFinite(row.localTokens) && row.localTokens > 0 &&
+                !(Number.isFinite(row.billableTokens) && row.billableTokens > 0);
+              return e("div", { key: row.id, className: "dma-stats-row" },
+                e("div", { className: "dma-stats-cell" },
+                  e("div", { className: "dma-stats-row-title" },
+                    e("b", { title: row.title }, row.title),
+                    localOnly ? e("span", { className: "dma-stats-pill dma-stats-pill-local" }, tt("stats.localTag")) : null,
+                    row.running ? e("span", { className: "dma-stats-pill dma-stats-pill-running" }, tt("stats.running")) : null,
+                    row.subagent ? e("span", { className: "dma-stats-pill" }, tt("stats.subagent")) : null
+                  ),
+                  e("div", { className: "dma-stats-meta" },
+                    (row.model || tt("stats.noModel")) + " · " + row.turns + " turns · " + row.messages + " msgs"),
+                  e("div", { className: "dma-stats-mini" },
+                    e("i", { className: "dma-stats-seg-input", style: { width: statsPct(statsShare(row.tokens.input, row.tokens.total || 1)) } }),
+                    e("i", { className: "dma-stats-seg-cacheRead", style: { width: statsPct(statsShare(row.tokens.cacheRead, row.tokens.total || 1)) } }),
+                    e("i", { className: "dma-stats-seg-cacheWrite", style: { width: statsPct(statsShare(row.tokens.cacheWrite, row.tokens.total || 1)) } }),
+                    e("i", { className: "dma-stats-seg-output", style: { width: statsPct(statsShare(row.tokens.output, row.tokens.total || 1)) } })
+                  )
+                ),
+                e("span", { className: "dma-stats-cell dma-stats-cell-right" }, formatTokens(row.tokens.total)),
+                e("span", {
+                  className: "dma-stats-cell dma-stats-cell-right",
+                  title: localOnly ? tt("stats.billingNote") : undefined
+                }, localOnly ? tt("stats.localCost") : formatCostMicros(row.costMicros)),
+                e("span", { className: "dma-stats-cell dma-stats-cell-right dma-stats-meta" },
+                  statsRelative(row.lastActiveAt, tt))
+              );
+            })
+        )
+      );
+    }
+
+    function StatsPanel({ onClose }) {
+      const tt = t;
+      const [state, setState] = React.useState({ status: "loading", data: null, error: "" });
+      const [range, setRange] = React.useState("hour");
+      const [budgetText, setBudgetText] = React.useState("");
+      const [budgetEditing, setBudgetEditing] = React.useState(false);
+      const [budgetBusy, setBudgetBusy] = React.useState(false);
+      const [budgetError, setBudgetError] = React.useState("");
+      const alive = React.useRef(true);
+      const budgetInit = React.useRef(false);
+
+      const load = React.useCallback(async () => {
+        try {
+          const res = await getJson(STATS_ROUTE);
+          if (!alive.current) return;
+          if (res.status === 200 && res.data && res.data.ok) {
+            setState({ status: "ready", data: res.data.value, error: "" });
+            return;
+          }
+          const message = res.data && res.data.error && res.data.error.message
+            ? String(res.data.error.message)
+            : tt("stats.error");
+          setState((prev) => ({ status: prev.data ? "stale" : "error", data: prev.data, error: message }));
+        } catch (err) {
+          if (!alive.current) return;
+          setState((prev) => ({
+            status: prev.data ? "stale" : "error",
+            data: prev.data,
+            error: err instanceof Error ? err.message : tt("stats.error")
+          }));
+        }
+      }, [tt]);
+
+      React.useEffect(() => {
+        alive.current = true;
+        load();
+        const timer = setInterval(() => {
+          if (typeof document !== "undefined" && document.visibilityState === "hidden") return;
+          load();
+        }, STATS_POLL_MS);
+        const onVisibility = () => {
+          if (typeof document !== "undefined" && document.visibilityState === "visible") load();
+        };
+        if (typeof document !== "undefined") document.addEventListener("visibilitychange", onVisibility);
+        return () => {
+          alive.current = false;
+          clearInterval(timer);
+          if (typeof document !== "undefined") document.removeEventListener("visibilitychange", onVisibility);
+        };
+      }, [load]);
+
+      React.useEffect(() => {
+        const data = state.data;
+        if (budgetInit.current || !data || !data.budget) return;
+        budgetInit.current = true;
+        setBudgetText(formatCents(data.budget.amountCents));
+      }, [state.data]);
+
+      useOverlayKeys({ active: true, primaryEnabled: false, busy: budgetBusy, onDismiss: onClose, onPrimary: () => {} });
+
+      const data = state.data;
+      const loading = state.status === "loading";
+      const totals = data ? data.totals : null;
+      const budget = data ? data.budget : null;
+      const ledger = data ? data.ledger : null;
+      const ratio = budget && budget.enabled ? budget.ratio * 100 : 0;
+      const over = budget && budget.enabled && budget.remainingCents === 0 && budget.spentCents > 0;
+      const cacheShare = totals && totals.tokens.total > 0
+        ? statsShare(totals.tokens.cacheRead, totals.tokens.total)
+        : 0;
+      const kpi = [
+        {
+          label: tt("stats.totalTokens"),
+          value: totals ? formatTokens(totals.tokens.total) : "—",
+          sub: totals ? tt("stats.cacheShare") + " " + statsPct(cacheShare) : ""
+        },
+        {
+          label: tt("stats.sessions"),
+          value: totals ? String(totals.sessions) : "—",
+          sub: totals ? tt("stats.runningNow") + " " + totals.running : ""
+        },
+        {
+          label: tt("stats.estCost"),
+          value: totals ? formatCostMicros(totals.costMicros) : "—",
+          sub: tt("stats.priceHint")
+        }
+      ];
+      const statsCard = (item) => e("div", { key: item.label, className: "dma-stats-card" },
+        e("span", { className: "dma-stats-card-label" }, item.label),
+        e("span", { className: "dma-stats-card-value", title: item.value }, item.value),
+        e("span", { className: "dma-stats-card-sub" }, item.sub)
+      );
+
+      async function saveBudget() {
+        if (budgetBusy) return;
+        const check = validateCorrectionAmount(budgetText);
+        if (!check.ok) {
+          setBudgetError(tt("stats.budgetInvalid"));
+          return;
+        }
+        setBudgetBusy(true);
+        setBudgetError("");
+        try {
+          const res = await postJson(STATS_BUDGET_ROUTE, { budgetYuan: String(budgetText).trim() });
+          if (res.status === 200 && res.data && res.data.ok) {
+            setBudgetText(formatCents(res.data.value.budgetCents));
+            if (alive.current) setBudgetEditing(false);
+            await load();
+          } else {
+            setBudgetError(tt("stats.budgetFailed"));
+          }
+        } catch {
+          setBudgetError(tt("stats.budgetFailed"));
+        } finally {
+          if (alive.current) setBudgetBusy(false);
+        }
+      }
+
+      /** 取消就地编辑：丢掉未保存的输入，恢复为当前预算金额。 */
+      function cancelBudget() {
+        setBudgetEditing(false);
+        setBudgetError("");
+        if (data && data.budget) setBudgetText(formatCents(data.budget.amountCents));
+      }
+
+      const openBudgetEdit = () => {
+        setBudgetError("");
+        setBudgetEditing(true);
+      };
+
+      const budgetProgress = budget && budget.enabled
+        ? e("div", { className: "dma-stats-progress", role: "progressbar", "aria-valuemin": 0, "aria-valuemax": 100, "aria-valuenow": Math.min(100, Math.round(ratio)) },
+          e("i", { style: { width: statsPct(ratio) } }))
+        : null;
+
+      // 第一行第三张：预算卡（金额 + 剩余/已用 + 进度条）；「修改预算」小按钮与金额同一行，
+      // 点金额仍可直接编辑（隐藏路径保留）。
+      const budgetCardNode = e("div", { className: "dma-stats-card dma-stats-money-card" },
+        e("span", { className: "dma-stats-card-label" }, tt("stats.moneyBudget")),
+        budgetEditing
+          ? e("div", { className: "dma-stats-money-edit-row" },
+            e("span", { className: "dma-stats-money-input" },
+              "¥",
+              e("input", {
+                id: "dma-stats-budget-input",
+                type: "text",
+                inputMode: "decimal",
+                value: budgetText,
+                disabled: budgetBusy,
+                autoFocus: true,
+                "aria-label": tt("stats.budgetEdit"),
+                onChange: (ev) => {
+                  setBudgetText(ev.target.value);
+                  if (budgetError) setBudgetError("");
+                },
+                onKeyDown: (ev) => {
+                  if (ev.key === "Enter") saveBudget();
+                  else if (ev.key === "Escape") {
+                    ev.stopPropagation();
+                    cancelBudget();
+                  }
+                }
+              }),
+              tt("stats.budgetUnit")
+            ),
+            e("button", {
+              type: "button",
+              className: "dma-stats-money-mini",
+              disabled: budgetBusy,
+              onClick: saveBudget
+            }, budgetBusy ? tt("stats.budgetSaving") : tt("stats.budgetSave")),
+            e("button", {
+              type: "button",
+              className: "dma-stats-money-cancel",
+              disabled: budgetBusy,
+              onClick: cancelBudget
+            }, tt("stats.budgetCancel"))
+          )
+          : e("div", { className: "dma-stats-money-value-row" },
+            e("button", {
+              type: "button",
+              className: "dma-stats-card-value dma-stats-money-edit",
+              title: tt("stats.moneyEdit"),
+              "aria-label": tt("stats.moneyEdit"),
+              onClick: openBudgetEdit
+            }, budget ? formatYuanCents(budget.amountCents) : "—"),
+            e("button", {
+              type: "button",
+              className: "dma-stats-money-mini",
+              title: tt("stats.moneyEdit"),
+              "aria-label": tt("stats.moneyEdit"),
+              onClick: openBudgetEdit
+            }, tt("stats.moneyEdit"))
+          ),
+        e("span", { className: "dma-stats-card-sub" },
+          budget && budget.enabled
+            ? (over
+              ? tt("stats.overBudget")
+              : tt("stats.budgetLeft") + " " + formatYuanCents(budget.remainingCents) + " · "
+                + tt("stats.budgetUsed") + " " + statsPct(ratio))
+            : tt("stats.budgetOffSub")),
+        budgetEditing
+          ? e("span", { className: "dma-stats-money-hint" }, budgetError || tt("stats.budgetHint"))
+          : null,
+        budgetProgress
+      );
+
+      // 第一行第四张：预算使用（比例 + 剩余 / 额度 + 进度条）。
+      const budgetUsageCardNode = e("div", { className: "dma-stats-card" },
+        e("span", { className: "dma-stats-card-label" }, tt("stats.budget")),
+        e("span", { className: "dma-stats-card-value", title: budget && budget.enabled ? statsRatioText(ratio) : tt("stats.budgetOff") },
+          budget && budget.enabled ? statsRatioText(ratio) : tt("stats.budgetOff")),
+        e("span", { className: "dma-stats-card-sub" },
+          budget && budget.enabled
+            ? (over
+              ? tt("stats.overBudget") + " · " + formatYuanCents(budget.amountCents)
+              : tt("stats.budgetLeft") + " " + formatYuanCents(budget.remainingCents) + tt("stats.of") + formatYuanCents(budget.amountCents))
+            : tt("stats.budgetOffSub")),
+        budgetProgress
+      );
+
+      return e("div", {
+        className: "dma-overlay",
+        onClick: (ev) => {
+          if (ev.target === ev.currentTarget) onClose();
+        }
+      },
+      e("div", {
+        className: "dma-panel dma-stats-panel",
+        role: "dialog",
+        "aria-modal": "true",
+        "aria-label": tt("stats.panelTitle")
+      },
+        e("div", { className: "dma-panel-head dma-stats-head" },
+          e("span", { className: "dma-stats-title" }, tt("stats.panelTitle")),
+          e("span", { className: "dma-stats-live" },
+            e("i", { className: "dma-stats-dot" }),
+            state.status === "ready" ? tt("stats.live") : state.status === "stale" ? tt("stats.stale") : tt("stats.loading")),
+          e("button", {
+            type: "button",
+            className: "dma-stats-icon",
+            title: tt("stats.refresh"),
+            "aria-label": tt("stats.refresh"),
+            disabled: loading || budgetBusy,
+            onClick: () => load()
+          }, e("span", { className: "dma-stats-ico", dangerouslySetInnerHTML: { __html: REFRESH_ICON } })),
+          e("button", {
+            type: "button",
+            autoFocus: true,
+            className: "dma-stats-icon",
+            title: tt("stats.close"),
+            "aria-label": tt("stats.close"),
+            onClick: onClose
+          }, "×")
+        ),
+        e("div", { className: "dma-panel-body dma-stats-body" },
+          e("p", { className: "dma-stats-intro" }, tt("stats.intro")),
+          state.status === "error"
+            ? e("p", { className: "dma-stats-error" }, tt("stats.error") + "：" + state.error)
+            : null,
+          state.status === "stale"
+            ? e("p", { className: "dma-stats-error" }, tt("stats.stale") + "：" + state.error)
+            : null,
+          !loading && data && data.available === false
+            ? e("p", { className: "dma-stats-error" }, tt("stats.unavailable"))
+            : null,
+          loading
+            ? e("p", { className: "dma-stats-empty" }, tt("stats.loading"))
+            : e("div", { className: "dma-stats-kpis" },
+              kpi.slice(0, 2).map(statsCard),
+              // 第一行：总 Token → 会话数量 → 预算 → 预算使用。
+              budgetCardNode,
+              budgetUsageCardNode
+            ),
+          !loading && data
+            ? e("div", { className: "dma-stats-kpis dma-stats-money" },
+              // 第二行：余额 → 日用 → 单次 → 估算成本。
+              ledger
+                ? e("div", { className: "dma-stats-card" },
+                  e("span", { className: "dma-stats-card-label" }, tt("cost.balance")),
+                  e("span", { className: "dma-stats-card-value" },
+                    Number.isFinite(ledger.balanceCents) ? formatYuanCents(ledger.balanceCents) : "—"),
+                  e("span", { className: "dma-stats-card-sub" },
+                    ledger.bonusCents > 0
+                      ? tt("cost.bonusHint", { bonus: formatYuanCents(ledger.bonusCents) })
+                      : tt("stats.moneyBalanceSub"))
+                )
+                : null,
+              ledger
+                ? e("div", { className: "dma-stats-card" },
+                  e("span", { className: "dma-stats-card-label" }, tt("cost.daily")),
+                  e("span", { className: "dma-stats-card-value" }, formatYuanCents(ledger.dailyCents || 0)),
+                  e("span", { className: "dma-stats-card-sub" }, tt("stats.moneyDailySub"))
+                )
+                : null,
+              ledger
+                ? e("div", { className: "dma-stats-card" },
+                  e("span", { className: "dma-stats-card-label" }, tt("cost.perTurn")),
+                  e("span", { className: "dma-stats-card-value" },
+                    Number.isFinite(ledger.lastTurnMicros) ? formatCostMicros(ledger.lastTurnMicros) : "—"),
+                  e("span", { className: "dma-stats-card-sub" }, tt("stats.moneyTurnSub"))
+                )
+                : null,
+              statsCard(kpi[2])
+            )
+            : null,
+          !loading && data
+            ? e("p", { className: "dma-stats-note" }, tt("stats.budgetNote"))
+            : null,
+          !loading && data
+            ? e("p", { className: "dma-stats-note" }, tt("stats.billingNote"))
+            : null,
+          !loading && data
+            ? e(StatsTimeline, { t: tt, series: data.series, range, onRange: setRange })
+            : null,
+          !loading && data
+            ? e(StatsSessionRows, {
+              t: tt,
+              rows: data.sessions || [],
+              truncated: data.truncated === true,
+              total: data.sessionsTotal || 0
+            })
+            : null,
+          !loading && data && data.ledger
+            ? e("p", { className: "dma-stats-note" }, tt("stats.ledger", {
+              daily: formatYuanCents(data.ledger.dailyCents || 0),
+              observed: formatYuanCents(data.ledger.observedSpendCents || 0)
+            }))
+            : null
+        )
+      )
+      );
+    }
+
     // 设置页（settings.section 槽位）
+    // 「完成提示音」不再有独立开关行：音色选「关闭」即关闭（见 SoundToneRow）。
     const SETTING_FIELDS = [
       ["recall", "settings.recall", "settings.recallDesc"],
       ["share", "settings.share", "settings.shareDesc"],
@@ -1531,8 +2266,7 @@ window.__ModuleLoader__.load({
       ["delete", "settings.delete", "settings.deleteDesc"],
       ["deleteFrom", "settings.deleteFrom", "settings.deleteFromDesc"],
       ["confirm", "settings.confirm", "settings.confirmDesc"],
-      ["stats", "settings.stats", "settings.statsDesc"],
-      ["sound", "settings.sound", "settings.soundDesc", true]
+      ["stats", "settings.stats", "settings.statsDesc"]
     ];
 
     function SettingRow({ t: tt, labelKey, descKey, on, disabled, onToggle }) {
@@ -1618,6 +2352,112 @@ window.__ModuleLoader__.load({
       );
     }
 
+    function SoundToneRow({ t: tt, value, onPick }) {
+      const current = completionSoundTone(value || {});
+      return e("div", { className: "dma-setting-row" },
+        e("div", { className: "dma-setting-text" },
+          e("div", { className: "dma-setting-label" }, tt("settings.soundTone")),
+          e("div", { className: "dma-setting-desc" }, tt("settings.soundToneDesc"))
+        ),
+        e("div", { className: "dma-seg", role: "group", "aria-label": tt("settings.soundTone") },
+          soundToneOptions().map((id) => e("button", {
+            key: id,
+            type: "button",
+            className: "dma-seg-btn",
+            "aria-pressed": current === id ? "true" : "false",
+            onClick: () => onPick(id)
+          }, tt("settings.soundTone." + id)))
+        )
+      );
+    }
+
+    function VolumeRow({ t: tt, value, disabled, onCommit }) {
+      const committed = clampSoundVolume(value);
+      const [draft, setDraft] = React.useState(committed);
+      const draftRef = React.useRef(committed);
+      const committedRef = React.useRef(committed);
+      const dragging = React.useRef(false);
+      const timer = React.useRef(null);
+      const inputRef = React.useRef(null);
+      const commitRef = React.useRef(() => {});
+
+      // 外部配置变化时才回写本地值；拖动中或防抖未落盘时不覆盖，保证数字跟手。
+      React.useEffect(() => {
+        committedRef.current = committed;
+        if (!dragging.current && !timer.current) {
+          draftRef.current = committed;
+          setDraft(committed);
+        }
+      }, [committed]);
+
+      React.useEffect(() => () => {
+        if (timer.current) clearTimeout(timer.current);
+      }, []);
+
+      // 拖动过程只更新本地显示，不写宿主配置、不重拉设置快照。
+      const update = (raw) => {
+        const next = clampSoundVolume(raw);
+        draftRef.current = next;
+        setDraft(next);
+      };
+
+      // 松手 / 键盘抬起 / 失焦合并成一次提交：120ms 防抖后写入并试听一次。
+      const commit = () => {
+        dragging.current = false;
+        if (timer.current) clearTimeout(timer.current);
+        timer.current = setTimeout(() => {
+          timer.current = null;
+          const next = draftRef.current;
+          if (next === committedRef.current) return;
+          committedRef.current = next;
+          onCommit(next);
+        }, 120);
+      };
+      commitRef.current = commit;
+
+      // 原生 change 在拖动结束时才触发（React 的 onChange 实际是 input 事件），
+      // 兜住指针在滑杆外松开、或浏览器不做隐式指针捕获的情况。
+      React.useEffect(() => {
+        const el = inputRef.current;
+        if (!el || typeof el.addEventListener !== "function") return undefined;
+        const onChangeEnd = () => commitRef.current();
+        el.addEventListener("change", onChangeEnd);
+        return () => el.removeEventListener("change", onChangeEnd);
+      }, []);
+
+      return e("div", { className: "dma-setting-row" },
+        e("div", { className: "dma-setting-text" },
+          e("div", { className: "dma-setting-label" }, tt("settings.soundVolume")),
+          e("div", { className: "dma-setting-desc" }, tt("settings.soundVolumeDesc"))
+        ),
+        e("div", { className: "dma-volume" },
+          e("input", {
+            ref: inputRef,
+            type: "range",
+            className: "dma-volume-range",
+            min: 0,
+            max: 100,
+            step: 5,
+            value: draft,
+            disabled: !!disabled,
+            "aria-label": tt("settings.soundVolume"),
+            onChange: (ev) => {
+              dragging.current = true;
+              update(ev.target.value);
+            },
+            onPointerDown: () => {
+              dragging.current = true;
+            },
+            onPointerUp: commit,
+            onPointerCancel: commit,
+            onKeyUp: commit,
+            onBlur: commit
+          }),
+          e("span", { className: "dma-volume-value" }, draft + "%")
+        )
+      );
+    }
+
     function BillingTab({ t: tt, form, value, save }) {
       const enabled = value ? value.usageStats !== false : true;
       const onToggle = (key, on) => () => save(key, !on);
@@ -1659,127 +2499,18 @@ window.__ModuleLoader__.load({
           disabled: !enabled,
           onToggle: enabled ? onToggle("costPeakValley", value ? value.costPeakValley !== false : true) : null
         }),
-        e(CorrectionForm, { t: tt })
-      );
-    }
-
-    function centsToInput(cents) {
-      return Number.isFinite(cents) ? formatCents(cents) : "0.00";
-    }
-
-    function CorrectionForm({ t: tt }) {
-      const snap = React.useSyncExternalStore(
-        costStore.subscribe,
-        costStore.getSnapshot,
-        costStore.getSnapshot
-      );
-      const value = snap && snap.status === "ready" ? snap.value : null;
-      const [credit, setCredit] = React.useState("0.00");
-      const [debit, setDebit] = React.useState("0.00");
-      const [busy, setBusy] = React.useState(false);
-      const [error, setError] = React.useState("");
-      const initialized = React.useRef(false);
-
-      React.useEffect(() => {
-        if (!value || initialized.current) return;
-        initialized.current = true;
-        setCredit(centsToInput(value.account.creditCents));
-        setDebit(centsToInput(value.account.debitCents));
-      }, [value]);
-
-      const creditCheck = validateCorrectionAmount(credit === "" ? 0 : credit);
-      const debitCheck = validateCorrectionAmount(debit === "" ? 0 : debit);
-      const invalid = !creditCheck.ok || !debitCheck.ok;
-
-      const account = value ? value.account : null;
-      const baseline = account && Number.isFinite(account.baselineCents) ? account.baselineCents : null;
-      const observed = account && Number.isFinite(account.observedSpendCents) ? account.observedSpendCents : 0;
-      const previewCents = baseline === null
-        ? null
-        : baseline - observed + (creditCheck.ok ? creditCheck.cents : 0) - (debitCheck.ok ? debitCheck.cents : 0);
-
-      async function submit() {
-        if (invalid || busy) return;
-        setBusy(true);
-        setError("");
-        let res;
-        try {
-          res = await postJson("/dsh-message-actions/cost/correction", {
-            creditYuan: credit,
-            debitYuan: debit
-          });
-        } catch {
-          // 网络中断 / 宿主超时：给出可理解的反馈，不留未捕获 rejection。
-          setError(tt("cost.correction.failed"));
-          setBusy(false);
-          return;
-        }
-        if (res.status === 200 && res.data && res.data.ok && res.data.value) {
-          patchCostState({ status: "ready", value: res.data.value, fetchedAt: Date.now(), error: "" });
-          setCredit(centsToInput(res.data.value.account.creditCents));
-          setDebit(centsToInput(res.data.value.account.debitCents));
-        } else {
-          const code = res.data && res.data.error ? res.data.error.code : undefined;
-          setError(tt(code === "INVALID_AMOUNT" ? "cost.correction.invalid" : "cost.correction.failed"));
-        }
-        setBusy(false);
-      }
-
-      return e("div", { className: "dma-correction" },
-        e("div", { className: "dma-correction-title" }, tt("cost.correction.title")),
-        e("div", { className: "dma-correction-row" },
-          e("label", { className: "dma-correction-label" }, tt("cost.correction.credit")),
-          e("span", { className: "dma-correction-input" },
-            e("span", { className: "dma-correction-yuan" }, tt("cost.correction.yuan")),
-            e("input", {
-              type: "text",
-              inputMode: "decimal",
-              value: credit,
-              disabled: busy,
-              "aria-invalid": invalid ? "true" : "false",
-              onChange: (ev) => setCredit(ev.target.value)
-            })
-          )
-        ),
-        e("div", { className: "dma-correction-row" },
-          e("label", { className: "dma-correction-label" }, tt("cost.correction.debit")),
-          e("span", { className: "dma-correction-input" },
-            e("span", { className: "dma-correction-yuan" }, tt("cost.correction.yuan")),
-            e("input", {
-              type: "text",
-              inputMode: "decimal",
-              value: debit,
-              disabled: busy,
-              "aria-invalid": invalid ? "true" : "false",
-              onChange: (ev) => setDebit(ev.target.value)
-            })
-          )
-        ),
-        e("div", { className: "dma-correction-row dma-correction-preview" },
-          e("label", { className: "dma-correction-label" }, tt("cost.correction.preview")),
-          e("span", {
-            className: "dma-correction-value" + (previewCents !== null && previewCents < 0 ? " dma-correction-negative" : "")
-          }, previewCents === null ? "—" : formatYuanCents(previewCents))
-        ),
-        e("div", { className: "dma-correction-row" },
-          e("label", { className: "dma-correction-label" }, tt("cost.correction.pending")),
-          e("span", { className: "dma-correction-value" },
-            formatYuanCents(value && Number.isFinite(value.pendingAdjustmentCents) ? value.pendingAdjustmentCents : 0))
-        ),
-        invalid ? e("div", { className: "dma-setting-error" }, tt("cost.correction.invalid")) : null,
-        previewCents !== null && previewCents < 0
-          ? e("div", { className: "dma-correction-warn" }, tt("cost.correction.negative"))
-          : null,
-        error ? e("div", { className: "dma-setting-error" }, error) : null,
-        e("p", { className: "dma-cost-note" }, tt("cost.note")),
-        e("div", { className: "dma-correction-actions" },
+        e("div", { className: "dma-setting-row" },
+          e("div", { className: "dma-setting-text" },
+            e("div", { className: "dma-setting-label" }, tt("cost.settings.statsTable")),
+            e("div", { className: "dma-setting-desc" }, tt("cost.settings.statsTableDesc"))
+          ),
           e("button", {
             type: "button",
-            className: "dma-correction-save",
-            disabled: invalid || busy,
-            onClick: submit
-          }, tt(busy ? "cost.correction.saving" : "cost.correction.save"))
-        )
+            className: "dma-setting-primary dma-setting-btn",
+            onClick: (ev) => openStatsPanel(ev.currentTarget)
+          }, tt("cost.settings.statsTableButton"))
+        ),
+        e("p", { className: "dma-cost-note" }, tt("cost.balanceNote"))
       );
     }
 
@@ -1851,6 +2582,28 @@ window.__ModuleLoader__.load({
                 onToggle: () => save(key, !on)
               });
             }),
+            // 音色 + 音量：没有独立开关行，「关闭」音色即关闭完成提示音。
+            e(SoundToneRow, {
+              key: "soundTone",
+              t: tt,
+              value: value || {},
+              onPick: (id) => {
+                save("soundTone", id);
+                if (id === "off") return; // 选「关闭」即关闭，不再试听
+                // 旧配置可能还留着 sound=false：选任一音色时同步打开。
+                if (value && value.sound === false) save("sound", true);
+                playCompletionSound(id);
+              }
+            }),
+            e(VolumeRow, {
+              key: "soundVolume",
+              t: tt,
+              value: value ? value.soundVolume : DEFAULT_SOUND_VOLUME,
+              onCommit: (volume) => {
+                save("soundVolume", volume);
+                playCompletionSound(undefined, volume);
+              }
+            }),
             // 第一个标签页底部：只读版本号，不抢设置项视觉焦点。
             e("div", { className: "dma-settings-version" }, "v" + VERSION)
           )
@@ -1917,9 +2670,17 @@ window.__ModuleLoader__.load({
       const status = value ? value.status : "stale";
       const lastTurn = value && value.lastTurn ? value.lastTurn : null;
 
-      const balanceCents = balance && balance.updatedAt > 0 && Number.isFinite(balance.totalCents)
-        ? balance.totalCents
+      // 余额口径：直接展示官方「充值余额」（不含赠金；赠金在提示里单列），
+      // 全部按分计，不做元级四舍五入。缺充值字段时才退回总额。
+      const rechargeCents = balance && Number.isFinite(balance.rechargeCents) ? balance.rechargeCents : null;
+      const bonusCents = balance && Number.isFinite(balance.bonusCents) ? balance.bonusCents : null;
+      const totalCents = balance && Number.isFinite(balance.totalCents) ? balance.totalCents : null;
+      const balanceCents = balance && balance.updatedAt > 0
+        ? (rechargeCents !== null ? rechargeCents : totalCents)
         : null;
+      const bonusTitle = bonusCents !== null && bonusCents > 0
+        ? " · " + tt("cost.bonusHint", { bonus: formatYuanCents(bonusCents) })
+        : "";
       const dailyCents = balanceCents !== null && value && Number.isFinite(value.dailyCents)
         ? value.dailyCents
         : null;
@@ -1966,7 +2727,7 @@ window.__ModuleLoader__.load({
 
       if (!wide) {
         const title = balanceCents !== null
-          ? tt("cost.railTitle", { balance: formatYuanCents(balanceCents) })
+          ? tt("cost.railTitle", { balance: formatYuanCents(balanceCents) }) + bonusTitle
           : tt("cost.balance");
         return e("div", { className: "dma-cost-item" },
           e("button", {
@@ -2010,7 +2771,6 @@ window.__ModuleLoader__.load({
         : formatCostMicros(Math.round(turnShown));
 
       const stale = status === "stale" && balanceCents !== null;
-      const pending = value && Number.isFinite(value.pendingAdjustmentCents) && value.pendingAdjustmentCents > 0;
       const staleTitle = balance && balance.updatedAt > 0
         ? tt("cost.staleTitle", { time: new Date(balance.updatedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) })
         : "";
@@ -2027,30 +2787,38 @@ window.__ModuleLoader__.load({
       if (compact) {
         return e("div", { className: "dma-cost-item" },
           e("div", { className: "dma-cost-card dma-cost-plain" },
-            e("button", {
-              type: "button",
-              className: "dma-cost-plain-row",
-              onClick: refresh,
-              title: stale ? staleTitle : tt("cost.refresh"),
-              "aria-label": tt("cost.refresh"),
-              "aria-busy": refreshing ? "true" : "false"
-            },
-              showPeak ? periodIcon : null,
-              e("span", { className: "dma-cost-col" },
-                e("span", { className: "dma-cost-label" }, tt("cost.balance")),
-                e("span", { className: "dma-cost-value" }, balanceText)
+            e("div", { className: "dma-cost-plain-wrap" },
+              e("button", {
+                type: "button",
+                className: "dma-cost-plain-row",
+                onClick: refresh,
+                title: (stale ? staleTitle : tt("cost.refresh")) + bonusTitle,
+                "aria-label": tt("cost.refresh"),
+                "aria-busy": refreshing ? "true" : "false"
+              },
+                showPeak ? periodIcon : null,
+                e("span", { className: "dma-cost-col" },
+                  e("span", { className: "dma-cost-label" }, tt("cost.balance")),
+                  e("span", { className: "dma-cost-value" }, balanceText)
+                ),
+                e("span", { className: "dma-cost-col" },
+                  e("span", { className: "dma-cost-label" }, tt("cost.daily")),
+                  e("span", { className: "dma-cost-value" }, dailyText)
+                ),
+                showTurn && !turnHidden
+                  ? e("span", { className: "dma-cost-col" },
+                    e("span", { className: "dma-cost-label", title: tt("cost.settings.perTurnDesc") }, tt("cost.perTurn")),
+                    e("span", { className: "dma-cost-value" }, turnText)
+                  )
+                  : null
               ),
-              e("span", { className: "dma-cost-col" },
-                e("span", { className: "dma-cost-label" }, tt("cost.daily")),
-                e("span", { className: "dma-cost-value" }, dailyText)
-              ),
-              showTurn && !turnHidden
-                ? e("span", { className: "dma-cost-col" },
-                  e("span", { className: "dma-cost-label", title: tt("cost.settings.perTurnDesc") }, tt("cost.perTurn")),
-                  e("span", { className: "dma-cost-value" }, turnText)
-                )
-                : null,
-              pending ? e("span", { className: "dma-cost-badge", title: tt("cost.pendingTitle") }, tt("cost.pending")) : null
+              e("button", {
+                type: "button",
+                className: "dma-stats-entry",
+                title: tt("stats.entryTitle"),
+                "aria-label": tt("stats.entryTitle"),
+                onClick: (ev) => openStatsPanel(ev.currentTarget)
+              }, e("span", { className: "dma-ico", dangerouslySetInnerHTML: { __html: STATS_ICON } }))
             )
           )
         );
@@ -2063,13 +2831,12 @@ window.__ModuleLoader__.load({
               type: "button",
               className: "dma-cost-col dma-cost-balance" + (refreshing ? " dma-cost-busy" : ""),
               onClick: refresh,
-              title: stale ? staleTitle : tt("cost.refresh"),
+              title: (stale ? staleTitle : tt("cost.refresh")) + bonusTitle,
               "aria-label": tt("cost.refresh"),
               "aria-busy": refreshing ? "true" : "false"
             },
               e("span", { className: "dma-cost-label" },
                 tt("cost.balance"),
-                pending ? e("span", { className: "dma-cost-badge", title: tt("cost.pendingTitle") }, tt("cost.pending")) : null,
                 refreshing ? e("span", { className: "dma-cost-spinner" }) : null,
                 stale ? e("span", { className: "dma-cost-stale", title: staleTitle }) : null
               ),
@@ -2093,7 +2860,14 @@ window.__ModuleLoader__.load({
                   }, "×")
                   : null
               )
-              : null
+              : null,
+            e("button", {
+              type: "button",
+              className: "dma-stats-entry",
+              title: tt("stats.entryTitle"),
+              "aria-label": tt("stats.entryTitle"),
+              onClick: (ev) => openStatsPanel(ev.currentTarget)
+            }, e("span", { className: "dma-ico", dangerouslySetInnerHTML: { __html: STATS_ICON } }))
           ),
           showPeak
             ? e("div", {
@@ -2138,21 +2912,13 @@ window.__ModuleLoader__.load({
 .dma-seg-btn{border:0;border-radius:6px;padding:4px 10px;background:transparent;color:var(--dsw-alias-label-secondary,#5b6472);font-size:12px;line-height:1.4;cursor:pointer}
 .dma-seg-btn[aria-pressed="true"]{background:var(--dsw-alias-bg-layer-1,#fff);color:var(--dsw-alias-label-primary,#1f2329);font-weight:600;box-shadow:0 1px 2px rgba(0,0,0,.08)}
 .dma-seg-btn:disabled{opacity:.45;cursor:default}
-.dma-correction{margin-top:10px;padding-top:10px;border-top:.5px solid var(--dsw-alias-border-l2,rgba(0,0,0,.08))}
-.dma-correction-title{margin-bottom:6px;font-size:13px;font-weight:600;color:var(--dsw-alias-label-primary,#1f2329)}
-.dma-correction-row{display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap;padding:5px 0;font-size:13px}
-.dma-correction-label{color:var(--dsw-alias-label-secondary,#5b6472)}
-.dma-correction-input{display:inline-flex;align-items:center;gap:4px;padding:4px 8px;border:.5px solid var(--dsw-alias-border-l3,#c9ced6);border-radius:7px;background:var(--dsw-alias-bg-layer-1,#fff)}
-.dma-correction-input input{width:110px;border:0;outline:0;background:transparent;color:var(--dsw-alias-label-primary,#1f2329);font:inherit;font-variant-numeric:tabular-nums;text-align:right}
-.dma-correction-input input[aria-invalid="true"]{color:var(--dsw-alias-state-error-primary,#e5484d)}
-.dma-correction-yuan{color:var(--dsw-alias-label-tertiary,#8a919e)}
-.dma-correction-value{color:var(--dsw-alias-label-primary,#1f2329);font-variant-numeric:tabular-nums}
-.dma-correction-negative{color:var(--dsw-alias-state-error-primary,#e5484d);font-weight:600}
-.dma-correction-warn{margin-top:4px;font-size:12px;color:var(--dsw-alias-state-error-primary,#e5484d)}
+.dma-volume{flex:none;display:inline-flex;align-items:center;gap:8px;margin-top:2px}
+.dma-volume-range{width:132px;accent-color:var(--dsw-alias-state-business-primary,#4c8dff)}
+.dma-volume-range:disabled{opacity:.45}
+.dma-volume-value{min-width:38px;font-size:12px;font-variant-numeric:tabular-nums;color:var(--dsw-alias-label-secondary,#5b6472);text-align:right}
 .dma-cost-note{margin:10px 0 0;font-size:11px;line-height:1.6;color:var(--dsw-alias-label-tertiary,#8a919e)}
-.dma-correction-actions{display:flex;justify-content:flex-end;margin-top:8px}
-.dma-correction-save{height:32px;padding:0 16px;border:0;border-radius:8px;background:var(--dsw-alias-button-primary-fill,#4c8dff);color:#fff;font-size:13px;cursor:pointer}
-.dma-correction-save:disabled{background:var(--dsw-alias-bg-layer-2,#f2f3f5);color:var(--dsw-alias-label-dimmed,#a0a6b0);cursor:default}
+.dma-setting-primary{height:32px;padding:0 16px;border:0;border-radius:8px;background:var(--dsw-alias-button-primary-fill,#4c8dff);color:#fff;font-size:13px;cursor:pointer}
+.dma-setting-primary:disabled{background:var(--dsw-alias-bg-layer-2,#f2f3f5);color:var(--dsw-alias-label-dimmed,#a0a6b0);cursor:default}
 .dma-cost-item{flex:1 1 auto;min-width:0}
 .dma-cost-card{display:flex;flex-direction:column;gap:3px;min-width:0;padding:5px 8px;border:.5px solid var(--dsw-alias-border-l2,rgba(0,0,0,.08));border-radius:8px;background:var(--dsw-alias-bg-layer-2,#f2f3f5);color:var(--dsw-alias-label-primary,#1f2329)}
 .dma-cost-cols{display:flex;align-items:baseline;justify-content:space-between;gap:6px;min-width:0}
@@ -2162,7 +2928,6 @@ window.__ModuleLoader__.load({
 .dma-cost-balance:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary,#4c8dff);outline-offset:2px}
 .dma-cost-label{display:flex;align-items:center;gap:2px;overflow:hidden;font-size:11px;line-height:1.2;white-space:nowrap;color:var(--dsw-alias-label-tertiary,#8a919e)}
 .dma-cost-value{overflow:hidden;font-size:14px;font-weight:600;line-height:1.25;white-space:nowrap;text-overflow:ellipsis;font-variant-numeric:tabular-nums}
-.dma-cost-badge{flex:none;padding:0 4px;border-radius:7px;background:rgba(245,154,46,.16);color:#b56a00;font-size:10.5px;font-weight:500;line-height:15px}
 .dma-cost-spinner{flex:none;width:9px;height:9px;border:1.5px solid rgba(0,0,0,.15);border-top-color:var(--dsw-alias-state-business-primary,#4c8dff);border-radius:50%;animation:dma-spin .8s linear infinite}
 .dma-cost-stale{flex:none;width:4px;height:4px;border-radius:50%;background:var(--dsw-alias-label-dimmed,#a0a6b0)}
 .dma-cost-hide{margin-left:1px;border:0;padding:0 1px;background:transparent;color:var(--dsw-alias-label-tertiary,#8a919e);font-size:11px;line-height:1;cursor:pointer}
@@ -2177,7 +2942,6 @@ window.__ModuleLoader__.load({
 .dma-cost-plain-row:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary,#4c8dff);outline-offset:2px}
 .dma-cost-plain .dma-cost-col{flex:0 1 auto;overflow:hidden}
 .dma-cost-plain .dma-cost-value{font-size:13.5px}
-.dma-cost-plain .dma-cost-badge{margin-left:auto}
 .dma-cost-local{flex-direction:row;align-items:center;justify-content:center;gap:5px;padding:6px 8px}
 .dma-cost-local.dma-cost-plain{justify-content:flex-start;gap:6px;padding:2px 2px}
 .dma-cost-local-text{overflow:hidden;font-size:12px;line-height:1.3;white-space:nowrap;text-overflow:ellipsis;color:var(--dsw-alias-label-secondary,#5b6472)}
@@ -2185,6 +2949,101 @@ window.__ModuleLoader__.load({
 .dma-cost-rail:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(0,0,0,.05))}
 .dma-cost-rail:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary,#4c8dff);outline-offset:2px}
 .dma-cost-rail svg{width:16px;height:16px}
+.dma-cost-plain-wrap{display:flex;align-items:center;gap:2px;width:100%;min-width:0}
+.dma-cost-plain-wrap .dma-cost-plain-row{flex:1 1 auto;min-width:0}
+.dma-cost-cols>.dma-stats-entry{align-self:center}
+.dma-stats-entry{flex:none;display:inline-flex;align-items:center;justify-content:center;width:24px;height:24px;padding:0;border:0;border-radius:6px;background:transparent;color:var(--dsw-alias-label-tertiary,#8a919e);cursor:pointer;transition:background 120ms ease,color 120ms ease}
+.dma-stats-entry:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(0,0,0,.05));color:var(--dsw-alias-label-primary,#1f2329)}
+.dma-stats-entry:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary,#4c8dff);outline-offset:2px}
+.dma-stats-entry svg{display:block;width:15px;height:15px}
+.dma-stats-panel{width:min(920px,calc(100vw - 48px));max-height:86vh}
+.dma-stats-head{display:flex;align-items:center;gap:6px}
+.dma-stats-title{margin-right:auto;font-size:16px;font-weight:600;color:var(--dsw-alias-label-primary,#1f2329)}
+.dma-stats-live{display:inline-flex;align-items:center;gap:5px;font-size:11px;color:var(--dsw-alias-label-tertiary,#8a919e)}
+.dma-stats-dot{display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--dsw-alias-state-success-primary,#22a06b)}
+.dma-stats-icon{flex:none;display:inline-flex;align-items:center;justify-content:center;width:28px;height:28px;padding:0;border:0;border-radius:7px;background:transparent;color:var(--dsw-alias-label-secondary,#5b6472);font-size:16px;line-height:1;cursor:pointer}
+.dma-stats-icon:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(0,0,0,.05))}
+.dma-stats-icon:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary,#4c8dff);outline-offset:2px}
+.dma-stats-icon:disabled{opacity:.45;cursor:default}
+.dma-stats-ico svg{display:block;width:16px;height:16px}
+.dma-stats-body{display:flex;flex-direction:column;gap:14px;padding:14px 18px}
+.dma-stats-intro{margin:0;font-size:12px;line-height:1.6;color:var(--dsw-alias-label-tertiary,#8a919e)}
+.dma-stats-kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px}
+.dma-stats-card{display:flex;flex-direction:column;gap:4px;min-width:0;padding:10px 12px;border:.5px solid var(--dsw-alias-border-l2,rgba(0,0,0,.08));border-radius:9px;background:var(--dsw-alias-bg-layer-2,#f2f3f5)}
+.dma-stats-card-label{font-size:11px;line-height:1.4;color:var(--dsw-alias-label-tertiary,#8a919e)}
+.dma-stats-card-value{overflow:hidden;font-size:20px;font-weight:600;line-height:1.25;white-space:nowrap;text-overflow:ellipsis;font-variant-numeric:tabular-nums;color:var(--dsw-alias-label-primary,#1f2329)}
+.dma-stats-card-sub{overflow:hidden;font-size:11px;line-height:1.45;white-space:nowrap;text-overflow:ellipsis;color:var(--dsw-alias-label-tertiary,#8a919e)}
+.dma-stats-progress{height:5px;margin-top:2px;border-radius:3px;background:var(--dsw-alias-bg-layer-1,#fff);overflow:hidden}
+.dma-stats-progress i{display:block;height:100%;border-radius:3px;background:var(--dsw-alias-state-business-primary,#4c8dff);transition:width 240ms ease}
+.dma-stats-section{display:flex;flex-direction:column;gap:8px;min-width:0}
+.dma-stats-section-head{display:flex;align-items:center;justify-content:space-between;gap:10px}
+.dma-stats-section-title{margin:0;font-size:13px;font-weight:600;color:var(--dsw-alias-label-primary,#1f2329)}
+.dma-stats-note{font-size:11px;line-height:1.5;color:var(--dsw-alias-label-tertiary,#8a919e)}
+.dma-stats-range{display:inline-flex;gap:2px;padding:2px;border-radius:8px;background:var(--dsw-alias-bg-layer-2,#f2f3f5)}
+.dma-stats-range button{border:0;border-radius:6px;padding:4px 10px;background:transparent;color:var(--dsw-alias-label-secondary,#5b6472);font-size:12px;line-height:1.4;cursor:pointer}
+.dma-stats-range button[aria-pressed="true"]{background:var(--dsw-alias-bg-layer-1,#fff);color:var(--dsw-alias-label-primary,#1f2329);font-weight:600;box-shadow:0 1px 2px rgba(0,0,0,.08)}
+.dma-stats-range button:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary,#4c8dff);outline-offset:2px}
+.dma-stats-chart-card{display:flex;flex-direction:column;gap:8px;padding:10px 12px;border:.5px solid var(--dsw-alias-border-l2,rgba(0,0,0,.08));border-radius:9px;background:var(--dsw-alias-bg-layer-2,#f2f3f5)}
+.dma-stats-chart-meta{display:flex;justify-content:space-between;gap:10px;font-size:11px;color:var(--dsw-alias-label-tertiary,#8a919e)}
+.dma-stats-chart{display:flex;align-items:flex-end;gap:2px;height:150px;min-width:0}
+.dma-stats-chart>div{flex:1 1 0;display:flex;align-items:flex-end;justify-content:center;min-width:0;height:100%}
+.dma-stats-col{position:relative;flex:1 1 0;display:flex;align-items:flex-end;justify-content:center;min-width:0;height:100%}
+.dma-stats-billing-bar{position:absolute;left:50%;bottom:0;transform:translateX(-50%);display:flex;width:100%;max-width:26px;height:3px;border-radius:2px;overflow:hidden;background:var(--dsw-alias-bg-layer-1,#fff)}
+.dma-stats-billing-bar i{display:block;height:100%}
+.dma-stats-billing-deepseek{background:#2f6bd8}
+.dma-stats-billing-local{background:#a8aeb8}
+.dma-stats-stack{display:flex;flex-direction:column-reverse;width:100%;max-width:26px;border-radius:3px 3px 0 0;overflow:hidden}
+.dma-stats-seg{display:block;width:100%}
+.dma-stats-seg-input{background:var(--dsw-alias-brand-primary,#4c8dff)}
+.dma-stats-seg-cacheRead{background:var(--dsw-alias-brand-primary,#4c8dff);opacity:.5}
+.dma-stats-seg-cacheWrite{background:var(--dsw-alias-brand-primary,#4c8dff);opacity:.26}
+.dma-stats-seg-output{background:var(--dsw-alias-state-success-primary,#22a06b)}
+.dma-stats-axis{display:grid;grid-template-columns:repeat(4,1fr);gap:2px;font-size:10px;color:var(--dsw-alias-label-tertiary,#8a919e)}
+.dma-stats-axis span{overflow:hidden;white-space:nowrap;text-align:center}
+.dma-stats-legend{display:flex;flex-wrap:wrap;gap:12px;font-size:11px;color:var(--dsw-alias-label-tertiary,#8a919e)}
+.dma-stats-legend span{display:inline-flex;align-items:center;gap:4px}
+.dma-stats-legend-row{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:6px 12px;min-width:0}
+.dma-stats-legend-billing{flex:none;margin-left:auto}
+.dma-stats-swatch{display:inline-block;width:9px;height:9px;border-radius:2px}
+.dma-stats-rows{display:flex;flex-direction:column;border:.5px solid var(--dsw-alias-border-l2,rgba(0,0,0,.08));border-radius:9px;overflow:hidden}
+.dma-stats-row{display:grid;grid-template-columns:minmax(0,1fr) 96px 84px 84px;gap:8px;align-items:center;padding:8px 12px;font-size:12px;border-top:.5px solid var(--dsw-alias-border-l2,rgba(0,0,0,.08))}
+.dma-stats-row:first-child{border-top:0}
+.dma-stats-row-head{font-size:11px;font-weight:600;color:var(--dsw-alias-label-tertiary,#8a919e);background:var(--dsw-alias-bg-layer-2,#f2f3f5)}
+.dma-stats-cell{min-width:0;overflow:hidden}
+.dma-stats-cell-right{text-align:right;font-variant-numeric:tabular-nums}
+.dma-stats-row-title{display:flex;align-items:center;gap:5px;min-width:0}
+.dma-stats-row-title b{overflow:hidden;font-weight:600;white-space:nowrap;text-overflow:ellipsis;color:var(--dsw-alias-label-primary,#1f2329)}
+.dma-stats-pill{flex:none;padding:0 5px;border-radius:7px;background:rgba(76,141,255,.14);color:#2f6bd8;font-size:10px;font-weight:500;line-height:15px}
+.dma-stats-pill-running{background:rgba(34,160,107,.15);color:#137a4e}
+.dma-stats-pill-local{background:rgba(0,0,0,.06);color:#6b7280}
+.dma-stats-meta{overflow:hidden;font-size:10.5px;line-height:1.45;white-space:nowrap;text-overflow:ellipsis;color:var(--dsw-alias-label-tertiary,#8a919e)}
+.dma-stats-mini{display:flex;height:4px;margin-top:4px;border-radius:2px;overflow:hidden;background:var(--dsw-alias-bg-layer-1,#fff)}
+.dma-stats-mini i{display:block;height:100%}
+.dma-stats-mini .dma-stats-seg-cacheRead{opacity:.5}
+.dma-stats-mini .dma-stats-seg-output{background:var(--dsw-alias-state-success-primary,#22a06b)}
+.dma-stats-empty{margin:6px 0;font-size:12px;color:var(--dsw-alias-label-tertiary,#8a919e)}
+.dma-stats-money-edit{padding:0;border:0;background:transparent;font:inherit;font-size:20px;font-weight:600;line-height:1.25;text-align:left;color:inherit;border-radius:4px;cursor:pointer;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;font-variant-numeric:tabular-nums}
+.dma-stats-money-edit:hover{color:var(--dsw-alias-state-business-primary,#4c8dff)}
+.dma-stats-money-edit:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary,#4c8dff);outline-offset:2px}
+.dma-stats-money-edit-row{display:flex;flex-wrap:nowrap;align-items:center;gap:7px;min-width:0;min-height:24px}
+.dma-stats-money-edit-row>*{flex:none;min-width:0}
+.dma-stats-money-card{container-type:inline-size}
+.dma-stats-money-input{display:inline-flex;flex:0 1 92px;align-items:center;gap:3px;box-sizing:border-box;width:92px;min-width:64px;padding:2px 6px;border:.5px solid var(--dsw-alias-border-l3,#c9ced6);border-radius:6px;background:var(--dsw-alias-bg-layer-1,#fff);font-size:13px;color:var(--dsw-alias-label-tertiary,#8a919e);overflow:hidden}
+.dma-stats-money-input input{flex:1 1 auto;width:0;min-width:0;border:0;outline:0;background:transparent;color:var(--dsw-alias-label-primary,#1f2329);font:inherit;font-size:13px;font-variant-numeric:tabular-nums;text-align:right}
+.dma-stats-money-mini{flex:none;height:25px;padding:0 9px;border:0;border-radius:6px;background:var(--dsw-alias-button-primary-fill,#4c8dff);color:#fff;font-size:11.5px;font-weight:500;line-height:1;cursor:pointer;white-space:nowrap}
+.dma-stats-money-mini:hover{filter:brightness(.95)}
+.dma-stats-money-mini:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary,#4c8dff);outline-offset:2px}
+.dma-stats-money-mini:disabled{background:var(--dsw-alias-bg-layer-1,#fff);color:var(--dsw-alias-label-dimmed,#a0a6b0);cursor:default;filter:none}
+.dma-stats-money-cancel{flex:none;height:25px;padding:0 7px;border:.5px solid var(--dsw-alias-border-l3,#c9ced6);border-radius:6px;background:transparent;color:var(--dsw-alias-label-secondary,#5b6472);font-size:11px;cursor:pointer;white-space:nowrap}
+.dma-stats-money-cancel:hover{color:var(--dsw-alias-label-primary,#1f2329);border-color:var(--dsw-alias-border-l2,rgba(0,0,0,.16))}
+.dma-stats-money-cancel:disabled{opacity:.45;cursor:default}
+@container (max-width:181px){.dma-stats-money-edit-row{gap:4px}.dma-stats-money-mini{padding:0 5px}.dma-stats-money-cancel{padding:0 4px}}
+.dma-stats-money-hint{overflow:hidden;font-size:10px;line-height:1.3;white-space:nowrap;text-overflow:ellipsis;color:var(--dsw-alias-label-tertiary,#8a919e)}
+.dma-stats-money-value-row{display:flex;align-items:center;gap:8px;min-width:0;min-height:24px}
+.dma-stats-money-value-row .dma-stats-money-edit{flex:1 1 auto;min-width:0}
+.dma-stats-money-value-row .dma-stats-money-mini{flex:none;white-space:nowrap}
+.dma-stats-error{margin:0;font-size:12px;line-height:1.5;color:var(--dsw-alias-state-error-primary,#e5484d)}
+.dma-setting-btn{flex:none;margin-top:2px;align-self:flex-start}
 @keyframes dma-spin{to{transform:rotate(360deg)}}
 `;
 

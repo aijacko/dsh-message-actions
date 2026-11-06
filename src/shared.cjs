@@ -37,6 +37,9 @@ const ERROR_LABELS = {
     INVALID_AMOUNT: '金额格式不合法',
     READ_ONLY: '状态文件只读，未保存',
     WRITE_FAILED: '写入状态文件失败',
+    ATTACHMENT_NOT_FOUND: '附件不存在或已失效',
+    ATTACHMENT_UNAVAILABLE: '附件服务不可用',
+    ATTACHMENT_READ_FAILED: '附件读取失败',
     INTERNAL: '内部错误'
   },
   en: {
@@ -52,6 +55,9 @@ const ERROR_LABELS = {
     INVALID_AMOUNT: 'Invalid amount',
     READ_ONLY: 'State file is read-only; nothing saved',
     WRITE_FAILED: 'Could not write the state file',
+    ATTACHMENT_NOT_FOUND: 'Attachment not found or no longer available',
+    ATTACHMENT_UNAVAILABLE: 'Attachment service is unavailable',
+    ATTACHMENT_READ_FAILED: 'Could not read the attachment',
     INTERNAL: 'Internal error'
   }
 };
@@ -64,7 +70,8 @@ const ERROR_LABELS = {
  * 折叠 OpenAI 风格 content（字符串或 block 数组）为纯文本。
  * 只取用户可见的 text 块：reasoning（思维链）不属于回答正文，不能混进分享/导出。
  */
-function contentText(content) {
+function contentText(content, options) {
+  const placeholders = !options || options.attachments !== false;
   if (typeof content === 'string') return content;
   if (!Array.isArray(content)) return '';
   const parts = [];
@@ -77,12 +84,54 @@ function contentText(content) {
     if (block.type === 'text' && typeof block.text === 'string') {
       parts.push(block.text);
     } else if (block.type === 'image') {
-      parts.push('[图片]');
+      if (placeholders) parts.push('[图片]');
     } else if (block.type === 'file') {
-      parts.push('[文件]');
+      if (placeholders) parts.push('[文件]');
     }
   }
   return parts.join('');
+}
+
+/**
+ * 撤回回填用的正文：只拼接文本块，不插入 `[图片]` / `[文件]` 占位符。
+ * 附件由客户端另行恢复（见 `attachmentsOfEvent`）；只有附件恢复不可用时，
+ * 占位符才有意义，因此这里不留占位符，避免与真实附件重复。
+ */
+function refillTextOf(event) {
+  if (!event || event.type !== 'user/message') return '';
+  const content = event.data && event.data.content;
+  return contentText(content, { attachments: false });
+}
+
+/**
+ * 提取用户消息里的附件描述（图片与文件），供客户端按 id 取回字节后恢复。
+ * 只读取 durable `attachment` 引用，不展开内容；同一 id 只保留一次。
+ * @returns {{ kind: 'image'|'file', attachmentId: string, name: string, mediaType: string, bytes?: number, width?: number, height?: number }[]}
+ */
+function attachmentsOfEvent(event) {
+  const content = event && event.type === 'user/message' && event.data && event.data.content;
+  if (!Array.isArray(content)) return [];
+  const list = [];
+  const seen = new Set();
+  for (const block of content) {
+    if (!block || block.type !== 'image' && block.type !== 'file') continue;
+    const ref = block.attachment;
+    if (!ref || typeof ref.attachmentId !== 'string' || ref.attachmentId.length === 0) continue;
+    if (seen.has(ref.attachmentId)) continue;
+    seen.add(ref.attachmentId);
+    list.push({
+      kind: block.type,
+      attachmentId: ref.attachmentId,
+      name: typeof ref.name === 'string' && ref.name.length > 0
+        ? ref.name
+        : (block.type === 'image' ? 'image' : 'file'),
+      mediaType: typeof ref.mediaType === 'string' ? ref.mediaType : '',
+      bytes: Number.isSafeInteger(ref.bytes) ? ref.bytes : undefined,
+      width: Number.isSafeInteger(ref.width) ? ref.width : undefined,
+      height: Number.isSafeInteger(ref.height) ? ref.height : undefined
+    });
+  }
+  return list;
 }
 
 /** 取一个事件的纯文本正文（按事件类型分发）。 */
@@ -492,7 +541,11 @@ function planAction(events, nodes, params) {
         })();
     // 撤回回填必须用被点的那条提问文本：轮次区间起点可能是运行时注入消息，
     // 不能取 startSeq 的正文，否则会把注入上下文回填到输入框。
-    if (plan.ok && action === 'recall') plan.refillText = textOf(evt);
+    // 附件单独返回，客户端恢复成真实图片 / 文件；正文不再插入占位符。
+    if (plan.ok && action === 'recall') {
+      plan.refillText = refillTextOf(evt);
+      plan.attachments = attachmentsOfEvent(evt);
+    }
     return plan;
   }
 
@@ -550,7 +603,7 @@ function buildPlan(events, nodes, startSeq, endSeq, targetType, action, turn) {
     via,
     turn,
     step,
-    refillText: action === 'recall' ? textOf(events[startSeq]) : null
+    refillText: action === 'recall' ? refillTextOf(events[startSeq]) : null
   };
 }
 
@@ -617,6 +670,25 @@ function goneTurnsOf(events, nodes, lookup) {
 }
 
 /**
+ * 单条回答的估算成本：只针对该条 `assistant/message` 自己的 usage，
+ * 不复用同一轮其它步骤的数据，避免同轮多步骤重复计价。
+ * 本地 / 非 DeepSeek 路由返回 `{ micros: 0, billable: false }`；
+ * 无 usage 或无法判定路由时返回 undefined（界面不显示金额）。
+ * @returns {{ micros: number, billable: boolean } | undefined}
+ */
+function replyCostOf(event) {
+  if (!event || event.type !== 'assistant/message') return undefined;
+  const usage = stepUsageOf(event);
+  if (!usage) return undefined;
+  const data = event.data || {};
+  const route = routeOfUsage(data.usage) || routeOfMessage(data.message);
+  if (!route) return undefined;
+  if (!isBillableRoute(route.provider, route.model)) return { micros: 0, billable: false };
+  const at = Number.isFinite(event.time) ? event.time : Date.now();
+  return { micros: turnCost(usage, route.model, periodInfo(at).period), billable: true };
+}
+
+/**
  * `/messages` 摘要快照：只返回预览、字数、用量与 callId，不返回正文。
  * 分享图 / 导出需要全文时，走 `full=1&turns=a,b` 的按需接口（见 index.mjs）。
  *
@@ -661,6 +733,7 @@ function messagesSummaryOf(events, nodes, lookup, options) {
       (data.source === undefined || data.source === null || data.source.kind === undefined || data.source.kind === 'user');
     const isText = isUserQuestion || event.type === 'assistant/message';
     const text = isText ? textOf(event) : '';
+    const replyCost = event.type === 'assistant/message' ? replyCostOf(event) : undefined;
     const summary = {
       seq,
       type: event.type,
@@ -672,6 +745,8 @@ function messagesSummaryOf(events, nodes, lookup, options) {
       preview: isText ? previewText(text, previewLimit) : '',
       words: isText ? wordCount(text) : 0,
       usage: usageSummaryOf(event),
+      costMicros: replyCost ? replyCost.micros : null,
+      billable: replyCost ? replyCost.billable : null,
       callId: toolCallIdOf(event)
     };
     const beyondCursor = since === null || seq > since;
@@ -1205,6 +1280,29 @@ function routingOfProvider(provider) {
   return 'local';
 }
 
+/** 模型名是否为 DeepSeek 官方模型（无 provider 时用于兜底判定）。 */
+function isDeepseekModel(model) {
+  return typeof model === 'string' && /^deepseek/i.test(model.trim());
+}
+
+/**
+ * 该次用量是否计入 DeepSeek 费用（统计表「估算成本」/「预算使用」/「日用」）。
+ *
+ * - provider 已知：`deepseek-account` / `deepseek-*` 计费，其余（本地模型、第三方网关）不计费；
+ * - provider 缺失：只有模型名明确是 `deepseek-*` 才计费，未知来源一律不计费（不臆测）。
+ *
+ * 本地 / 未知来源的 token 仍照常统计，只是成本记 0。
+ * @param provider 路由 provider（如 `deepseek-account` / `ninfer-27b`）
+ * @param model 模型名（如 `deepseek-flash`）
+ * @returns {boolean}
+ */
+function isBillableRoute(provider, model) {
+  const routing = routingOfProvider(provider);
+  if (routing === 'local') return false;
+  if (routing === 'account' || routing === 'api-key') return true;
+  return isDeepseekModel(model);
+}
+
 /**
  * 费用卡片样式枚举。数组顺序即设置页选项顺序：单行样式排在第一位。
  * 内部存储值沿用 `compact` / `default`，与旧版本配置兼容。
@@ -1235,10 +1333,58 @@ function costSwitches(config) {
   };
 }
 
-/** 完成提示音开关：默认开启，只有显式 `false` 才关闭。 */
-function completionSoundEnabled(config) {
+/** 可选音色（Web Audio 现场合成，无音频文件）。 */
+const SOUND_TONES = ['double', 'bell', 'soft'];
+const DEFAULT_SOUND_TONE = 'double';
+
+/** 音色归一化：未知值回落到默认双音（'off' 由 completionSoundTone 单独处理）。 */
+function normalizeSoundTone(value) {
+  return typeof value === 'string' && SOUND_TONES.indexOf(value) >= 0 ? value : DEFAULT_SOUND_TONE;
+}
+
+/**
+ * 运行时音色。0.2.2 起不再有独立开关：
+ * - `soundTone === 'off'` 即关闭；
+ * - 旧配置只有 `sound: false`（没有音色）时，映射为「关闭」，保持旧行为；
+ * - 旧配置 `sound: false` + 已有音色，同样显示「关闭」（旧开关优先）。
+ */
+function completionSoundTone(config) {
   const cfg = config || {};
-  return cfg.sound !== false;
+  if (cfg.sound === false) return 'off';
+  if (cfg.soundTone === 'off') return 'off';
+  return normalizeSoundTone(cfg.soundTone);
+}
+
+/** 完成提示音是否开启：等价于音色不为「关闭」。 */
+function completionSoundEnabled(config) {
+  return completionSoundTone(config) !== 'off';
+}
+
+/**
+ * 设置页音色选项：3 个音色 + 「关闭」。
+ * 选中「关闭」即关闭完成提示音；选中任一音色即开启并试听。
+ * 供客户端渲染与离线断言共用。
+ */
+function soundToneOptions() {
+  return SOUND_TONES.concat(['off']);
+}
+
+// 音量：0–100 整数，默认 50（= 现有增益基准），步进 5 由滑杆约束。
+const DEFAULT_SOUND_VOLUME = 50;
+
+/** 音量归一化：非法值回默认 50，其余夹到 0–100 的整数。 */
+function clampSoundVolume(value) {
+  const num = typeof value === 'number' ? value : Number(value);
+  if (!Number.isFinite(num)) return DEFAULT_SOUND_VOLUME;
+  return Math.min(100, Math.max(0, Math.round(num)));
+}
+
+/**
+ * 音量倍数：50 为基准 1.0，0 为 0（静音），100 为 2.0。
+ * 播放端用 `TONE_SPECS[音色].gain * soundGainScale(音量)`，避免 0 音量仍发声。
+ */
+function soundGainScale(volume) {
+  return clampSoundVolume(volume) / 50;
 }
 
 /**
@@ -1377,30 +1523,60 @@ function appendTurnEvent(buffer, event) {
 }
 
 // ---------------------------------------------------------------------------
-// 费用统计：余额观测（账户口径）与金额校正
+// 费用统计：余额观测（账户口径）
 // ---------------------------------------------------------------------------
 
 /** 间隔超过 25 小时视为应用长时间未运行，不补记差额。 */
 const MAX_OBSERVE_GAP_MS = 25 * 60 * 60 * 1000;
 
-/** 校正后余额（允许为负）。 */
-function correctedBalanceCents(account) {
-  const a = account || {};
-  const baseline = Number.isFinite(a.baselineCents) ? a.baselineCents : null;
-  if (baseline === null) return null;
-  return baseline -
-    (Number.isFinite(a.observedSpendCents) ? a.observedSpendCents : 0) +
-    (Number.isFinite(a.creditCents) ? a.creditCents : 0) -
-    (Number.isFinite(a.debitCents) ? a.debitCents : 0);
+/**
+ * 轮次结算累加当日用量（纯函数）。
+ *
+ * 口径：**以结算累加为主**——每轮 `turn/end` 落地时立即把估算金额（分）
+ * 记入当日桶，并与「自上次余额观测以来已结算的金额」一起累计；
+ * 余额观测随后只对差额做校正（见 observeBalance），避免重复计入。
+ *
+ * 幂等：同一 `key`（会话 + 轮次 + 结束时刻）只累加一次，重复推送不会二次计数。
+ * 跨零点：按结算时刻（endedAt）的北京日期入桶。
+ *
+ * @param state 持久化状态（不修改入参）
+ * @param params { micros, at, key }
+ * @returns {{ state, applied, cents }}
+ */
+function settleSpend(state, params) {
+  const s = state || {};
+  const p = params || {};
+  const micros = Number.isFinite(p.micros) ? p.micros : 0;
+  const cents = micros > 0 ? Math.round(micros / 10000) : 0;
+  const out = {
+    dailySpendCents: Object.assign({}, s.dailySpendCents || {}),
+    settledSpendTotalCents: Number.isFinite(s.settledSpendTotalCents) ? s.settledSpendTotalCents : 0,
+    settledSinceObserveCents: Number.isFinite(s.settledSinceObserveCents) ? s.settledSinceObserveCents : 0,
+    lastSettledKey: typeof s.lastSettledKey === 'string' ? s.lastSettledKey : ''
+  };
+  const key = typeof p.key === 'string' ? p.key : '';
+  if (cents === 0) return { state: out, applied: false, cents: 0 };
+  if (key !== '' && key === out.lastSettledKey) return { state: out, applied: false, cents: 0 };
+  const at = Number.isFinite(p.at) ? p.at : Date.now();
+  const day = beijingDateKey(at);
+  out.dailySpendCents[day] = (out.dailySpendCents[day] || 0) + cents;
+  out.settledSpendTotalCents += cents;
+  out.settledSinceObserveCents += cents;
+  if (key !== '') out.lastSettledKey = key;
+  return { state: out, applied: true, cents };
 }
 
 /**
  * 一次余额观测的记账（纯函数，返回新状态与本次记账原因）。
  *
  * - 下降 → 累计「已观测消费」，按北京时间日期计入「日用」；
- * - 上升 → 累计「待核对余额调整」，绝不冲减消费；
+ * - 上升 → 只更新 lastBalance，不冲减消费（不再维护手工校正字段）；
  * - 跨日 / 间隔超 25h / 路由切换 → 只更新 lastBalance，跳过本次差额；
  * - 非 account 路由 → 完全不记账。
+ *
+ * 与轮次结算共用同一份「日用」：本轮已结算的金额先由 settleSpend 记入，
+ * 观测到差额时只把 **超出已结算部分** 补进当日桶（`diff - settledSinceObserveCents`），
+ * 不重复计入；估算高于实际（差额为负）时不做减法，保持「日用」为花费上限提示。
  *
  * @param state 持久化状态（不修改入参）
  * @param params { cents, routing, at }
@@ -1418,8 +1594,9 @@ function observeBalance(state, params) {
     lastRouting: typeof s.lastRouting === 'string' ? s.lastRouting : null,
     observedSpendTotalCents: Number.isFinite(s.observedSpendTotalCents) ? s.observedSpendTotalCents : 0,
     dailySpendCents: Object.assign({}, s.dailySpendCents || {}),
-    pendingAdjustmentCents: Number.isFinite(s.pendingAdjustmentCents) ? s.pendingAdjustmentCents : 0,
-    pendingAdjustmentAt: Number.isFinite(s.pendingAdjustmentAt) ? s.pendingAdjustmentAt : 0
+    settledSpendTotalCents: Number.isFinite(s.settledSpendTotalCents) ? s.settledSpendTotalCents : 0,
+    settledSinceObserveCents: Number.isFinite(s.settledSinceObserveCents) ? s.settledSinceObserveCents : 0,
+    lastSettledKey: typeof s.lastSettledKey === 'string' ? s.lastSettledKey : ''
   };
   if (cents === null) return { state: out, reason: 'invalid' };
   if (routing !== 'account') return { state: out, reason: 'not-account' };
@@ -1429,28 +1606,34 @@ function observeBalance(state, params) {
     out.lastBalanceCents = cents;
     out.lastBalanceAt = at;
     out.lastRouting = routing;
+    out.settledSinceObserveCents = 0;
     return { state: out, reason: 'baseline' };
   }
   if (out.lastBalanceCents === null || out.lastBalanceAt === 0) {
     out.lastBalanceCents = cents;
     out.lastBalanceAt = at;
     out.lastRouting = routing;
+    out.settledSinceObserveCents = 0;
     return { state: out, reason: 'first' };
   }
   if (out.lastRouting !== routing) {
     out.lastBalanceCents = cents;
     out.lastBalanceAt = at;
     out.lastRouting = routing;
+    out.settledSinceObserveCents = 0;
     return { state: out, reason: 'routing-switch' };
   }
   if (beijingDateKey(out.lastBalanceAt) !== beijingDateKey(at)) {
     out.lastBalanceCents = cents;
     out.lastBalanceAt = at;
+    // 跨日不补记差额；同时清空待核对结算，避免把昨天的金额算进今天的差值。
+    out.settledSinceObserveCents = 0;
     return { state: out, reason: 'cross-day' };
   }
   if (at - out.lastBalanceAt > MAX_OBSERVE_GAP_MS) {
     out.lastBalanceCents = cents;
     out.lastBalanceAt = at;
+    out.settledSinceObserveCents = 0;
     return { state: out, reason: 'too-long' };
   }
 
@@ -1458,12 +1641,16 @@ function observeBalance(state, params) {
   let reason = 'none';
   if (diff > 0) {
     out.observedSpendTotalCents += diff;
-    const key = beijingDateKey(at);
-    out.dailySpendCents[key] = (out.dailySpendCents[key] || 0) + diff;
+    // 已结算部分已计入「日用」，这里只补超出部分，避免同一轮被计两次。
+    const extra = diff - out.settledSinceObserveCents;
+    if (extra > 0) {
+      const key = beijingDateKey(at);
+      out.dailySpendCents[key] = (out.dailySpendCents[key] || 0) + extra;
+    }
+    out.settledSinceObserveCents = 0;
     reason = 'spend';
   } else if (diff < 0) {
-    out.pendingAdjustmentCents += -diff;
-    out.pendingAdjustmentAt = at;
+    // 余额上升（充值 / 退货）：只更新基准，不冲减消费，也不做手工校正。
     reason = 'adjust';
   }
   out.lastBalanceCents = cents;
@@ -1472,10 +1659,15 @@ function observeBalance(state, params) {
 }
 
 /** 元（数字或字符串）转分；非法返回 null。 */
-function yuanToCents(value) {
+function yuanToCents(value, mode) {
+  const truncate = mode === 'truncate';
   if (typeof value === 'number') {
     if (!Number.isFinite(value)) return null;
-    return Math.round(value * 100);
+    // 数字先转十进制字符串再按分解析：避免 `5.99 * 100 = 598.999…` 的浮点误差把分差成 1。
+    const asText = String(value);
+    if (/^-?\d+(\.\d+)?$/.test(asText.trim())) return yuanToCents(asText, mode);
+    // 科学计数法等无法逐位解析的极端值，退回浮点换算。
+    return truncate && value >= 0 ? Math.floor(value * 100 + 1e-6) : Math.round(value * 100);
   }
   if (typeof value !== 'string') return null;
   const raw = value.trim().replace(/,/g, '');
@@ -1486,7 +1678,9 @@ function yuanToCents(value) {
   const whole = split[0];
   const frac = split[1] || '';
   let cents = Number(whole) * 100 + Number((frac + '00').slice(0, 2));
-  if (frac.length > 2 && Number(frac.charAt(2)) >= 5) cents += 1;
+  // 官方「账号与余额」对正金额截断至分：原始余额字符串可能带三位以上小数，
+  // 这里必须同样截断，否则 5.999… 会进位成 6.00，比官方页面多一分。
+  if (frac.length > 2 && !(truncate && !negative) && Number(frac.charAt(2)) >= 5) cents += 1;
   return negative ? -cents : cents;
 }
 
@@ -1560,6 +1754,17 @@ function formatCostMicros(micros) {
   return formatYuanCents(Math.round(micros / 10000));
 }
 
+/**
+ * 微元 -> 单条回答金额展示（保留 4 位小数，避免每轮几厘钱被舍成 0）：
+ * 0 → `¥0.0000`；0 < x < ¥0.0001 → `<¥0.0001`；其余四舍五入到 4 位。
+ */
+function formatReplyCost(micros) {
+  if (!Number.isFinite(micros)) return '';
+  if (micros <= 0) return '¥0.0000';
+  if (micros < 100) return '<¥0.0001';
+  return '¥' + (micros / 1000000).toFixed(4);
+}
+
 /** 自动关闭时刻：秒数 0 / 非法返回 null（不自动关闭）；上限 600 秒。 */
 function autoCloseAt(firstSeenAt, seconds) {
   const s = typeof seconds === 'string' ? Number(seconds) : seconds;
@@ -1571,6 +1776,329 @@ function autoCloseAt(firstSeenAt, seconds) {
 function easeOutCubic(t) {
   const x = t <= 0 ? 0 : t >= 1 ? 1 : t;
   return 1 - Math.pow(1 - x, 3);
+}
+
+// ---------------------------------------------------------------------------
+// 会话统计：从真实会话日志折叠 token / 成本 / 时间线（宿主与测试共用）
+// ---------------------------------------------------------------------------
+
+/** 时间线桶数：小时视图 48 个（客户端展示最近 24 个），日视图 30 个。 */
+const STATS_HOURLY_BUCKETS = 48;
+const STATS_DAILY_BUCKETS = 30;
+
+/** 四类 token 的空桶。 */
+function emptyStatsTokens() {
+  return { input: 0, cacheRead: 0, cacheWrite: 0, output: 0 };
+}
+
+/** 四类 token 合计。 */
+function statsTokenTotal(tokens) {
+  const t = tokens || {};
+  return tokenCount(t.input) + tokenCount(t.cacheRead) + tokenCount(t.cacheWrite) + tokenCount(t.output);
+}
+
+/**
+ * 原始 usage → 四类 token 桶。缺 input/output 计数时返回 null（该条不计入）。
+ * 与费用统计共用 `normalizeCostUsage`，保证同一份日志得到同一组数字。
+ */
+function statsUsageBuckets(usage) {
+  const normalized = normalizeCostUsage(usage);
+  if (!normalized) return null;
+  return {
+    input: normalized.inputTokens,
+    cacheRead: normalized.cacheReadTokens,
+    cacheWrite: normalized.cacheWriteTokens,
+    output: normalized.outputTokens
+  };
+}
+
+/**
+ * 单个时间点的估算成本（微元）：按该点时刻的峰 / 谷价与当时模型价目计算，
+ * 与费用卡片的「单次」共用 `turnCost`，因此两处口径一致。
+ */
+function statsPointCostMicros(point) {
+  if (!point) return 0;
+  // 本地 / 未知来源的 token 照常统计，但成本记 0（不套用 DeepSeek 价目）。
+  if (point.billable === false) return 0;
+  const at = Number.isFinite(point.t) ? point.t : Date.now();
+  const period = periodInfo(at).period;
+  const usage = {
+    inputTokens: tokenCount(point.input),
+    cacheReadTokens: tokenCount(point.cacheRead),
+    cacheWriteTokens: tokenCount(point.cacheWrite),
+    outputTokens: tokenCount(point.output),
+    reasoningTokens: 0
+  };
+  return turnCost(usage, point.model, period);
+}
+
+/** 取目录的最后一段，作为无标题会话的兜底名称。 */
+function baseNameOfPath(value) {
+  if (typeof value !== 'string' || value.length === 0) return '';
+  const parts = value.split(/[\\/]/).filter(Boolean);
+  return parts.length === 0 ? '' : parts[parts.length - 1];
+}
+
+/**
+ * 折叠一条会话日志：四类 token 汇总、时间线点（含计价时刻的模型）、
+ * 标题 / 首个问题 / 模型与最后活跃时间。与宿主的 `tokenUsage` 投影口径一致：
+ * 每个 assistant/message 的 usage 只取一次。
+ * @param events 会话事件数组（读取日志得到的原始事件）
+ */
+function foldSessionStats(events) {
+  const list = Array.isArray(events) ? events : [];
+  const tokens = emptyStatsTokens();
+  const points = [];
+  let title = '';
+  let firstPrompt = '';
+  let model = '';
+  let provider = '';
+  let currentModel = '';
+  let lastActiveAt = 0;
+  let turns = 0;
+  let steps = 0;
+  let messages = 0;
+
+  for (const event of list) {
+    if (!event || typeof event.type !== 'string') continue;
+    const time = Number.isFinite(event.time) ? event.time : 0;
+    if (time > lastActiveAt) lastActiveAt = time;
+    const data = event.data || {};
+
+    if (event.type === 'assistant/message') {
+      messages += 1;
+      if (Number.isSafeInteger(data.turn) && data.turn > turns) turns = data.turn;
+      const route = routeOfMessage(data.message) || routeOfUsage(data.usage);
+      if (route) {
+        provider = route.provider;
+        if (route.model) currentModel = route.model;
+      }
+      const buckets = statsUsageBuckets(data.usage);
+      if (buckets) {
+        const pointModel = currentModel || model;
+        const point = {
+          t: time,
+          input: buckets.input,
+          cacheRead: buckets.cacheRead,
+          cacheWrite: buckets.cacheWrite,
+          output: buckets.output,
+          model: pointModel,
+          // 只对 DeepSeek 官方路由计价；本地模型仍统计 token，但成本为 0。
+          billable: isBillableRoute(provider, pointModel)
+        };
+        tokens.input += point.input;
+        tokens.cacheRead += point.cacheRead;
+        tokens.cacheWrite += point.cacheWrite;
+        tokens.output += point.output;
+        points.push(point);
+      }
+      continue;
+    }
+
+    if (event.type === 'step/end') {
+      steps += 1;
+      continue;
+    }
+
+    if (event.type === 'session/title') {
+      if (typeof data.title === 'string' && data.title.trim()) title = data.title.trim();
+      continue;
+    }
+
+    if (event.type === 'request/header') {
+      const config = data.header && data.header.config;
+      if (config && typeof config === 'object') {
+        if (typeof config.model === 'string' && config.model) {
+          model = config.model;
+          currentModel = config.model;
+        }
+        if (typeof config.provider === 'string' && config.provider) provider = config.provider;
+      }
+      continue;
+    }
+
+    if (event.type === 'user/message' && !firstPrompt) {
+      // 会话日志两种历史形状都兼容：data.message.content 或 data.content。
+      const message = data.message && typeof data.message === 'object' ? data.message : data;
+      const text = contentText(message.content).replace(/\s+/g, ' ').trim();
+      if (text) firstPrompt = text.length > 80 ? text.slice(0, 80) + '…' : text;
+    }
+  }
+
+  return { tokens, points, title, firstPrompt, model, provider, lastActiveAt, turns, steps, messages };
+}
+
+/** 本地时间的小时起点。 */
+function statsFloorHour(ts) {
+  const date = new Date(ts);
+  date.setMinutes(0, 0, 0);
+  return date.getTime();
+}
+
+/** 本地时间的日起点。 */
+function statsFloorDay(ts) {
+  const date = new Date(ts);
+  date.setHours(0, 0, 0, 0);
+  return date.getTime();
+}
+
+/** 以 `now` 为终点、向过去生成连续桶起点（旧 → 新）。 */
+function statsBucketStarts(now, count, unit) {
+  const total = Number.isSafeInteger(count) && count > 0 ? count : 1;
+  const starts = [];
+  const cursor = new Date(unit === 'hour' ? statsFloorHour(now) : statsFloorDay(now));
+  for (let index = 0; index < total; index += 1) {
+    starts.push(cursor.getTime());
+    if (unit === 'hour') cursor.setHours(cursor.getHours() - 1);
+    else cursor.setDate(cursor.getDate() - 1);
+  }
+  return starts.reverse();
+}
+
+/** 把时间点聚合成桶（含 token 合计与成本合计，微元）。 */
+function statsAggregate(points, starts, unit) {
+  const list = starts || [];
+  const buckets = list.map((t) => ({
+    t,
+    ...emptyStatsTokens(),
+    tokens: 0,
+    billableTokens: 0,
+    localTokens: 0,
+    costMicros: 0
+  }));
+  const positionOf = new Map();
+  buckets.forEach((bucket, index) => positionOf.set(bucket.t, index));
+  for (const point of points || []) {
+    if (!point || !Number.isFinite(point.t)) continue;
+    const start = unit === 'hour' ? statsFloorHour(point.t) : statsFloorDay(point.t);
+    const position = positionOf.get(start);
+    if (position === undefined) continue;
+    const bucket = buckets[position];
+    bucket.input += tokenCount(point.input);
+    bucket.cacheRead += tokenCount(point.cacheRead);
+    bucket.cacheWrite += tokenCount(point.cacheWrite);
+    bucket.output += tokenCount(point.output);
+    const pointTokens = tokenCount(point.input) + tokenCount(point.cacheRead) +
+      tokenCount(point.cacheWrite) + tokenCount(point.output);
+    bucket.tokens += pointTokens;
+    if (point.billable === false) bucket.localTokens += pointTokens;
+    else bucket.billableTokens += pointTokens;
+    bucket.costMicros += statsPointCostMicros(point);
+  }
+  return buckets;
+}
+
+/** 小时 / 日两条时间线（宿主一次性算好，客户端只切换显示）。 */
+function statsTimeline(points, now) {
+  const at = Number.isFinite(now) ? now : Date.now();
+  return {
+    hourly: statsAggregate(points, statsBucketStarts(at, STATS_HOURLY_BUCKETS, 'hour'), 'hour'),
+    daily: statsAggregate(points, statsBucketStarts(at, STATS_DAILY_BUCKETS, 'day'), 'day')
+  };
+}
+
+/** 会话行（供表格与汇总；纯函数便于离线断言）。 */
+function statsSessionRow(header, fold, options) {
+  const h = header && typeof header === 'object' ? header : {};
+  const f = fold && typeof fold === 'object' ? fold : {};
+  const opt = options || {};
+  const source = f.tokens && typeof f.tokens === 'object' ? f.tokens : emptyStatsTokens();
+  const tokens = {
+    input: tokenCount(source.input),
+    cacheRead: tokenCount(source.cacheRead),
+    cacheWrite: tokenCount(source.cacheWrite),
+    output: tokenCount(source.output)
+  };
+  const total = statsTokenTotal(tokens);
+  let costMicros = 0;
+  let billableTokens = 0;
+  let localTokens = 0;
+  for (const point of Array.isArray(f.points) ? f.points : []) {
+    if (!point) continue;
+    const pointTokens = tokenCount(point.input) + tokenCount(point.cacheRead) +
+      tokenCount(point.cacheWrite) + tokenCount(point.output);
+    if (point.billable === false) localTokens += pointTokens;
+    else billableTokens += pointTokens;
+    costMicros += statsPointCostMicros(point);
+  }
+  const id = typeof h.id === 'string' ? h.id : '';
+  return {
+    id,
+    title: f.title || f.firstPrompt || baseNameOfPath(h.cwd) || id,
+    cwd: typeof h.cwd === 'string' ? h.cwd : '',
+    createdAt: Number.isFinite(h.createdAt) ? h.createdAt : 0,
+    lastActiveAt: Number.isFinite(f.lastActiveAt) ? f.lastActiveAt : 0,
+    model: f.model || '',
+    provider: f.provider || '',
+    turns: Number.isSafeInteger(f.turns) ? f.turns : 0,
+    steps: Number.isSafeInteger(f.steps) ? f.steps : 0,
+    messages: Number.isSafeInteger(f.messages) ? f.messages : 0,
+    tokens: { ...tokens, total },
+    billableTokens,
+    localTokens,
+    /** 该会话是否有任何 DeepSeek 计费用量（用于会话表「本地 · 不计费」展示）。 */
+    billable: billableTokens > 0,
+    costMicros,
+    running: opt.running === true,
+    live: opt.live === true,
+    subagent: h.origin === 'subagent'
+  };
+}
+
+/** 汇总多行：四类 token、成本、会话数、运行中数量与轮 / step / 消息数。 */
+function statsSummary(rows) {
+  const list = Array.isArray(rows) ? rows : [];
+  const tokens = emptyStatsTokens();
+  let costMicros = 0;
+  let billableTokens = 0;
+  let localTokens = 0;
+  let running = 0;
+  let turns = 0;
+  let steps = 0;
+  let messages = 0;
+  for (const row of list) {
+    if (!row) continue;
+    const source = row.tokens || {};
+    tokens.input += tokenCount(source.input);
+    tokens.cacheRead += tokenCount(source.cacheRead);
+    tokens.cacheWrite += tokenCount(source.cacheWrite);
+    tokens.output += tokenCount(source.output);
+    costMicros += Number.isFinite(row.costMicros) ? Math.max(0, Math.round(row.costMicros)) : 0;
+    billableTokens += Number.isFinite(row.billableTokens) ? Math.max(0, row.billableTokens) : 0;
+    localTokens += Number.isFinite(row.localTokens) ? Math.max(0, row.localTokens) : 0;
+    turns += Number.isSafeInteger(row.turns) ? row.turns : 0;
+    steps += Number.isSafeInteger(row.steps) ? row.steps : 0;
+    messages += Number.isSafeInteger(row.messages) ? row.messages : 0;
+    if (row.running === true) running += 1;
+  }
+  return {
+    tokens: { ...tokens, total: statsTokenTotal(tokens) },
+    billableTokens,
+    localTokens,
+    costMicros,
+    sessions: list.length,
+    running,
+    turns,
+    steps,
+    messages
+  };
+}
+
+/**
+ * 预算视图：金额为分（人民币，与费用卡片币种一致）。
+ * budgetCents 为 0 视为未设预算（enabled=false，比例不显示）。
+ */
+function statsBudget(spentMicros, budgetCents) {
+  const amountCents = Number.isFinite(budgetCents) && budgetCents > 0 ? Math.round(budgetCents) : 0;
+  const spentCents = Number.isFinite(spentMicros) ? Math.max(0, Math.round(spentMicros / 10000)) : 0;
+  const enabled = amountCents > 0;
+  return {
+    amountCents,
+    spentCents,
+    remainingCents: enabled ? Math.max(0, amountCents - spentCents) : 0,
+    ratio: enabled ? spentCents / amountCents : 0,
+    enabled
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -1683,6 +2211,8 @@ const CSS = `
 [data-dma-rail="1"]{display:none!important}
 .dma-overlay{position:fixed;inset:0;z-index:2147483000;background:var(--dsw-alias-bg-mask-1,rgba(0,0,0,.45));display:flex;align-items:center;justify-content:center}
 .dma-panel{width:min(680px,calc(100vw - 48px));max-height:80vh;display:flex;flex-direction:column;background:var(--dsw-alias-bg-layer-1,#ffffff);border:.5px solid var(--dsw-alias-border-l2,rgba(0,0,0,.1));border-radius:var(--dsw-radius-panel,12px);box-shadow:var(--dsw-elevation-panel,0 18px 48px rgba(0,0,0,.18));overflow:hidden;color:var(--dsw-alias-label-primary,#1f2329)}
+.dma-confirm{width:min(420px,calc(100vw - 48px))}
+@media (max-width:480px){.dma-confirm{width:calc(100vw - 32px)}.dma-panel-foot{gap:8px}.dma-panel-foot .dma-btn{padding:0 12px}}
 .dma-panel-head{padding:16px 20px;border-bottom:.5px solid var(--dsw-alias-border-l2,rgba(0,0,0,.1));font-size:16px;font-weight:600}
 .dma-panel-body{overflow:auto;padding:12px 16px}
 .dma-round{display:flex;gap:12px;align-items:flex-start;padding:10px 8px;border-bottom:.5px solid var(--dsw-alias-border-l2,rgba(0,0,0,.08));border-radius:8px}
@@ -1716,6 +2246,8 @@ module.exports = {
   TOMBSTONE_TEXT,
   ERROR_LABELS,
   contentText,
+  refillTextOf,
+  attachmentsOfEvent,
   textOf,
   messageRoleOf,
   messageIdOf,
@@ -1784,8 +2316,18 @@ module.exports = {
   routeOfMessage,
   routeOfUsage,
   routingOfProvider,
+  isDeepseekModel,
+  isBillableRoute,
   costSwitches,
   completionSoundEnabled,
+  SOUND_TONES,
+  DEFAULT_SOUND_TONE,
+  normalizeSoundTone,
+  completionSoundTone,
+  soundToneOptions,
+  DEFAULT_SOUND_VOLUME,
+  clampSoundVolume,
+  soundGainScale,
   shouldPlayCompletionSound,
   COST_LAYOUTS,
   DEFAULT_COST_LAYOUT,
@@ -1795,16 +2337,32 @@ module.exports = {
   deriveTurnUsage,
   createTurnBuffer,
   appendTurnEvent,
-  correctedBalanceCents,
   observeBalance,
+  settleSpend,
   yuanToCents,
   validateCorrectionAmount,
   pruneDailySpend,
   formatCents,
   formatYuanCents,
   formatCostMicros,
+  formatReplyCost,
   autoCloseAt,
   easeOutCubic,
+  STATS_HOURLY_BUCKETS,
+  STATS_DAILY_BUCKETS,
+  emptyStatsTokens,
+  statsTokenTotal,
+  statsUsageBuckets,
+  statsPointCostMicros,
+  foldSessionStats,
+  statsFloorHour,
+  statsFloorDay,
+  statsBucketStarts,
+  statsAggregate,
+  statsTimeline,
+  statsSessionRow,
+  statsSummary,
+  statsBudget,
   ICONS,
   CSS
 };

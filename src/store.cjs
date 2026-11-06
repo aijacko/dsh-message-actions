@@ -16,6 +16,8 @@ const os = require("node:os");
 const path = require("node:path");
 
 const STATE_VERSION = 1;
+/** 默认预算 ¥5：首次运行、旧状态文件缺字段时都落到这里。 */
+const DEFAULT_BUDGET_CENTS = 500;
 const FILE_NAME = "cost-state.json";
 const DIR_NAME = "dsh-message-actions";
 /** 状态文件读取上限：正常只有几 KB，超限视为异常文件，不再解析。 */
@@ -55,10 +57,11 @@ function defaultState() {
     lastRouting: null,
     observedSpendTotalCents: 0,
     dailySpendCents: {},
-    pendingAdjustmentCents: 0,
-    pendingAdjustmentAt: 0,
-    correctionCreditCents: 0,
-    correctionDebitCents: 0,
+    settledSpendTotalCents: 0,
+    settledSinceObserveCents: 0,
+    lastSettledKey: "",
+    /** 会话统计的预算（分，人民币）；0 表示未启用预算比例。 */
+    budgetCents: DEFAULT_BUDGET_CENTS,
     updatedAt: 0
   };
 }
@@ -99,10 +102,11 @@ function normalizeCostState(raw) {
     lastRouting: typeof raw.lastRouting === "string" ? raw.lastRouting : null,
     observedSpendTotalCents: intOr(raw.observedSpendTotalCents, 0),
     dailySpendCents: daily,
-    pendingAdjustmentCents: intOr(raw.pendingAdjustmentCents, 0),
-    pendingAdjustmentAt: intOr(raw.pendingAdjustmentAt, 0),
-    correctionCreditCents: intOr(raw.correctionCreditCents, 0),
-    correctionDebitCents: intOr(raw.correctionDebitCents, 0),
+    settledSpendTotalCents: intOr(raw.settledSpendTotalCents, 0),
+    settledSinceObserveCents: Math.max(0, intOr(raw.settledSinceObserveCents, 0)),
+    lastSettledKey: typeof raw.lastSettledKey === "string" ? raw.lastSettledKey : "",
+    // 旧状态文件没有该字段：按默认预算补齐，不视为损坏。
+    budgetCents: Math.max(0, intOr(raw.budgetCents, DEFAULT_BUDGET_CENTS)),
     updatedAt: intOr(raw.updatedAt, 0)
   };
   return { state, readOnly };
@@ -249,6 +253,7 @@ function persistCostState(filePath, state, readOnly, logger) {
 
 module.exports = {
   STATE_VERSION,
+  DEFAULT_BUDGET_CENTS,
   MAX_STATE_BYTES,
   expandHome,
   resolveDshHome,

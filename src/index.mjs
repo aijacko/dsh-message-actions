@@ -32,22 +32,29 @@ const {
   routeOfMessage,
   routeOfUsage,
   routingOfProvider,
+  isBillableRoute,
   costSwitches,
   turnCostOfGroups,
   deriveTurnUsage,
   createTurnBuffer,
   appendTurnEvent,
   observeBalance,
-  correctedBalanceCents,
   validateCorrectionAmount,
   pruneDailySpend,
-  yuanToCents
+  yuanToCents,
+  foldSessionStats,
+  statsTimeline,
+  statsSessionRow,
+  statsSummary,
+  statsBudget,
+  settleSpend
 } = shared;
 
 const {
   resolveStatePath,
   loadCostState,
-  persistCostState
+  persistCostState,
+  DEFAULT_BUDGET_CENTS
 } = store;
 
 // ---------------------------------------------------------------------------
@@ -70,7 +77,13 @@ const Config = z.object({
   deleteFrom: z.boolean().default(true).volatile(),
   confirm: z.boolean().default(true).volatile(),
   stats: z.boolean().default(true).volatile(),
+  // 0.2.2 起「完成提示音」不再有独立开关：由 soundTone 的「off」表示关闭。
+  // 保留 sound 字段只为兼容旧配置（老配置 sound=false 视为关闭）。
   sound: z.boolean().default(true).volatile(),
+  // 完成提示音音色：double | bell | soft | off。
+  soundTone: z.string().default("double").volatile(),
+  // 提示音音量 0–100（50 = 基准增益，0 = 静音），作用于全部音色。
+  soundVolume: z.number().min(0).max(100).default(50).volatile(),
 
   // —— 费用统计（新增）——
   usageStats: z.boolean().default(true).volatile(),
@@ -128,6 +141,126 @@ function newTombstoneId() {
 
 // ---------------------------------------------------------------------------
 // 路由处理器
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// 附件回读（撤回后恢复图片 / 文件）
+// ---------------------------------------------------------------------------
+
+const ATTACHMENT_ROUTE = "/dsh-message-actions/attachment";
+
+/** 在会话事件里按 attachmentId 找回原始附件引用（只查用户消息）。 */
+function attachmentRefFromEvents(events, attachmentId) {
+  for (const event of events) {
+    if (!event || event.type !== "user/message") continue;
+    const content = event.data && event.data.content;
+    if (!Array.isArray(content)) continue;
+    for (const block of content) {
+      if (!block || (block.type !== "image" && block.type !== "file")) continue;
+      const ref = block.attachment;
+      if (ref && ref.attachmentId === attachmentId) return { kind: block.type, ref: ref };
+    }
+  }
+  return null;
+}
+
+/**
+ * `/dsh-message-actions/attachment`：按 id 回读附件原字节。
+ * 图片走 `attachments.readImage`（宿主归一化后的字节），文件走
+ * `readFileStream`（原样字节）；响应直接流式返回，不经过 JSON 编码。
+ */
+function makeAttachmentHandler(ctx) {
+  return async function handleAttachment(req, res) {
+    if (req.method !== "GET") {
+      drainRequest(req);
+      sendMethodNotAllowed(res, "GET");
+      return;
+    }
+    if (!isTrusted(req, ctx.webServer)) {
+      drainRequest(req);
+      sendForbidden(res);
+      return;
+    }
+    let query;
+    try {
+      query = new URL(req.url, "http://localhost").searchParams;
+    } catch {
+      sendBadRequest(res);
+      return;
+    }
+    const sessionId = query.get("sessionId") || "";
+    const attachmentId = query.get("attachmentId") || "";
+    if (!sessionId || !attachmentId) {
+      sendBadRequest(res);
+      return;
+    }
+
+    const agent = ctx.agents.get(sessionId);
+    const session = agent && agent.session;
+    if (!session || typeof session.snapshotEvents !== "function") {
+      sendError(res, 409, "SESSION_NOT_LIVE");
+      return;
+    }
+    const found = attachmentRefFromEvents(session.snapshotEvents(), attachmentId);
+    if (!found) {
+      sendError(res, 404, "ATTACHMENT_NOT_FOUND");
+      return;
+    }
+    const store = ctx.get("attachments");
+    if (!store) {
+      sendError(res, 503, "ATTACHMENT_UNAVAILABLE");
+      return;
+    }
+
+    const name = (found.ref && found.ref.name) || (found.kind === "image" ? "image" : "file");
+    const headers = {
+      "content-type": (found.ref && found.ref.mediaType) || (found.kind === "image" ? "image/png" : "application/octet-stream"),
+      "cache-control": "no-store",
+      "x-content-type-options": "nosniff",
+      "cross-origin-resource-policy": "same-origin",
+      "content-disposition": "attachment; filename*=UTF-8''" + encodeURIComponent(name)
+    };
+    if (Number.isSafeInteger(found.ref.bytes)) headers["content-length"] = found.ref.bytes;
+
+    try {
+      if (found.kind === "image") {
+        if (typeof store.readImage !== "function") {
+          sendError(res, 503, "ATTACHMENT_UNAVAILABLE");
+          return;
+        }
+        const image = await store.readImage(found.ref);
+        // 图片可能被宿主重新编码，长度与原始 ref.bytes 不同，必须用实际字节数。
+        const bytes = Buffer.from(image.data);
+        headers["content-length"] = bytes.length;
+        res.writeHead(200, headers);
+        res.end(bytes);
+        return;
+      }
+      if (typeof store.readFileStream !== "function") {
+        sendError(res, 503, "ATTACHMENT_UNAVAILABLE");
+        return;
+      }
+      res.writeHead(200, headers);
+      for await (const chunk of store.readFileStream(found.ref)) {
+        res.write(chunk);
+      }
+      res.end();
+    } catch {
+      if (res.headersSent) {
+        try {
+          res.destroy();
+        } catch {
+          /* ignore */
+        }
+        return;
+      }
+      sendError(res, 500, "ATTACHMENT_READ_FAILED");
+    }
+  };
+}
+
+// ---------------------------------------------------------------------------
+// 删除动作
 // ---------------------------------------------------------------------------
 
 function makeActionHandler(ctx) {
@@ -248,7 +381,8 @@ function makeActionHandler(ctx) {
         removed: plan.removed,
         turn: plan.turn,
         step: plan.step,
-        refillText: plan.refillText
+        refillText: plan.refillText,
+        attachments: plan.attachments || []
       }
     });
   };
@@ -380,14 +514,16 @@ function eventTime(event) {
   return Date.now();
 }
 
-/** 钱包列表按 CNY 求和（其他币种忽略，不换算）。 */
+/** 钱包列表按 CNY 求和（其他币种忽略，不换算）。
+ *  正金额按官方「账号与余额」的规则截断至分：API 原始字符串可能带三位以上小数，
+ *  四舍五入会把 5.999… 显示成 6.00，与官方页面的 5.99 差一分。 */
 function sumCnyWallets(wallets) {
   if (!Array.isArray(wallets)) return 0;
   let cents = 0;
   for (const wallet of wallets) {
     if (!wallet || typeof wallet !== "object") continue;
     if (wallet.currency !== "CNY") continue;
-    const value = yuanToCents(wallet.balance);
+    const value = yuanToCents(wallet.balance, "truncate");
     if (value !== null) cents += value;
   }
   return cents;
@@ -603,28 +739,22 @@ function createCostService(ctx, config) {
   }
 
   /**
-   * 余额校正：先改内存再落盘；落盘失败时把 4 个字段回滚，
-   * 返回失败结果，避免内存状态与磁盘状态不一致。
+   * 保存预算（分）。落盘失败时回滚内存值：
+   * 不把未落盘的设置伪装成成功。
    */
-  function applyCorrection(creditCents, debitCents) {
-    const previous = {
-      credit: state.correctionCreditCents,
-      debit: state.correctionDebitCents,
-      pending: state.pendingAdjustmentCents,
-      pendingAt: state.pendingAdjustmentAt
-    };
-    state.correctionCreditCents = creditCents;
-    state.correctionDebitCents = debitCents;
-    state.pendingAdjustmentCents = 0;
-    state.pendingAdjustmentAt = 0;
+  function applyBudget(cents) {
+    const previous = state.budgetCents;
+    state.budgetCents = Math.max(0, Math.round(Number.isFinite(cents) ? cents : 0));
     const saved = persist();
-    if (!saved.ok) {
-      state.correctionCreditCents = previous.credit;
-      state.correctionDebitCents = previous.debit;
-      state.pendingAdjustmentCents = previous.pending;
-      state.pendingAdjustmentAt = previous.pendingAt;
-    }
+    if (!saved.ok) state.budgetCents = previous;
     return saved;
+  }
+
+  /** 当前预算（分）；旧状态文件缺字段时回落到默认 ¥5。 */
+  function budgetCents() {
+    return Number.isFinite(state.budgetCents) && state.budgetCents >= 0
+      ? Math.round(state.budgetCents)
+      : DEFAULT_BUDGET_CENTS;
   }
 
   async function stateValue() {
@@ -649,19 +779,7 @@ function createCostService(ctx, config) {
         refreshing: inFlight !== null
       },
       dailyCents: state.dailySpendCents[beijingDateKey(now)] || 0,
-      pendingAdjustmentCents: state.pendingAdjustmentCents,
-      account: {
-        baselineCents: state.baselineBalanceCents,
-        observedSpendCents: state.observedSpendTotalCents,
-        creditCents: state.correctionCreditCents,
-        debitCents: state.correctionDebitCents,
-        correctedBalanceCents: correctedBalanceCents({
-          baselineCents: state.baselineBalanceCents,
-          observedSpendCents: state.observedSpendTotalCents,
-          creditCents: state.correctionCreditCents,
-          debitCents: state.correctionDebitCents
-        })
-      },
+      observedSpendCents: state.observedSpendTotalCents,
       period: period.period,
       nextChangeAt: period.nextChangeAt,
       lastTurn: switches().perTurn ? lastTurn : null
@@ -692,9 +810,9 @@ function createCostService(ctx, config) {
     }
 
     if (!switches().perTurn) {
-      // 运行中关闭「单次」后不再保留旧的 lastTurn，避免重新开启时闪回过期金额。
+      // 运行中关闭「单次」后不再保留旧的 lastTurn，避免重新开启时闪回过期金额；
+      // 但当日用量仍按结算累加（统计表与费用卡片共用这一份数字）。
       lastTurn = null;
-      return;
     }
     if (type === "turn/start") {
       // 防御性上限：会话中途异常结束（没有 turn/end）时不让缓冲无限增长。
@@ -720,14 +838,32 @@ function createCostService(ctx, config) {
     if (!usage) return;
     const at = Number.isFinite(usage.at) ? usage.at : buffer.at;
     const period = periodInfo(at).period;
+    const endedAt = Number.isFinite(usage.endedAt) ? usage.endedAt : eventTime(event);
+    // 只对 DeepSeek 官方路由结算金额；本地模型的 token 仍然计数，但不进「日用」。
+    const billableGroups = usage.groups.filter((group) => group && isBillableRoute(group.provider, group.model));
+    const costMicros = turnCostOfGroups(billableGroups, period, PRICE_TABLE);
+    const turn = Number.isSafeInteger(usage.turn) ? usage.turn : buffer.turn;
+
+    // 结算即累加：当日用量与「单次」同一时刻更新，余额观测随后只补差额。
+    const settled = settleSpend(state, {
+      micros: costMicros,
+      at: endedAt,
+      key: `${sessionId}:${turn == null ? "" : turn}:${endedAt}`
+    });
+    if (settled.applied) {
+      Object.assign(state, settled.state);
+      persist();
+    }
+
+    if (!switches().perTurn) return;
     lastTurn = {
       at,
-      endedAt: Number.isFinite(usage.endedAt) ? usage.endedAt : eventTime(event),
+      endedAt,
       provider: usage.provider,
       models: usage.models,
       tokens: usage.tokens,
-      costMicros: turnCostOfGroups(usage.groups, period, PRICE_TABLE),
-      turn: Number.isSafeInteger(usage.turn) ? usage.turn : buffer.turn
+      costMicros,
+      turn
     };
     notifyTurnSettled();
   }
@@ -744,7 +880,8 @@ function createCostService(ctx, config) {
     waitTurnSettled,
     refresh,
     stateValue,
-    applyCorrection,
+    applyBudget,
+    budgetCents,
     onSessionEvent,
     dispose,
     state,
@@ -793,8 +930,205 @@ function makeCostStateHandler(ctx, service) {
   };
 }
 
-function makeCostCorrectionHandler(ctx, service) {
-  return async function handleCostCorrection(req, res) {
+// ---------------------------------------------------------------------------
+// 会话统计：读真实会话日志（复用官方 sessionQuery，不新建采集器）
+// ---------------------------------------------------------------------------
+
+const STATS_ROUTE = "/dsh-message-actions/stats";
+const STATS_BUDGET_ROUTE = "/dsh-message-actions/stats/budget";
+/** 同一会话日志的折叠结果缓存 4s，避免每次刷新都重读大文件。 */
+const STATS_FOLD_TTL_MS = 4000;
+/** 会话表最多返回 100 行，避免大型工作区一次传输过多数据。 */
+const STATS_SESSION_ROWS = 100;
+/** 折叠缓存上限：超出后丢弃最早插入的一项。 */
+const STATS_FOLD_CACHE_MAX = 300;
+
+function sessionQueryOf(ctx) {
+  try {
+    const service = ctx.get("sessionQuery");
+    if (service && typeof service.listSessions === "function" && typeof service.readSession === "function") {
+      return service;
+    }
+  } catch {
+    /* 宿主未提供该服务 */
+  }
+  return null;
+}
+
+/**
+ * 会话统计服务：枚举会话、按 revision 折叠日志，产出与费用卡片同一价目口径的
+ * token / 成本 / 时间线 / 会话表。数据源只有官方日志，不另建采集器。
+ */
+function createStatsService(ctx, cost, config) {
+  const folds = new Map();
+  const warn = (message) => {
+    if (typeof ctx.logger?.warn === "function") ctx.logger.warn(`[dsh-message-actions] ${message}`);
+  };
+
+  async function revisionOf(sessionId) {
+    try {
+      const store = ctx.get("sessionPersistence");
+      if (!store || typeof store.stat !== "function") return undefined;
+      const snapshot = await store.stat(sessionId);
+      if (snapshot === undefined) return "missing";
+      return String(snapshot.revision ?? `${snapshot.eventCount ?? ""}:${snapshot.sizeBytes ?? ""}`);
+    } catch {
+      return undefined;
+    }
+  }
+
+  async function foldFor(record) {
+    const id = record && record.header && typeof record.header.id === "string" ? record.header.id : "";
+    if (!id) return null;
+    const query = sessionQueryOf(ctx);
+    if (!query) return null;
+    const cached = folds.get(id);
+    const now = Date.now();
+    if (cached !== undefined && now - cached.at < STATS_FOLD_TTL_MS) return cached.fold;
+    const revision = await revisionOf(id);
+    if (cached !== undefined && revision !== undefined && cached.revision === revision) {
+      cached.at = now;
+      return cached.fold;
+    }
+    let snapshot;
+    try {
+      snapshot = await query.readSession(id);
+    } catch (err) {
+      warn(`could not read session "${id}": ${err instanceof Error ? err.message : String(err)}`);
+      return cached !== undefined ? cached.fold : null;
+    }
+    const fold = foldSessionStats(Array.isArray(snapshot && snapshot.events) ? snapshot.events : []);
+    if (folds.size >= STATS_FOLD_CACHE_MAX && !folds.has(id)) {
+      const oldest = folds.keys().next();
+      if (!oldest.done) folds.delete(oldest.value);
+    }
+    folds.set(id, { revision, at: now, fold });
+    return fold;
+  }
+
+  function runningSet() {
+    const running = new Set();
+    try {
+      const agents = ctx.get("agents");
+      if (agents && typeof agents.list === "function") {
+        for (const agent of agents.list()) {
+          if (!agent || agent.status !== "running") continue;
+          const id = agent.session && typeof agent.session.id === "string" ? agent.session.id : agent.id;
+          if (typeof id === "string") running.add(id);
+        }
+      }
+    } catch {
+      /* 运行状态只是装饰列 */
+    }
+    return running;
+  }
+
+  async function buildPayload() {
+    const now = Date.now();
+    const query = sessionQueryOf(ctx);
+    let records = [];
+    if (query) {
+      try {
+        records = await query.listSessions();
+      } catch (err) {
+        warn(`session list failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+    const running = runningSet();
+    const rows = [];
+    const points = [];
+    for (const record of Array.isArray(records) ? records : []) {
+      const fold = await foldFor(record);
+      if (fold === null) continue;
+      const id = record && record.header && typeof record.header.id === "string" ? record.header.id : "";
+      rows.push(statsSessionRow(record && record.header, fold, {
+        running: running.has(id),
+        live: record && record.live === true
+      }));
+      for (const point of fold.points) points.push(point);
+    }
+    rows.sort((left, right) => right.tokens.total - left.tokens.total || right.lastActiveAt - left.lastActiveAt);
+    const summary = statsSummary(rows);
+    const budget = statsBudget(summary.costMicros, cost.budgetCents());
+    // 余额口径（费用卡片）：只作对照，不参与估算成本与预算。
+    let ledger = null;
+    try {
+      const value = await cost.stateValue();
+      const b = (value.balance && typeof value.balance === "object") ? value.balance : {};
+      const rechargeCents = Number.isFinite(b.rechargeCents) ? b.rechargeCents : null;
+      const bonusCents = Number.isFinite(b.bonusCents) ? b.bonusCents : null;
+      const totalCents = Number.isFinite(b.totalCents) ? b.totalCents : null;
+      // 与侧边栏费用卡片完全同一口径：直接展示官方「充值余额」（不含赠金）。
+      const balanceCents = rechargeCents !== null ? rechargeCents : totalCents;
+      ledger = {
+        balanceCents,
+        rechargeCents,
+        bonusCents,
+        totalCents,
+        dailyCents: Number.isFinite(value.dailyCents) ? value.dailyCents : 0,
+        observedSpendCents: Number.isFinite(value.observedSpendCents) ? value.observedSpendCents : 0,
+        lastTurnMicros: value.lastTurn && Number.isFinite(value.lastTurn.costMicros) ? value.lastTurn.costMicros : null
+      };
+    } catch {
+      ledger = null;
+    }
+    return {
+      available: query !== null,
+      generatedAt: now,
+      currency: "CNY",
+      currencySymbol: "¥",
+      budget,
+      totals: { ...summary, costCents: Math.round(summary.costMicros / 10000) },
+      series: statsTimeline(points, now),
+      sessions: rows.slice(0, STATS_SESSION_ROWS),
+      sessionsTotal: rows.length,
+      truncated: rows.length > STATS_SESSION_ROWS,
+      ledger
+    };
+  }
+
+  /** 同一时刻只跑一次折叠：刷新按钮与定时轮询撞车时复用同一个 Promise。 */
+  let inflight = null;
+  function payload() {
+    if (inflight !== null) return inflight;
+    const task = buildPayload();
+    inflight = task;
+    task
+      .finally(() => {
+        if (inflight === task) inflight = null;
+      })
+      .catch(() => {});
+    return task;
+  }
+
+  return { payload };
+}
+
+function makeStatsHandler(ctx, service) {
+  return async function handleStats(req, res) {
+    if (req.method !== "GET") {
+      drainRequest(req);
+      sendMethodNotAllowed(res, "GET");
+      return;
+    }
+    if (!isTrusted(req, ctx.webServer)) {
+      drainRequest(req);
+      sendForbidden(res);
+      return;
+    }
+    try {
+      sendJson(res, 200, { ok: true, value: await service.payload() });
+    } catch (err) {
+      if (typeof ctx.logger?.warn === "function") {
+        ctx.logger.warn(`[dsh-message-actions] stats failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      sendError(res, 500, "INTERNAL");
+    }
+  };
+}
+
+function makeStatsBudgetHandler(ctx, cost) {
+  return async function handleStatsBudget(req, res) {
     if (req.method !== "POST") {
       drainRequest(req);
       sendMethodNotAllowed(res, "POST");
@@ -817,22 +1151,21 @@ function makeCostCorrectionHandler(ctx, service) {
       sendBadRequest(res);
       return;
     }
-    const credit = validateCorrectionAmount(body.creditYuan);
-    const debit = validateCorrectionAmount(body.debitYuan);
-    if (!credit.ok || !debit.ok) {
+    const amount = validateCorrectionAmount(body.budgetYuan);
+    if (!amount.ok) {
       sendError(res, 400, "INVALID_AMOUNT");
       return;
     }
     try {
-      const saved = service.applyCorrection(credit.cents, debit.cents);
+      const saved = cost.applyBudget(amount.cents);
       if (!saved.ok) {
         sendError(res, 500, saved.error);
         return;
       }
-      sendJson(res, 200, { ok: true, value: await service.stateValue() });
+      sendJson(res, 200, { ok: true, value: { budgetCents: cost.budgetCents() } });
     } catch (err) {
       if (typeof ctx.logger?.warn === "function") {
-        ctx.logger.warn(`[dsh-message-actions] correction failed: ${err instanceof Error ? err.message : String(err)}`);
+        ctx.logger.warn(`[dsh-message-actions] budget save failed: ${err instanceof Error ? err.message : String(err)}`);
       }
       sendError(res, 500, "INTERNAL");
     }
@@ -860,9 +1193,18 @@ function apply(ctx, config) {
     }),
     "dsh-message-actions: read route"
   );
+  ctx.effect(
+    () => ctx.webServer.register({
+      kind: "exact",
+      path: ATTACHMENT_ROUTE,
+      handler: makeAttachmentHandler(ctx)
+    }),
+    "dsh-message-actions: attachment route"
+  );
 
   // —— 费用统计 ——
   const cost = createCostService(ctx, config);
+  const stats = createStatsService(ctx, cost, config);
 
   ctx.effect(
     () => ctx.webServer.register({
@@ -872,13 +1214,22 @@ function apply(ctx, config) {
     }),
     "dsh-message-actions: cost state route"
   );
+  // —— 会话统计（数据来自官方会话日志）——
   ctx.effect(
     () => ctx.webServer.register({
       kind: "exact",
-      path: "/dsh-message-actions/cost/correction",
-      handler: makeCostCorrectionHandler(ctx, cost)
+      path: STATS_ROUTE,
+      handler: makeStatsHandler(ctx, stats)
     }),
-    "dsh-message-actions: cost correction route"
+    "dsh-message-actions: session stats route"
+  );
+  ctx.effect(
+    () => ctx.webServer.register({
+      kind: "exact",
+      path: STATS_BUDGET_ROUTE,
+      handler: makeStatsBudgetHandler(ctx, cost)
+    }),
+    "dsh-message-actions: stats budget route"
   );
 
   ctx.effect(() => {

@@ -1,6 +1,6 @@
 {
   "name": "dsh-message-actions",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "消息费用：撤回、删除、删至末尾、分享、导出、回答统计与 DeepSeek 费用统计（DSH 插件）。",
   "type": "module",
   "license": "MIT",

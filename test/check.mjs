@@ -10,6 +10,7 @@ import { fileURLToPath } from "node:url";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { spawnSync } from "node:child_process";
 
 const require = createRequire(import.meta.url);
 const s = require("../src/shared.cjs");
@@ -829,7 +830,7 @@ function bj(y, m, d, hh, mm) {
 
   r = s.observeBalance(r.state, { cents: 2000, routing: "account", at: at1 + 180000 });
   eq("余额上升 → adjust", r.reason, "adjust");
-  eq("上升记待核对", r.state.pendingAdjustmentCents, 400);
+  eq("上升只更新基准", r.state.lastBalanceCents, 2000);
   eq("上升不冲减消费", r.state.observedSpendTotalCents, 84);
 
   const overnight = Object.assign(store.defaultState(), {
@@ -887,24 +888,10 @@ function bj(y, m, d, hh, mm) {
 }
 
 // ---------------------------------------------------------------------------
-// 28. 费用统计：余额校正
+// 28. 费用统计：金额解析（官方充值余额截断至分）
 // ---------------------------------------------------------------------------
 
 {
-  eq("校正后余额 = 基线 - 消费 + 到账 - 扣减", s.correctedBalanceCents({
-    baselineCents: 20000,
-    observedSpendCents: 5000,
-    creditCents: 3000,
-    debitCents: 1000
-  }), 17000);
-  eq("校正后余额允许为负", s.correctedBalanceCents({
-    baselineCents: 1000,
-    observedSpendCents: 5000,
-    creditCents: 0,
-    debitCents: 0
-  }), -4000);
-  eq("缺基线 → null", s.correctedBalanceCents({ observedSpendCents: 100 }), null);
-
   eq("金额字符串转分", s.validateCorrectionAmount("12.34"), { ok: true, cents: 1234 });
   eq("金额数字转分", s.validateCorrectionAmount(12.34), { ok: true, cents: 1234 });
   eq("千分位字符串", s.validateCorrectionAmount("1,000"), { ok: true, cents: 100000 });
@@ -920,6 +907,14 @@ function bj(y, m, d, hh, mm) {
   eq("元字符串转分", s.yuanToCents("16.84"), 1684);
   eq("元数字转分", s.yuanToCents(16.84), 1684);
   eq("元非法 → null", s.yuanToCents("abc"), null);
+  // 官方「账号与余额」对正金额截断至分；默认四舍五入保留给普通金额解析。
+  eq("截断模式：5.999 → 599", s.yuanToCents("5.999", "truncate"), 599);
+  eq("截断模式：5.99 → 599", s.yuanToCents("5.99", "truncate"), 599);
+  eq("截断模式：5.994 → 599", s.yuanToCents("5.994", "truncate"), 599);
+  eq("截断模式：6 → 600", s.yuanToCents("6", "truncate"), 600);
+  eq("默认模式仍四舍五入：5.999 → 600", s.yuanToCents("5.999"), 600);
+  eq("截断模式：负数仍四舍五入", s.yuanToCents("-5.999", "truncate"), -600);
+  eq("截断模式：数字 5.999 → 599", s.yuanToCents(5.999, "truncate"), 599);
 }
 
 // ---------------------------------------------------------------------------
@@ -965,13 +960,12 @@ function bj(y, m, d, hh, mm) {
     const saved = Object.assign(store.defaultState(), {
       baselineBalanceCents: 1684,
       observedSpendTotalCents: 84,
-      dailySpendCents: { "2026-11-02": 84 },
-      correctionCreditCents: 3000,
-      correctionDebitCents: 1000
+      dailySpendCents: { "2026-11-02": 84 }
     });
     store.saveCostState(file, saved);
     const loaded = store.loadCostState(file);
-    eq("原子写后读取一致", loaded.state.correctionCreditCents, 3000);
+    eq("原子写后读取一致", loaded.state.observedSpendTotalCents, 84);
+    eq("旧校正字段不落盘", "correctionCreditCents" in loaded.state, false);
     eq("读取非损坏", loaded.recovered, false);
     eq("状态版本", loaded.state.version, 1);
     eq("普通版本可写", loaded.readOnly, false);
@@ -1348,6 +1342,25 @@ function fakeRes() {
     fs.readFileSync(path.join(rootDir, "lib", "index.js"), "utf8")
       === fs.readFileSync(path.join(rootDir, "src", "index.mjs"), "utf8")
   );
+
+  // 产物必须能被真实 JS 引擎解析：0.2.2 曾因括号不平衡导致 web boot import failed。
+  const syntax = spawnSync(process.execPath, ["--check", path.join(rootDir, "lib", "client.js")], { encoding: "utf8" });
+  eq("构建产物的客户端脚本可解析", syntax.status, 0);
+
+  // 客户端解构的 shared 名称必须都真实导出，防止重命名后产物引用不存在的符号。
+  const destructure = /const \{([\s\S]*?)\} = shared;/.exec(srcClient);
+  const sharedNames = (destructure ? destructure[1] : "")
+    .split(",")
+    .map((part) => part.replace(/\/\/.*$/gm, "").trim())
+    .filter((name) => /^[A-Za-z_$][\w$]*$/.test(name));
+  const missingExports = sharedNames.filter((name) => !(name in s));
+  eq("客户端解构的 shared 符号全部存在", missingExports.join(","), "");
+
+  // 客户端字面量文案键必须同时存在于 zh / en，防止新增键漏配一侧。
+  const keyMatches = [...srcClient.matchAll(/\bt+\("([^"]+)"\)/g)].map((m) => m[1]);
+  const usedKeys = [...new Set(keyMatches)];
+  const missingKeys = usedKeys.filter((key) => i18n.zh[key] == null || i18n.en[key] == null);
+  eq("客户端引用的 i18n 键在 zh/en 均存在", missingKeys.join(","), "");
 }
 
 // ---------------------------------------------------------------------------
@@ -1493,10 +1506,6 @@ function fakeRes() {
     ["cost.settings.autoClose", 12],
     ["cost.settings.peakValley", 15],
     ["cost.local", 20],
-    ["cost.correction.title", 20],
-    ["cost.correction.debit", 18],
-    ["cost.correction.preview", 18],
-    ["cost.correction.pending", 14],
     ["pick.share", 12]
   ];
   for (const [key, max] of limits) {
@@ -1507,6 +1516,14 @@ function fakeRes() {
   eq("中文余额标签未改", i18n.zh["cost.balance"], "余额");
   eq("中文计费样式标签未改", i18n.zh["cost.settings.layout"], "计费样式");
   eq("中文单次标签未改", i18n.zh["cost.perTurn"], "单次");
+  eq("预算保存按钮文案收紧", i18n.zh["stats.budgetSave"], "保存");
+  eq("预算保存按钮文案（英）", i18n.en["stats.budgetSave"], "Save");
+  // 余额校正整块移除后，中英文都不再保留相关键；账号口径说明必须存在。
+  for (const key of ["cost.pending", "cost.pendingTitle", "cost.correction.title", "cost.correction.save", "cost.note"]) {
+    ok(`已移除文案 ${key}`, i18n.zh[key] === undefined && i18n.en[key] === undefined);
+  }
+  ok("账号口径说明（中文）", typeof i18n.zh["cost.balanceNote"] === "string" && i18n.zh["cost.balanceNote"].length > 20);
+  ok("账号口径说明（英文）", typeof i18n.en["cost.balanceNote"] === "string" && i18n.en["cost.balanceNote"].length > 20);
 }
 
 // ---------------------------------------------------------------------------
@@ -1796,20 +1813,20 @@ function pushTombstone(bag, plan, id, action) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dma-persist-"));
   const file = path.join(dir, "cost-state.json");
   const state = store.defaultState();
-  state.correctionCreditCents = 3000;
-  state.correctionDebitCents = 1000;
+  state.observedSpendTotalCents = 3000;
+  state.budgetCents = 900;
 
   eq("持久化：正常写入返回成功", store.persistCostState(file, state, false), { ok: true });
   const loaded = store.loadCostState(file, null);
-  eq("持久化：重启后校正不丢失（到账）", loaded.state.correctionCreditCents, 3000);
-  eq("持久化：重启后校正不丢失（扣减）", loaded.state.correctionDebitCents, 1000);
+  eq("持久化：重启后消费观测不丢失", loaded.state.observedSpendTotalCents, 3000);
+  eq("持久化：重启后预算不丢失", loaded.state.budgetCents, 900);
 
   eq(
     "持久化：只读模式返回 READ_ONLY",
     store.persistCostState(file, state, true),
     { ok: false, error: "READ_ONLY" }
   );
-  eq("持久化：只读模式不改动磁盘", store.loadCostState(file, null).state.correctionCreditCents, 3000);
+  eq("持久化：只读模式不改动磁盘", store.loadCostState(file, null).state.observedSpendTotalCents, 3000);
 
   // 父路径是普通文件 → mkdir/rename 必然失败，用于模拟写盘异常。
   fs.writeFileSync(path.join(dir, "blocker"), "x");
@@ -1818,7 +1835,7 @@ function pushTombstone(bag, plan, id, action) {
     store.persistCostState(path.join(dir, "blocker", "cost-state.json"), state, false),
     { ok: false, error: "WRITE_FAILED" }
   );
-  eq("持久化：失败时磁盘仍保留旧值", store.loadCostState(file, null).state.correctionCreditCents, 3000);
+  eq("持久化：失败时磁盘仍保留旧值", store.loadCostState(file, null).state.observedSpendTotalCents, 3000);
 
   eq("错误码文案：只读（中）", s.ERROR_LABELS.zh.READ_ONLY.length > 0, true);
   eq("错误码文案：写盘失败（英）", s.ERROR_LABELS.en.WRITE_FAILED.length > 0, true);
@@ -1862,12 +1879,29 @@ function pushTombstone(bag, plan, id, action) {
   ok("路由：busy 判定使用 isBusyError", /if \(isBusyError\(err\)\)/.test(indexSrc));
   ok("路由：/messages 解析 since 游标", /searchParams\.get\("since"\)/.test(indexSrc));
   ok(
-    "路由：校正落盘失败返回 500",
+    "路由：预算保存失败返回 500",
     /if \(!saved\.ok\) \{[\s\S]{0,160}sendError\(res, 500, saved\.error\)/.test(indexSrc)
   );
   ok(
-    "路由：校正落盘失败回滚内存字段",
-    /const saved = persist\(\);[\s\S]{0,220}state\.correctionCreditCents = previous\.credit/.test(indexSrc)
+    "余额校正路由已移除",
+    !indexSrc.includes("/dsh-message-actions/cost/correction") &&
+    !indexSrc.includes("makeCostCorrectionHandler") &&
+    !indexSrc.includes("applyCorrection")
+  );
+  ok(
+    "余额校正字段已移除",
+    !indexSrc.includes("pendingAdjustmentCents") &&
+    !indexSrc.includes("correctedBalanceCents") &&
+    !clientSrc.includes("CorrectionForm") &&
+    !clientSrc.includes("pendingAdjustmentCents")
+  );
+  ok(
+    "钱包按官方截断至分",
+    /yuanToCents\(wallet\.balance, "truncate"\)/.test(indexSrc)
+  );
+  ok(
+    "客户端展示账号口径说明",
+    /tt\("cost\.balanceNote"\)/.test(clientSrc)
   );
   ok("store：persist 返回结构化结果", /return persistCostState\(statePath, state, readOnly, ctx\.logger\)/.test(indexSrc));
 
@@ -1897,11 +1931,646 @@ function pushTombstone(bag, plan, id, action) {
   ok("提示音：无结算时间不响", s.shouldPlayCompletionSound({ ...soundBase, at: null }) === false);
   ok("提示音：非法时间不响", s.shouldPlayCompletionSound({ ...soundBase, at: NaN }) === false);
   ok("提示音：Web Audio 现场合成", /createOscillator\(\)/.test(clientSrc) && !/new Audio\(/.test(clientSrc));
-  ok("提示音：AudioContext 挂起静默跳过", /state !== "running"[\s\S]{0,220}return false;/.test(clientSrc));
+  ok("提示音：AudioContext 挂起静默跳过", /state !== "running"[\s\S]{0,400}return false;/.test(clientSrc));
   ok("提示音：过滤首次快照基线", /if \(previousAt === null\) return;/.test(clientSrc));
   ok("结算推送：客户端 wait 长轮询", /"wait=" \+ wait/.test(clientSrc));
   ok("结算推送：宿主 wait 挂起接口", /waitTurnSettled\(COST_SETTLE_WAIT_MS\)/.test(indexSrc) && /notifyTurnSettled\(\)/.test(indexSrc));
   ok("设置：提示音默认开启分支", /defaultOn \? value\[key\] !== false/.test(clientSrc));
+}
+
+// ---------------------------------------------------------------------------
+// 50. 会话统计：日志折叠、时间线分桶、会话表聚合、预算与入口判定
+// ---------------------------------------------------------------------------
+
+{
+  const root = fileURLToPath(new URL("..", import.meta.url));
+  const indexSrc = fs.readFileSync(path.join(root, "src", "index.mjs"), "utf8");
+  const clientSrc = fs.readFileSync(path.join(root, "src", "client.js"), "utf8");
+
+  // 四类 token 归一化：只认非负安全整数，缺 input/output 视为无效。
+  ok("统计：usage 归一化四类桶", s.statsUsageBuckets({
+    inputTokens: 120,
+    cacheReadTokens: 80,
+    cacheWriteTokens: 30,
+    outputTokens: 40
+  }).input === 120);
+  ok("统计：usage 保留 cacheWrite", s.statsUsageBuckets({
+    inputTokens: 1,
+    cacheReadTokens: 2,
+    cacheWriteTokens: 3,
+    outputTokens: 4
+  }).cacheWrite === 3);
+  ok("统计：usage 缺字段返回 null", s.statsUsageBuckets({ inputTokens: 1 }) === null);
+  ok("统计：usage 非对象返回 null", s.statsUsageBuckets(null) === null);
+  ok("统计：token 合计", s.statsTokenTotal({ input: 10, cacheRead: 20, cacheWrite: 30, output: 40 }) === 100);
+
+  // 折叠会话日志：标题、模型、四类 token、时间点、轮次与消息数。
+  const baseAt = new Date(2026, 10, 4, 15, 30, 0, 0).getTime();
+  const events = [
+    { type: "session/title", time: baseAt - 90 * 60 * 1000, data: { title: "  Alpha  " } },
+    { type: "user/message", time: baseAt - 80 * 60 * 1000, data: { message: { role: "user", content: [{ type: "text", text: "hello world" }] } } },
+    {
+      type: "request/header",
+      time: baseAt - 70 * 60 * 1000,
+      data: { header: { config: { model: "deepseek-chat", provider: "deepseek" } } }
+    },
+    {
+      type: "assistant/message",
+      time: baseAt - 60 * 60 * 1000,
+      data: {
+        turn: 1,
+        usage: { inputTokens: 100, cacheReadTokens: 200, cacheWriteTokens: 30, outputTokens: 40 }
+      }
+    },
+    { type: "step/end", time: baseAt - 50 * 60 * 1000, data: {} },
+    {
+      type: "assistant/message",
+      time: baseAt - 40 * 60 * 1000,
+      data: { turn: 2, usage: { inputTokens: 10, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 5 } }
+    }
+  ];
+  const fold = s.foldSessionStats(events);
+  eq("折叠：标题去空白", fold.title, "Alpha");
+  eq("折叠：首个问题", fold.firstPrompt, "hello world");
+  eq("折叠：模型", fold.model, "deepseek-chat");
+  eq("折叠：provider", fold.provider, "deepseek");
+  eq("折叠：input 合计", fold.tokens.input, 110);
+  eq("折叠：cacheRead 合计", fold.tokens.cacheRead, 200);
+  eq("折叠：cacheWrite 合计", fold.tokens.cacheWrite, 30);
+  eq("折叠：output 合计", fold.tokens.output, 45);
+  eq("折叠：时间点数量", fold.points.length, 2);
+  eq("折叠：时间点继承模型", fold.points[0].model, "deepseek-chat");
+  eq("折叠：轮次取最大 turn", fold.turns, 2);
+  eq("折叠：step 计数", fold.steps, 1);
+  eq("折叠：消息计数", fold.messages, 2);
+  eq("折叠：最后活跃时间", fold.lastActiveAt, baseAt - 40 * 60 * 1000);
+  eq("折叠：空日志不崩", s.foldSessionStats(null).points.length, 0);
+
+  // 计费口径：只有 DeepSeek 官方路由计费；本地模型 token 照常统计但成本为 0。
+  eq("计费：DeepSeek 账户路由计费", s.isBillableRoute("deepseek-account", "deepseek-flash"), true);
+  eq("计费：DeepSeek 官方路由计费", s.isBillableRoute("deepseek-official", "deepseek-v4-pro"), true);
+  eq("计费：本地模型不计费", s.isBillableRoute("ninfer-27b", "ninfer-27b"), false);
+  eq("计费：无 provider 但模型为 DeepSeek 时兜底计费", s.isBillableRoute("", "deepseek-flash"), true);
+  eq("计费：无 provider 且未知模型不计费", s.isBillableRoute("", "llama3"), false);
+  eq("计费：provider 与模型都缺失时不计费", s.isBillableRoute(undefined, undefined), false);
+  ok("计费：provider 优先于模型名", s.isBillableRoute("ninfer-27b", "deepseek-flash") === false);
+
+  const localEvents = [
+    { type: "request/header", time: baseAt - 30 * 60 * 1000, data: { header: { config: { provider: "ninfer-27b", model: "ninfer-27b" } } } },
+    {
+      type: "assistant/message",
+      time: baseAt - 20 * 60 * 1000,
+      data: { turn: 1, usage: { inputTokens: 1000, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 500 } }
+    }
+  ];
+  const localFold = s.foldSessionStats(localEvents);
+  eq("计费：本地时间点标记不计费", localFold.points[0].billable, false);
+  eq("计费：本地时间点成本为 0", s.statsPointCostMicros(localFold.points[0]), 0);
+  eq("计费：本地 token 仍统计", localFold.tokens.input + localFold.tokens.output, 1500);
+  const localRow = s.statsSessionRow({ id: "local-1" }, localFold, {});
+  eq("计费：本地会话成本为 0", localRow.costMicros, 0);
+  eq("计费：本地会话可识别（无计费用量）", localRow.billable, false);
+  eq("计费：本地会话 token 照常统计", localRow.tokens.total, 1500);
+  eq("计费：本地 token 计入 localTokens", localRow.localTokens, 1500);
+  eq("计费：本地 token 不计入 billableTokens", localRow.billableTokens, 0);
+  const localSummary = s.statsSummary([localRow]);
+  eq("计费：合计成本排除本地", localSummary.costMicros, 0);
+  eq("计费：合计 token 仍含本地", localSummary.tokens.total, 1500);
+  eq("计费：合计 localTokens", localSummary.localTokens, 1500);
+  eq("计费：合计 billableTokens 为 0", localSummary.billableTokens, 0);
+  const localBuckets = s.statsAggregate(localFold.points, s.statsBucketStarts(baseAt, 2, "hour"), "hour");
+  eq("计费：时间线本地桶 localTokens", localBuckets[1].localTokens, 1500);
+  eq("计费：时间线本地桶 billableTokens", localBuckets[1].billableTokens, 0);
+  eq("计费：时间线本地桶成本为 0", localBuckets[1].costMicros, 0);
+
+  const mixedEvents = [
+    { type: "request/header", time: baseAt - 40 * 1000, data: { header: { config: { provider: "deepseek-account", model: "deepseek-flash" } } } },
+    {
+      type: "assistant/message",
+      time: baseAt - 30 * 1000,
+      data: { turn: 1, usage: { inputTokens: 100000, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 1000 } }
+    },
+    { type: "request/header", time: baseAt - 20 * 1000, data: { header: { config: { provider: "ninfer-27b", model: "ninfer-27b" } } } },
+    {
+      type: "assistant/message",
+      time: baseAt - 10 * 1000,
+      data: { turn: 1, usage: { inputTokens: 2000, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 1000 } }
+    }
+  ];
+  const mixedRow = s.statsSessionRow({ id: "mixed-1" }, s.foldSessionStats(mixedEvents), {});
+  ok("计费：混合会话只计 DeepSeek 部分", mixedRow.costMicros > 0);
+  eq("计费：混合会话 billableTokens", mixedRow.billableTokens, 101000);
+  eq("计费：混合会话 localTokens", mixedRow.localTokens, 3000);
+
+  // 时间线分桶：本地小时 / 日起点，旧 → 新，越界点忽略。
+  const hourStarts = s.statsBucketStarts(baseAt, 4, "hour");
+  eq("分桶：小时桶数量", hourStarts.length, 4);
+  eq("分桶：小时桶按本地整点结束", hourStarts[3], new Date(2026, 10, 4, 15, 0, 0, 0).getTime());
+  eq("分桶：小时桶连续", hourStarts[0], new Date(2026, 10, 4, 12, 0, 0, 0).getTime());
+  const dayStarts = s.statsBucketStarts(baseAt, 3, "day");
+  eq("分桶：日桶结束于今天零点", dayStarts[2], new Date(2026, 10, 4, 0, 0, 0, 0).getTime());
+  eq("分桶：日桶连续", dayStarts[0], new Date(2026, 10, 2, 0, 0, 0, 0).getTime());
+
+  const points = [
+    { t: new Date(2026, 10, 4, 15, 10).getTime(), input: 10, cacheRead: 20, cacheWrite: 30, output: 40, model: "deepseek-chat" },
+    { t: new Date(2026, 10, 4, 12, 20).getTime(), input: 5, cacheRead: 0, cacheWrite: 0, output: 5, model: "deepseek-chat" },
+    { t: new Date(2026, 10, 1, 9, 0).getTime(), input: 99, cacheRead: 0, cacheWrite: 0, output: 1, model: "deepseek-chat" }
+  ];
+  const hourBuckets = s.statsAggregate(points, hourStarts, "hour");
+  eq("聚合：越界点被忽略", hourBuckets[0].tokens, 10);
+  eq("聚合：最后一桶含两点", hourBuckets[3].tokens, 100);
+  ok("聚合：成本为正", hourBuckets[3].costMicros > 0);
+  eq("聚合：日视图跨天取最近 30 天", s.statsTimeline(points, baseAt).daily.length, 30);
+  eq("聚合：小时视图 48 桶", s.statsTimeline(points, baseAt).hourly.length, 48);
+
+  // 会话表聚合：标题兜底、总 token、运行态。
+  const row = s.statsSessionRow(
+    { id: "s1", cwd: "D:\\projects\\alpha" },
+    fold,
+    { running: true, live: true }
+  );
+  eq("会话行：有标题用标题", row.title, "Alpha");
+  eq("会话行：token 总数", row.tokens.total, 385);
+  eq("会话行：运行中标记", row.running, true);
+  eq("会话行：实时标记", row.live, true);
+  eq("会话行：无标题回退目录名", s.statsSessionRow({ id: "s2", cwd: "D:\\projects\\beta" }, { points: [], tokens: {} }, {}).title, "beta");
+  eq("会话行：无标题无目录回退 id", s.statsSessionRow({ id: "s3" }, { points: [], tokens: {} }, {}).title, "s3");
+  eq("会话行：子会话标记", s.statsSessionRow({ id: "s4", origin: "subagent" }, { points: [], tokens: {} }, {}).subagent, true);
+
+  const summary = s.statsSummary([
+    row,
+    s.statsSessionRow({ id: "s5" }, { tokens: { input: 1, output: 1 }, points: [] }, {}),
+    s.statsSessionRow({ id: "s6" }, { tokens: {}, points: [] }, { running: true })
+  ]);
+  eq("汇总：会话数", summary.sessions, 3);
+  eq("汇总：四类 token 合计", summary.tokens.total, 387);
+  eq("汇总：运行中数量", summary.running, 2);
+  ok("汇总：成本累加为正", summary.costMicros > 0);
+  ok("汇总：空表不崩", s.statsSummary(null).sessions === 0 && s.statsSummary(null).tokens.total === 0);
+
+  // 预算：人民币分，0 视为未启用。
+  const budget = s.statsBudget(2500000, 500);
+  eq("预算：金额", budget.amountCents, 500);
+  eq("预算：已用", budget.spentCents, 250);
+  eq("预算：剩余", budget.remainingCents, 250);
+  eq("预算：比例", budget.ratio, 0.5);
+  eq("预算：启用", budget.enabled, true);
+  const over = s.statsBudget(9000000, 500);
+  eq("预算：超支剩余归零", over.remainingCents, 0);
+  eq("预算：超支仍启用", over.enabled, true);
+  const off = s.statsBudget(100, 0);
+  eq("预算：0 关闭比例", off.enabled, false);
+  eq("预算：0 比例为零", off.ratio, 0);
+  eq("预算：无消费比例为零", s.statsBudget(null, 500).ratio, 0);
+
+  // 入口与开关：0.2.2 调整后不再有「会话统计」开关，入口随费用卡片常显。
+  ok("入口：不再暴露会话统计开关函数", typeof s.statsPanelEnabled === "undefined");
+  ok("入口：不再暴露入口判定函数", typeof s.statsEntryVisible === "undefined");
+  ok("入口：客户端不再引用入口判定", !/statsEntryVisible/.test(clientSrc));
+  ok("入口：客户端不再渲染 showStats 分支", !/showStats/.test(clientSrc));
+  ok("配置：宿主不再声明 statsPanel 开关", !/statsPanel/.test(indexSrc));
+  ok("配置：客户端不再引用 statsPanel", !/statsPanel/.test(clientSrc));
+
+  // 状态文件兼容：旧文件缺 budgetCents 时补默认 500，且不因未知字段报错。
+  const legacy = store.normalizeCostState({ version: 1, observedSpendTotalCents: 12 });
+  eq("状态：旧文件补默认预算", legacy.state.budgetCents, store.DEFAULT_BUDGET_CENTS);
+  eq("状态：默认预算 500 分", store.DEFAULT_BUDGET_CENTS, 500);
+  eq("状态：旧文件预算不为 0", legacy.state.budgetCents > 0, true);
+  eq("状态：读旧文件不进入只读", legacy.readOnly, false);
+  eq("状态：负数预算归零", store.normalizeCostState({ budgetCents: -20 }).state.budgetCents, 0);
+  eq("状态：非法预算回默认", store.normalizeCostState({ budgetCents: "abc" }).state.budgetCents, 500);
+
+  // 宿主 / 客户端接线断言：路由、日志来源、入口位置与设置项。
+  ok("宿主：注册会话统计路由", /path: STATS_ROUTE/.test(indexSrc));
+  ok("宿主：预算路由", /path: STATS_BUDGET_ROUTE/.test(indexSrc));
+  ok("宿主：复用官方 sessionQuery", /ctx\.get\("sessionQuery"\)/.test(indexSrc));
+  ok("宿主：折叠复用共享纯函数", /foldSessionStats\(/.test(indexSrc) && /statsTimeline\(/.test(indexSrc));
+  ok("宿主：结算只对 DeepSeek 可计费分组计价",
+    /isBillableRoute\(group\.provider, group\.model\)/.test(indexSrc) &&
+    /turnCostOfGroups\(billableGroups/.test(indexSrc));
+  ok("宿主：预算写入走同一状态文件", /applyBudget\(/.test(indexSrc) && /cost\.budgetCents\(\)/.test(indexSrc));
+  ok("客户端：侧边栏费用行末尾入口", /dma-stats-entry/.test(clientSrc) && !/statsEntryVisible\(cfg\)/.test(clientSrc));
+  ok("客户端：图标 + 悬停提示", /title: tt\("stats\.entryTitle"\)/.test(clientSrc));
+  ok("设置页：按钮文案打开统计表", /tt\("cost\.settings\.statsTableButton"\)/.test(clientSrc) && !/cost\.settings\.openStats/.test(clientSrc));
+  ok("设置页：统计表按钮不再受开关置灰", !/disabled: !statsPanelEnabled/.test(clientSrc));
+  const iUsage = clientSrc.indexOf('labelKey: "cost.settings.usageStats"');
+  const iLayout = clientSrc.indexOf("e(LayoutRow");
+  const iPerTurn = clientSrc.indexOf('labelKey: "cost.settings.perTurn"');
+  const iAutoClose = clientSrc.indexOf('labelKey: "cost.settings.autoClose"');
+  const iPeak = clientSrc.indexOf('labelKey: "cost.settings.peakValley"');
+  const iStats = clientSrc.indexOf('tt("cost.settings.statsTable")');
+  const iBalanceNote = clientSrc.indexOf('tt("cost.balanceNote")');
+  ok("设置页：统计表排在峰谷之后、账号口径说明之前",
+    iUsage > -1 && iUsage < iLayout && iLayout < iPerTurn && iPerTurn < iAutoClose &&
+    iAutoClose < iPeak && iPeak < iStats && iStats < iBalanceNote);
+  ok("设置页：统计表行不再写预算说明", !/cost\.settings\.budgetNote/.test(clientSrc));
+  ok("面板：预算辅助说明保留", /stats\.budgetNote/.test(clientSrc));
+  const i18nSrc = fs.readFileSync(path.join(root, "src", "i18n.cjs"), "utf8");
+  ok("文案：统计表 zh/en 均有", (i18nSrc.match(/'cost\.settings\.statsTable':/g) || []).length === 2);
+  ok("文案：打开统计表按钮 zh/en 均有",
+    (i18nSrc.match(/'cost\.settings\.statsTableButton':/g) || []).length === 2);
+  ok("文案：预算说明只在面板、不在设置页",
+    (i18nSrc.match(/'cost\.settings\.budgetNote':/g) || []).length === 0 &&
+    (i18nSrc.match(/'stats\.budgetNote':/g) || []).length === 2);
+  const i18nObj = i18n;
+  eq("文案：面板标题 zh", i18nObj.zh["stats.panelTitle"], "统计表");
+  eq("文案：面板标题 en", i18nObj.en["stats.panelTitle"], "Statistics");
+  eq("文案：入口悬停 zh", i18nObj.zh["stats.entryTitle"], "统计表");
+  eq("文案：入口悬停 en", i18nObj.en["stats.entryTitle"], "Statistics");
+  ok("面板标题用于 aria-label", /"aria-label": tt\("stats\.panelTitle"\)/.test(clientSrc));
+  ok("面板标题用于标题栏", /className: "dma-stats-title" \}, tt\("stats\.panelTitle"\)/.test(clientSrc));
+  ok("文案：答行统计提示仍保留 stats.title", (i18nSrc.match(/'stats\.title':/g) || []).length === 2);
+  ok("文案：不再保留打开会话统计设置项", !/cost\.settings\.openStats/.test(i18nSrc));
+  ok("客户端：浮层复用 dma-overlay/dma-panel", /className: "dma-panel dma-stats-panel"/.test(clientSrc));
+  ok("客户端：Esc 关闭走 useOverlayKeys", /useOverlayKeys\(\{ active: true, primaryEnabled: false/.test(clientSrc));
+  ok("客户端：面板请求统计路由", /getJson\(STATS_ROUTE\)/.test(clientSrc));
+  ok("客户端：预算保存走宿主路由", /postJson\(STATS_BUDGET_ROUTE/.test(clientSrc));
+  ok("客户端：时间线 24 小时切换", /\(series\.hourly \|\| \[\]\)\.slice\(-24\)/.test(clientSrc));
+  ok("客户端：未并入 CPU 面板", !/CpuPanel|process\.cpuUsage|loadavg|uptime\(/.test(clientSrc));
+
+  // —— 0.2.2 实测反馈：日用即时累加、分单位余额、预算行三数字、提示音 ——
+
+  // 北京时区固定锚点：2026-11-03 23:00 与 2026-11-04 01:00。
+  const dayOneAt = Date.UTC(2026, 10, 3, 15, 0, 0);
+  const dayTwoAt = dayOneAt + 2 * 60 * 60 * 1000;
+  const settledOne = s.settleSpend({}, { micros: 50000, at: dayOneAt, key: "s:1:1" });
+  eq("结算：本轮立即累加日用（5 分）", settledOne.state.dailySpendCents["2026-11-03"], 5);
+  eq("结算：标记已应用", settledOne.applied, true);
+  eq("结算：累计结算总额", settledOne.state.settledSpendTotalCents, 5);
+  eq("结算：累计待核对结算", settledOne.state.settledSinceObserveCents, 5);
+  const settledDup = s.settleSpend(settledOne.state, { micros: 50000, at: dayOneAt, key: "s:1:1" });
+  eq("结算：同一轮重复推送幂等", settledDup.applied, false);
+  eq("结算：幂等后日用量不变", settledDup.state.dailySpendCents["2026-11-03"], 5);
+  const settledCross = s.settleSpend({}, { micros: 70000, at: dayTwoAt, key: "s:2:2" });
+  eq("结算：跨零点按结算时刻入桶", settledCross.state.dailySpendCents["2026-11-04"], 7);
+  eq("结算：跨日不写入前一天", settledCross.state.dailySpendCents["2026-11-03"], undefined);
+  eq("结算：零金额不计", s.settleSpend({}, { micros: 0, at: dayOneAt, key: "s:3:3" }).applied, false);
+
+  // 余额观测只补差额，不把已结算金额重复计入。
+  const observedBase = {
+    baselineBalanceCents: 600,
+    lastBalanceCents: 600,
+    lastBalanceAt: dayOneAt,
+    lastRouting: "account",
+    dailySpendCents: { "2026-11-03": 5 },
+    settledSinceObserveCents: 5,
+    settledSpendTotalCents: 5,
+    observedSpendTotalCents: 0
+  };
+  const observedSame = s.observeBalance(observedBase, { cents: 595, routing: "account", at: dayOneAt + 60000 });
+  eq("观测：差额与结算相等不重复累加", observedSame.state.dailySpendCents["2026-11-03"], 5);
+  eq("观测：累计已观测消费", observedSame.state.observedSpendTotalCents, 5);
+  eq("观测：核对后清空待核对结算", observedSame.state.settledSinceObserveCents, 0);
+  const observedExtra = s.observeBalance(observedBase, { cents: 592, routing: "account", at: dayOneAt + 60000 });
+  eq("观测：差额大于结算时只补超出部分", observedExtra.state.dailySpendCents["2026-11-03"], 8);
+  const observedLess = s.observeBalance(observedBase, { cents: 597, routing: "account", at: dayOneAt + 60000 });
+  eq("观测：差额小于结算时不做减法", observedLess.state.dailySpendCents["2026-11-03"], 5);
+  const observedCross = s.observeBalance(
+    { lastBalanceCents: 600, lastBalanceAt: dayOneAt, lastRouting: "account", baselineBalanceCents: 600, settledSinceObserveCents: 5, dailySpendCents: { "2026-11-03": 5 } },
+    { cents: 590, routing: "account", at: dayTwoAt }
+  );
+  eq("观测：跨日跳过差额并清空待核对", observedCross.state.settledSinceObserveCents, 0);
+  eq("观测：跨日不改日用", observedCross.state.dailySpendCents["2026-11-03"], 5);
+
+  // 分单位金额：不经过元级四舍五入。
+  eq("金额：字符串 5.99 元 = 599 分", s.yuanToCents("5.99"), 599);
+  eq("金额：数字 5.99 元 = 599 分", s.yuanToCents(5.99), 599);
+  eq("金额：浮点 0.1+0.2 = 30 分", s.yuanToCents(0.1 + 0.2), 30);
+  eq("金额：599 分显示 ¥5.99", s.formatYuanCents(599), "¥5.99");
+  eq("金额：600 分显示 ¥6.00", s.formatYuanCents(600), "¥6.00");
+  eq("金额：非法值返回 null", s.yuanToCents("abc"), null);
+
+  // 提示音：音色归一化、关闭语义与选项集合（0.2.2 起由音色「关闭」承载开关）。
+  eq("提示音：未知音色回默认双音", s.normalizeSoundTone("weird"), "double");
+  eq("提示音：默认音色为双音", s.completionSoundTone({}), "double");
+  eq("提示音：关闭开关返回 off", s.completionSoundTone({ sound: false }), "off");
+  eq("提示音：音色关闭返回 off", s.completionSoundTone({ soundTone: "off" }), "off");
+  eq("提示音：关闭后开启状态为假", s.completionSoundEnabled({ soundTone: "off" }), false);
+  eq("提示音：四选项含关闭", s.soundToneOptions().join(","), "double,bell,soft,off");
+  eq("提示音：旧配置 sound=false 映射为关闭", s.completionSoundTone({ sound: false, soundTone: "soft" }), "off");
+  eq("提示音：新配置 soundTone=soft 即开启", s.completionSoundTone({ soundTone: "soft" }), "soft");
+
+  // 音量：0–100，默认 50，50 为基准，100 为两倍，0 静音。
+  eq("音量：默认 50", s.DEFAULT_SOUND_VOLUME, 50);
+  eq("音量：非法值回默认", s.clampSoundVolume("abc"), 50);
+  eq("音量：负数归零", s.clampSoundVolume(-10), 0);
+  eq("音量：超过 100 归 100", s.clampSoundVolume(130), 100);
+  eq("音量：字符串数字生效", s.clampSoundVolume("35"), 35);
+  eq("音量：50 为基准倍数 1", s.soundGainScale(50), 1);
+  eq("音量：25 为一半", s.soundGainScale(25), 0.5);
+  eq("音量：100 为两倍", s.soundGainScale(100), 2);
+  eq("音量：0 增益为 0（不发声）", s.soundGainScale(0), 0);
+
+  // 接线：结算、充值余额、预算卡片与音频解锁。
+  ok("宿主：turn/end 走 settleSpend", /settleSpend\(state, \{/.test(indexSrc));
+  ok("宿主：Config 声明 soundTone", /soundTone: z\.string\(\)\.default\("double"\)\.volatile\(\)/.test(indexSrc));
+  ok("宿主：Config 声明 soundVolume", /soundVolume: z\.number\(\)\.min\(0\)\.max\(100\)\.default\(50\)\.volatile\(\)/.test(indexSrc));
+  ok("宿主：余额直接取充值口径（缺字段才退回总额）",
+    /const balanceCents = rechargeCents !== null \? rechargeCents : totalCents;/.test(indexSrc) &&
+    /const rechargeCents = sumCnyWallets\(result\.value\);/.test(indexSrc));
+  ok("客户端：首次交互预解锁音频", /installAudioUnlock\(\)/.test(clientSrc) && /addEventListener\("pointerdown", unlockAudio/.test(clientSrc));
+  ok("客户端：基准增益 0.18", /double: \{ gain: 0\.18/.test(clientSrc));
+  ok("客户端：增益按音量缩放", /spec\.gain \* scale/.test(clientSrc) && /soundGainScale\(vol\) > 0/.test(clientSrc));
+  ok("客户端：设置页不再有完成提示音开关行", !/settings\.soundDesc/.test(clientSrc) &&
+    !/\["sound", "settings\.sound"/.test(clientSrc));
+  ok("客户端：设置页音色行", /function SoundToneRow/.test(clientSrc) && /soundToneOptions\(\)/.test(clientSrc));
+  ok("客户端：选中音色即时试听", /playCompletionSound\(id\)/.test(clientSrc));
+  ok("客户端：音量滑杆 0–100 步进 5", /type: "range"/.test(clientSrc) && /min: 0,/.test(clientSrc) &&
+    /max: 100,/.test(clientSrc) && /step: 5,/.test(clientSrc));
+  ok("客户端：音量用本地 draft 跟手显示",
+    /const \[draft, setDraft\] = React\.useState\(committed\)/.test(clientSrc) &&
+    /draftRef\.current = next;/.test(clientSrc) &&
+    /value: draft,/.test(clientSrc) && /draft \+ "%"/.test(clientSrc));
+  ok("客户端：拖动 onChange 只更新本地、不写宿主配置",
+    /onChange: \(ev\) => \{\s*dragging\.current = true;\s*update\(ev\.target\.value\);/.test(clientSrc) &&
+    (clientSrc.match(/save\("soundVolume"/g) || []).length === 1);
+  ok("客户端：音量提交防抖 120ms 且只提交一次",
+    /}, 120\);/.test(clientSrc) &&
+    /if \(next === committedRef\.current\) return;/.test(clientSrc) &&
+    /committedRef\.current = next;[\s\S]{0,80}onCommit\(next\);/.test(clientSrc));
+  ok("客户端：松手 / 键盘 / 失焦 / change 结束都走提交",
+    /onPointerUp: commit/.test(clientSrc) && /onKeyUp: commit/.test(clientSrc) &&
+    /onBlur: commit/.test(clientSrc) && /addEventListener\("change", onChangeEnd\)/.test(clientSrc));
+  ok("客户端：音量提交时保存一次并只试听一次",
+    /onCommit: \(volume\) => \{\s*save\("soundVolume", volume\);\s*playCompletionSound\(undefined, volume\);\s*\}/.test(clientSrc));
+  ok("客户端：外部配置在拖动/防抖期间不回写 draft",
+    /if \(!dragging\.current && !timer\.current\) \{\s*draftRef\.current = committed;\s*setDraft\(committed\);\s*\}/.test(clientSrc));
+  ok("客户端：音色「关闭」不再写 sound 开关", /if \(id === "off"\) return;/.test(clientSrc));
+  ok("客户端：预算卡片网格", /dma-stats-kpis dma-stats-money/.test(clientSrc) && !/dma-stats-budget-ledger/.test(clientSrc));
+  ok("客户端：预算卡可编辑金额", /dma-stats-money-edit/.test(clientSrc) && /budgetEditing/.test(clientSrc));
+  ok("客户端：预算卡有「修改预算」小按钮", /className: "dma-stats-money-value-row"/.test(clientSrc) &&
+    /className: "dma-stats-money-mini"/.test(clientSrc) &&
+    !/dma-stats-money-apply/.test(clientSrc) && !/dma-stats-money-trigger/.test(clientSrc));
+  ok("客户端：「修改预算」与「保存」复用同一小按钮类",
+    (clientSrc.match(/className: "dma-stats-money-mini"/g) || []).length >= 2 &&
+    !/dma-stats-money-save/.test(clientSrc) &&
+    !/\.dma-stats-money-value-row \.dma-setting-primary/.test(clientSrc));
+  ok("客户端：预算小按钮尺寸 25px 高 / 11.5px 字 / 6px 圆角",
+    /\.dma-stats-money-mini\{[^}]*height:25px[^}]*padding:0 9px[^}]*border-radius:6px[^}]*font-size:11\.5px/.test(clientSrc));
+  ok("客户端：「修改预算」与金额同一行，不再独占一行",
+    /className: "dma-stats-money-value-row"[\s\S]{0,700}dma-stats-money-mini/.test(clientSrc) &&
+    /\.dma-stats-money-value-row\{display:flex;align-items:center/.test(clientSrc));
+  ok("客户端：预算输入框宽度 92px（最窄 64px、13px 字）",
+    /\.dma-stats-money-input\{[^}]*flex:0 1 92px[^}]*box-sizing:border-box;width:92px;min-width:64px[^}]*font-size:13px/.test(clientSrc) &&
+    /\.dma-stats-money-input input\{[^}]*width:0[^}]*font-size:13px/.test(clientSrc));
+  ok("客户端：最窄卡片下预算行由容器查询收紧间距",
+    /\.dma-stats-money-card\{container-type:inline-size\}/.test(clientSrc) &&
+    /@container \(max-width:181px\)\{\.dma-stats-money-edit-row\{gap:4px\}/.test(clientSrc));
+  ok("客户端：预算编辑态强制同行（nowrap）且控件间距 7px",
+    /\.dma-stats-money-edit-row\{display:flex;flex-wrap:nowrap;align-items:center;gap:7px/.test(clientSrc));
+  ok("客户端：预算输入框不再使用 64px 基础宽度",
+    !/flex:0 1 64px/.test(clientSrc) && !/width:64px;min-width:40px/.test(clientSrc));
+  ok("客户端：预算编辑态保存 + 取消同行，取消为小号次级描边",
+    /tt\("stats\.budgetSave"\)\),[\s\S]{0,260}className: "dma-stats-money-cancel"/.test(clientSrc) &&
+    /\.dma-stats-money-cancel\{[^}]*height:25px[^}]*padding:0 7px[^}]*border:\.5px solid[^}]*font-size:11px/.test(clientSrc));
+  ok("客户端：预算说明压缩为一行（不换行截断）",
+    /\.dma-stats-money-hint\{[^}]*font-size:10px[^}]*white-space:nowrap/.test(clientSrc));
+  ok("客户端：时间线有计费口径细条（DeepSeek 深蓝 / 本地灰）",
+    /dma-stats-billing-bar/.test(clientSrc) &&
+    /\.dma-stats-billing-deepseek\{background:#2f6bd8\}/.test(clientSrc) &&
+    /\.dma-stats-billing-local\{background:#a8aeb8\}/.test(clientSrc));
+  ok("客户端：时间线图例区分 DeepSeek 计费与本地不计费",
+    /tt\("stats\.billingDeepseek"\)/.test(clientSrc) && /tt\("stats\.billingLocal"\)/.test(clientSrc));
+  ok("客户端：计费说明并入四色图例同一行并右对齐",
+    /className: "dma-stats-legend-row"[\s\S]{0,300}e\(StatsLegend, \{ t: tt \}\)[\s\S]{0,200}dma-stats-legend-billing/.test(clientSrc) &&
+    /\.dma-stats-legend-row\{[^}]*justify-content:space-between/.test(clientSrc) &&
+    /\.dma-stats-legend-billing\{flex:none;margin-left:auto\}/.test(clientSrc));
+  ok("客户端：会话表本地行成本显示「本地」并加灰色标记",
+    /tt\("stats\.localCost"\)/.test(clientSrc) &&
+    /dma-stats-pill-local/.test(clientSrc) && /tt\("stats\.localTag"\)/.test(clientSrc));
+  ok("客户端：统计表说明写明仅 DeepSeek 官方模型计费", /tt\("stats\.billingNote"\)/.test(clientSrc));
+  ok("文案：仅 DeepSeek 计费说明（英）",
+    String(i18n.en["stats.billingNote"]).indexOf("Only official DeepSeek models are billed") >= 0);
+  eq("文案：预算说明已缩短（中）", i18n.zh["stats.budgetHint"], "按全部会话估算成本；填 0 隐藏占比");
+  ok("客户端：「修改预算」按钮为主要入口（与点金额共用）",
+    /const openBudgetEdit = \(\) => \{/.test(clientSrc) &&
+    (clientSrc.match(/onClick: openBudgetEdit/g) || []).length === 2);
+  ok("客户端：预算编辑态回车保存 / Esc 取消 / 保存取消按钮",
+    /ev\.key === "Enter"\) saveBudget\(\);/.test(clientSrc) &&
+    /ev\.key === "Escape"/.test(clientSrc) &&
+    /dma-stats-money-cancel/.test(clientSrc) && /tt\("stats\.budgetSaving"\)/.test(clientSrc));
+  ok("客户端：第一行顺序 总Token → 会话 → 预算 → 预算使用",
+    /className: "dma-stats-kpis"[\s\S]{0,220}kpi\.slice\(0, 2\)\.map\(statsCard\),[\s\S]{0,220}budgetCardNode,[\s\S]{0,90}budgetUsageCardNode/.test(clientSrc));
+  ok("客户端：第二行顺序 余额 → 日用 → 单次 → 估算成本",
+    (() => {
+      const at = clientSrc.indexOf('className: "dma-stats-kpis dma-stats-money"');
+      if (at < 0) return false;
+      const end = clientSrc.indexOf("!loading && data", at);
+      const seg = clientSrc.slice(at, end < 0 ? at + 1200 : end);
+      const a = seg.indexOf('tt("cost.balance")');
+      const b = seg.indexOf('tt("cost.daily")');
+      const c = seg.indexOf('tt("cost.perTurn")');
+      const d = seg.indexOf("statsCard(kpi[2])");
+      return a >= 0 && a < b && b < c && c < d;
+    })());
+  ok("客户端：预算卡与预算使用卡各定义一次（无重复内联）",
+    (clientSrc.match(/className: "dma-stats-money-edit-row"/g) || []).length === 1 &&
+    (clientSrc.match(/dma-stats-budget-input/g) || []).length === 1 &&
+    (clientSrc.match(/const budgetUsageCardNode/g) || []).length === 1);
+  ok("样式：余额校正区块已完全移除（无死样式）",
+    !/\.dma-correction/.test(clientSrc) && !/dma-cost-badge/.test(clientSrc) &&
+    /\.dma-setting-primary\{/.test(clientSrc));
+  ok("样式：设置分组分割线唯一来源是设置行 border-bottom",
+    (clientSrc.match(/\.dma-setting-row\{[^}]*border-bottom:\.5px solid/g) || []).length === 1);
+  ok("客户端：顶部 KPI 不再含预算使用项",
+    (() => {
+      const at = clientSrc.indexOf("const kpi = [");
+      if (at < 0) return false;
+      const block = clientSrc.slice(at, clientSrc.indexOf("];", at));
+      return block.split("label:").length - 1 === 3 && !/stats\.budget"/.test(block);
+    })());
+  eq("文案：修改预算中文", i18n.zh["stats.moneyEdit"], "修改预算");
+  eq("文案：修改预算英文", i18n.en["stats.moneyEdit"], "Edit budget");
+  ok("客户端：预算/余额/日用/单次四卡", /tt\("stats\.moneyBudget"\)/.test(clientSrc) && /tt\("cost\.balance"\)/.test(clientSrc) &&
+    /tt\("cost\.daily"\)/.test(clientSrc) && /tt\("cost\.perTurn"\)/.test(clientSrc));
+  ok("客户端：卡片数字与侧边栏同源", /ledger\.balanceCents/.test(clientSrc) && /ledger\.dailyCents/.test(clientSrc) &&
+    /ledger\.lastTurnMicros/.test(clientSrc) && /formatYuanCents\(ledger\.dailyCents/.test(clientSrc));
+  ok("文案：赠金提示 zh/en 均有", (i18nSrc.match(/'cost\.bonusHint':/g) || []).length === 2);
+  ok("文案：音色选项 zh/en 均有", (i18nSrc.match(/'settings\.soundTone\.double':/g) || []).length === 2);
+  ok("文案：音色说明 zh/en 均有", (i18nSrc.match(/'settings\.soundToneDesc':/g) || []).length === 2 &&
+    !/等同.*上方开关/.test(i18nSrc));
+  ok("文案：音量项 zh/en 均有", (i18nSrc.match(/'settings\.soundVolume':/g) || []).length === 2 &&
+    (i18nSrc.match(/'settings\.soundVolumeDesc':/g) || []).length === 2);
+  ok("文案：金额卡文案 zh/en 均有", (i18nSrc.match(/'stats\.moneyEdit':/g) || []).length === 2 &&
+    (i18nSrc.match(/'stats\.moneyBudget':/g) || []).length === 2);
+}
+
+// ---------------------------------------------------------------------------
+// 51. 单条回答金额：只算该条自己的 usage，本地路由不显示金额
+// ---------------------------------------------------------------------------
+
+{
+  const at = bj(2026, 11, 2, 10, 0); // 周一高峰
+  const events = [
+    ev("system/message", { message: { content: [{ type: "text", text: "sys" }] } }),
+    ev("turn/start", { turn: 1 }),
+    ev("user/message", { role: "user", id: "u1", content: [{ type: "text", text: "q" }], source: { kind: "user" } }),
+    {
+      type: "assistant/message",
+      time: at,
+      data: {
+        turn: 1,
+        step: 1,
+        usage: { inputTokens: 1000000, outputTokens: 0 },
+        message: { content: [{ type: "text", text: "DeepSeek 回答" }], source: { provider: "deepseek-account", model: "deepseek-flash" } }
+      }
+    },
+    {
+      type: "assistant/message",
+      time: at,
+      data: {
+        turn: 1,
+        step: 2,
+        usage: { inputTokens: 1000000, outputTokens: 0 },
+        message: { content: [{ type: "text", text: "本地回答" }], source: { provider: "ninfer-27b", model: "ninfer-27b" } }
+      }
+    },
+    ev("assistant/message", { turn: 1, step: 3, message: { content: [{ type: "text", text: "无用量" }] } }),
+    ev("turn/end", { turn: 1 })
+  ];
+  const { events: bag, nodes } = session(events);
+  const summary = messagesSummaryOf(bag, nodes);
+  const row = (seq) => summary.rows.find((item) => item.seq === seq);
+
+  eq("单条金额：DeepSeek 高峰百万输入", row(3).costMicros, 2000000);
+  eq("单条金额：DeepSeek 计入", row(3).billable, true);
+  eq("单条金额：本地路由为 0", row(4).costMicros, 0);
+  eq("单条金额：本地路由不计费", row(4).billable, false);
+  eq("单条金额：无 usage 不显示", row(5).costMicros, null);
+  eq("单条金额：无 usage 不计费标记", row(5).billable, null);
+  eq("单条金额：问行不计算", row(2).costMicros, null);
+
+  eq("formatReplyCost 0", s.formatReplyCost(0), "¥0.0000");
+  eq("formatReplyCost 不足万分之一元", s.formatReplyCost(50), "<¥0.0001");
+  eq("formatReplyCost 4 位小数", s.formatReplyCost(2300), "¥0.0023");
+  eq("formatReplyCost 进位到 4 位", s.formatReplyCost(250000), "¥0.2500");
+  eq("formatReplyCost 非法值返回空", s.formatReplyCost(undefined), "");
+  eq("formatReplyCost 负值按 0", s.formatReplyCost(-1), "¥0.0000");
+}
+
+// ---------------------------------------------------------------------------
+// 52. 撤回附件：正文不留占位符，图片/文件按 id 交给客户端恢复
+// ---------------------------------------------------------------------------
+
+{
+  const events = [
+    ev("system/message", { message: { content: [{ type: "text", text: "sys" }] } }),
+    ev("turn/start", { turn: 1 }),
+    ev("user/message", {
+      role: "user",
+      id: "u1",
+      content: [
+        { type: "text", text: "看图" },
+        {
+          type: "image",
+          attachment: {
+            attachmentId: "sha256:aaa",
+            mediaType: "image/png",
+            name: "报错.png",
+            bytes: 1234,
+            width: 800,
+            height: 600
+          }
+        },
+        { type: "text", text: "还有" },
+        {
+          type: "file",
+          attachment: {
+            attachmentId: "sha256:bbb",
+            mediaType: "application/pdf",
+            name: "柱状图.pdf",
+            bytes: 5678
+          }
+        },
+        {
+          type: "image",
+          attachment: { attachmentId: "sha256:aaa", mediaType: "image/png", name: "报错.png" }
+        }
+      ],
+      source: { kind: "user" }
+    }),
+    ev("assistant/message", { turn: 1, step: 1, message: { content: [{ type: "text", text: "好的" }] } }),
+    ev("turn/end", { turn: 1 })
+  ];
+  const { events: bag, nodes } = session(events);
+  const plan = planAction(bag, nodes, { action: "recall", seq: 2 });
+
+  ok("撤回附件：返回 ok", plan.ok === true);
+  eq("撤回附件：正文不含占位符", plan.refillText, "看图还有");
+  eq("撤回附件：描述去重且保序", plan.attachments, [
+    {
+      kind: "image",
+      attachmentId: "sha256:aaa",
+      name: "报错.png",
+      mediaType: "image/png",
+      bytes: 1234,
+      width: 800,
+      height: 600
+    },
+    {
+      kind: "file",
+      attachmentId: "sha256:bbb",
+      name: "柱状图.pdf",
+      mediaType: "application/pdf",
+      bytes: 5678,
+      width: undefined,
+      height: undefined
+    }
+  ]);
+  eq("撤回附件：分享/导出文本仍保留占位符", textOf(bag[2]), "看图[图片]还有[文件][图片]");
+  eq("撤回附件：无附件时为空数组", s.attachmentsOfEvent(bag[4]), []);
+  eq("撤回附件：非用户消息为空数组", s.attachmentsOfEvent({ type: "assistant/message", data: { content: [] } }), []);
+  eq("删除不返回附件", planAction(bag, nodes, { action: "delete", seq: 2 }).attachments, undefined);
+}
+
+// ---------------------------------------------------------------------------
+// 53. 影响面断言：附件路由、客户端恢复通道、单条金额展示
+// ---------------------------------------------------------------------------
+
+{
+  const root = fileURLToPath(new URL("..", import.meta.url));
+  const indexSrc = fs.readFileSync(path.join(root, "src", "index.mjs"), "utf8");
+  const clientSrc = fs.readFileSync(path.join(root, "src", "client.js"), "utf8");
+  const i18nSrc = fs.readFileSync(path.join(root, "src", "i18n.cjs"), "utf8");
+
+  ok("宿主：附件路由常量", /const ATTACHMENT_ROUTE = "\/dsh-message-actions\/attachment"/.test(indexSrc));
+  ok("宿主：附件处理器存在", /function makeAttachmentHandler\(ctx\)/.test(indexSrc));
+  ok("宿主：图片走 readImage", /store\.readImage\(found\.ref\)/.test(indexSrc) && /typeof store\.readImage !== "function"/.test(indexSrc));
+  ok("宿主：文件走 readFileStream", /store\.readFileStream\(found\.ref\)/.test(indexSrc) && /typeof store\.readFileStream !== "function"/.test(indexSrc));
+  ok("宿主：注册附件路由", /path: ATTACHMENT_ROUTE/.test(indexSrc));
+  ok("宿主：动作响应带回附件", /attachments: plan\.attachments \|\| \[\]/.test(indexSrc));
+  ok("宿主：附件错误码已本地化", /ATTACHMENT_NOT_FOUND/.test(indexSrc) && /ATTACHMENT_UNAVAILABLE/.test(indexSrc) && /ATTACHMENT_READ_FAILED/.test(indexSrc));
+
+  ok("客户端：撤回后恢复附件", /restoreRecallAttachments\(this\.sessionId, value\.attachments\)/.test(clientSrc));
+  ok("客户端：附件回读路由常量", /const ATTACHMENT_PATH = "\/dsh-message-actions\/attachment"/.test(clientSrc));
+  ok("客户端：交给官方 drop 通道", /new DragEvent\("drop"/.test(clientSrc) && /document\.dispatchEvent\(event\)/.test(clientSrc));
+  ok("客户端：构造 File 恢复附件", /new File\(\[blob\], name, \{ type: meta\.mediaType/.test(clientSrc));
+  ok("客户端：单条金额用 4 位格式", /formatReplyCost\(row\.costMicros\)/.test(clientSrc));
+  ok("客户端：本地路由显示「本地」", /row\.billable === false \? tt\("stats\.localCost"\)/.test(clientSrc));
+  ok("客户端：单条金额并入统计行", /words \+ " " \+ tt\("stats\.unit"\),[\s\S]{0,40}replyCost/.test(clientSrc));
+
+  eq("文案：单条金额说明中文", i18n.zh["stats.replyCostTitle"], "本条回答估算 {cost}；同一轮的合计见侧边栏「单次」");
+  ok("文案：单条金额说明中英均有", (i18nSrc.match(/'stats\.replyCostTitle':/g) || []).length === 2 &&
+    i18n.zh["stats.replyCostTitle"].includes("{cost}") &&
+    i18n.en["stats.replyCostTitle"].includes("{cost}"));
+  eq("文案：附件不存在中文", s.ERROR_LABELS.zh.ATTACHMENT_NOT_FOUND, "附件不存在或已失效");
+  eq("文案：附件不存在英文", s.ERROR_LABELS.en.ATTACHMENT_NOT_FOUND, "Attachment not found or no longer available");
+}
+
+// ---------------------------------------------------------------------------
+// 54. 确认弹窗宽度：收回/删除/删至末尾共用窄面板，窄屏按钮不挤
+// ---------------------------------------------------------------------------
+
+{
+  const root = fileURLToPath(new URL("..", import.meta.url));
+  const sharedSrc = fs.readFileSync(path.join(root, "src", "shared.cjs"), "utf8");
+  const clientSrc = fs.readFileSync(path.join(root, "src", "client.js"), "utf8");
+
+  ok("确认弹窗：窄面板宽度 420px", /\.dma-confirm\{width:min\(420px,calc\(100vw - 48px\)\)\}/.test(sharedSrc));
+  ok("确认弹窗：窄屏改为满宽减 32px", /@media \(max-width:480px\)\{\.dma-confirm\{width:calc\(100vw - 32px\)\}/.test(sharedSrc));
+  ok("确认弹窗：窄屏按钮间距与内边距收紧", /\.dma-panel-foot\{gap:8px\}/.test(sharedSrc) && /\.dma-panel-foot \.dma-btn\{padding:0 12px\}/.test(sharedSrc));
+  ok("确认弹窗：三个动作共用 dma-confirm", /className: "dma-panel dma-confirm"/.test(clientSrc));
+  ok("确认弹窗：不影响分享/导出面板 680px", /\.dma-panel\{width:min\(680px,calc\(100vw - 48px\)\);/.test(sharedSrc));
 }
 
 // ---------------------------------------------------------------------------
