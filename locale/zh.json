@@ -1,6 +1,6 @@
 {
   "meta": {
-    "title": "消息费用",
-    "description": "撤回、删除、删至末尾；多选分享与导出对话；回答统计；DeepSeek 账户余额、日用与单次费用统计。"
+    "title": "dsh-message-actions",
+    "description": "对话完成声音提示；每条回答的 token、字数与费用；单次花费、统计表、预算与余额；撤回、删除、删至末尾；多选分享与导出对话。"
   }
 }

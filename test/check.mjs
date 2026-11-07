@@ -1271,8 +1271,13 @@ function fakeRes() {
   eq("i18n zh / en 键完全一致", zhKeys, enKeys);
   ok("i18n zh 非空", zhKeys.length > 50);
   ok("i18n en 非空", enKeys.length > 50);
-  ok("i18n meta.zh.title", typeof i18n.meta.zh.title === "string" && i18n.meta.zh.title.length > 0);
-  ok("i18n meta.en.title", typeof i18n.meta.en.title === "string" && i18n.meta.en.title.length > 0);
+  eq("i18n meta.zh.title 为插件名", i18n.meta.zh.title, "dsh-message-actions");
+  eq("i18n meta.en.title 为插件名", i18n.meta.en.title, "dsh-message-actions");
+  ok("i18n meta.zh.description 覆盖声音、费用、统计与撤回", ["声音", "费用", "统计表", "预算", "撤回", "分享"].every((w) => i18n.meta.zh.description.includes(w)));
+  ok("i18n meta.en.description 覆盖声音、费用、统计与撤回", ["Completion sound", "cost", "stats panel", "budget", "recall", "share"].every((w) => i18n.meta.en.description.includes(w)));
+  const iconSrc = fs.readFileSync(fileURLToPath(new URL("../icon.svg", import.meta.url)), "utf8");
+  ok("插件图标：对话气泡内嵌 ¥", /viewBox="0 0 64 64"/.test(iconSrc) &&
+    iconSrc.includes('fill="#2563eb"') && iconSrc.includes("M26 23l6 7 6-7"));
 
   const localeDir = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "locale");
   for (const lang of ["zh", "en"]) {
@@ -2265,9 +2270,14 @@ function pushTombstone(bag, plan, id, action) {
   ok("宿主：turn/end 走 settleSpend", /settleSpend\(state, \{/.test(indexSrc));
   ok("宿主：Config 声明 soundTone", /soundTone: z\.string\(\)\.default\("double"\)\.volatile\(\)/.test(indexSrc));
   ok("宿主：Config 声明 soundVolume", /soundVolume: z\.number\(\)\.min\(0\)\.max\(100\)\.default\(50\)\.volatile\(\)/.test(indexSrc));
-  ok("宿主：余额直接取充值口径（缺字段才退回总额）",
-    /const balanceCents = rechargeCents !== null \? rechargeCents : totalCents;/.test(indexSrc) &&
-    /const rechargeCents = sumCnyWallets\(result\.value\);/.test(indexSrc));
+  ok("宿主：余额主数字取总额（充值 + 赠金，缺总额才退回充值）",
+    /const balanceCents = totalCents !== null \? totalCents : rechargeCents;/.test(indexSrc) &&
+    /const rechargeCents = sumCnyWallets\(result\.value\);/.test(indexSrc) &&
+    /const bonusCents = sumCnyWallets\(result\.bonusWallets\);/.test(indexSrc));
+  ok("客户端：余额主数字取总额（充值 + 赠金）",
+    /totalCents !== null \? totalCents : rechargeCents/.test(clientSrc));
+  ok("统计表：余额卡不再单独拆赠金副行", !/ledger\.bonusCents > 0/.test(clientSrc) &&
+    /tt\("stats\.moneyBalanceSub"\)/.test(clientSrc));
   ok("客户端：首次交互预解锁音频", /installAudioUnlock\(\)/.test(clientSrc) && /addEventListener\("pointerdown", unlockAudio/.test(clientSrc));
   ok("客户端：基准增益 0.18", /double: \{ gain: 0\.18/.test(clientSrc));
   ok("客户端：增益按音量缩放", /spec\.gain \* scale/.test(clientSrc) && /soundGainScale\(vol\) > 0/.test(clientSrc));
@@ -2385,7 +2395,10 @@ function pushTombstone(bag, plan, id, action) {
     /tt\("cost\.daily"\)/.test(clientSrc) && /tt\("cost\.perTurn"\)/.test(clientSrc));
   ok("客户端：卡片数字与侧边栏同源", /ledger\.balanceCents/.test(clientSrc) && /ledger\.dailyCents/.test(clientSrc) &&
     /ledger\.lastTurnMicros/.test(clientSrc) && /formatYuanCents\(ledger\.dailyCents/.test(clientSrc));
-  ok("文案：赠金提示 zh/en 均有", (i18nSrc.match(/'cost\.bonusHint':/g) || []).length === 2);
+  ok("文案：赠金提示 zh/en 均有且为合并口径", (i18nSrc.match(/'cost\.bonusHint':/g) || []).length === 2 &&
+    i18n.zh["cost.bonusHint"] === "含赠金 {bonus}" && i18n.en["cost.bonusHint"] === "incl. bonus {bonus}");
+  eq("文案：统计表余额副行中文", i18n.zh["stats.moneyBalanceSub"], "账户总余额（含赠金）");
+  eq("文案：统计表余额副行英文", i18n.en["stats.moneyBalanceSub"], "Total balance (incl. bonus)");
   ok("文案：音色选项 zh/en 均有", (i18nSrc.match(/'settings\.soundTone\.double':/g) || []).length === 2);
   ok("文案：音色说明 zh/en 均有", (i18nSrc.match(/'settings\.soundToneDesc':/g) || []).length === 2 &&
     !/等同.*上方开关/.test(i18nSrc));
@@ -2571,6 +2584,33 @@ function pushTombstone(bag, plan, id, action) {
   ok("确认弹窗：窄屏按钮间距与内边距收紧", /\.dma-panel-foot\{gap:8px\}/.test(sharedSrc) && /\.dma-panel-foot \.dma-btn\{padding:0 12px\}/.test(sharedSrc));
   ok("确认弹窗：三个动作共用 dma-confirm", /className: "dma-panel dma-confirm"/.test(clientSrc));
   ok("确认弹窗：不影响分享/导出面板 680px", /\.dma-panel\{width:min\(680px,calc\(100vw - 48px\)\);/.test(sharedSrc));
+}
+
+// ---------------------------------------------------------------------------
+// 55. 浮层 portal 挂载与视口约束（宿主输入区 will-change/overflow 兼容）
+// ---------------------------------------------------------------------------
+
+{
+  const root = fileURLToPath(new URL("..", import.meta.url));
+  const sharedSrc = fs.readFileSync(path.join(root, "src", "shared.cjs"), "utf8");
+  const clientSrc = fs.readFileSync(path.join(root, "src", "client.js"), "utf8");
+
+  ok("浮层：从 react-dom 探测 createPortal", /require\("react-dom"\)/.test(clientSrc) &&
+    /typeof ReactDOM\.createPortal === "function"/.test(clientSrc));
+  ok("浮层：portal 到 document.body 且失败回退槽位", /ReactDOM\.createPortal\(node, document\.body\)/.test(clientSrc) &&
+    /return node;/.test(clientSrc));
+  ok("浮层：确认框与分享/导出共用 mountOverlay 单一路径",
+    /function mountOverlay\(node\)/.test(clientSrc) &&
+    /return panel \? mountOverlay\(panel\) : null;/.test(clientSrc) &&
+    !/return e\(ConfirmOverlay,/.test(clientSrc) && !/return e\(PickOverlay,/.test(clientSrc));
+  ok("浮层：遮罩按视口铺满并居中滚动",
+    /\.dma-overlay\{position:fixed;inset:0;/.test(sharedSrc) &&
+    /display:grid;place-items:center;padding:16px;overflow:auto/.test(sharedSrc));
+  ok("浮层：面板限高且正文可滚动、头尾固定",
+    /max-height:calc\(100vh - 32px\)/.test(sharedSrc) &&
+    /\.dma-panel-head\{flex:none/.test(sharedSrc) &&
+    /\.dma-panel-body\{flex:1 1 auto;min-height:0;overflow:auto/.test(sharedSrc) &&
+    /\.dma-panel-foot\{flex:none/.test(sharedSrc));
 }
 
 // ---------------------------------------------------------------------------

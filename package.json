@@ -1,7 +1,7 @@
 {
   "name": "dsh-message-actions",
-  "version": "0.2.2",
-  "description": "消息费用：撤回、删除、删至末尾、分享、导出、回答统计与 DeepSeek 费用统计（DSH 插件）。",
+  "version": "0.2.3",
+  "description": "对话完成声音提示；每条回答的 token、字数与费用；单次花费、统计表、预算与余额；撤回、删除、删至末尾；多选分享与导出对话。",
   "type": "module",
   "license": "MIT",
   "repository": {

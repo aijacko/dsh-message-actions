@@ -8,12 +8,12 @@
 
 const meta = {
   zh: {
-    title: '消息费用',
-    description: '撤回、删除、删至末尾；多选分享与导出对话；回答统计；DeepSeek 账户余额、日用与单次费用统计。'
+    title: 'dsh-message-actions',
+    description: '对话完成声音提示；每条回答的 token、字数与费用；单次花费、统计表、预算与余额；撤回、删除、删至末尾；多选分享与导出对话。'
   },
   en: {
-    title: 'Messages & Cost',
-    description: 'Recall, delete, and delete-to-end messages; multi-select share and export; per-answer statistics; DeepSeek balance, daily spend, and per-turn cost.'
+    title: 'dsh-message-actions',
+    description: 'Completion sound; per-reply tokens, words, and cost; per-turn spend, stats panel, budget, and balance; recall, delete, and delete-to-end; multi-select share and export.'
   }
 };
 
@@ -77,7 +77,7 @@ const zh = {
   'cost.tab.actions': '消息操作',
   'cost.tab.billing': '费用统计',
   'cost.balance': '余额',
-  'cost.bonusHint': '赠金 {bonus}',
+  'cost.bonusHint': '含赠金 {bonus}',
   'cost.daily': '日用',
   'cost.perTurn': '单次',
   'cost.peak': '高峰价',
@@ -105,7 +105,7 @@ const zh = {
   'cost.settings.layoutDesc': '单行样式去背景、所有数字排成一行；多行样式带背景卡片与峰谷文字行',
   'cost.layout.default': '多行样式',
   'cost.layout.compact': '单行样式',
-  'cost.balanceNote': '余额直接读取 DeepSeek 账户的充值余额（按官方规则截断至分，不含赠金；赠金另以悬停提示）。「日用」按账户余额实际下降观测，「单次」按官方价目换算，两者口径不同，不要求逐轮对齐。',
+  'cost.balanceNote': '余额直接读取 DeepSeek 账户的可用总余额（充值余额 + 赠金钱包，逐钱包按官方规则截断至分；赠金已并入主数字，悬停提示给出拆分）。「日用」按同一总额的实际下降观测，「单次」按官方价目换算，两者口径不同，不要求逐轮对齐。',
   'cost.settings.statsTable': '统计表',
   'cost.settings.statsTableDesc': '查看 Token 用量、消耗时间线与各会话成本',
   'cost.settings.statsTableButton': '打开统计表',
@@ -156,7 +156,7 @@ const zh = {
   'stats.budgetUsed': '已用',
   'stats.budgetCancel': '取消',
   'stats.moneyBudget': '预算',
-  'stats.moneyBalanceSub': '充值余额',
+  'stats.moneyBalanceSub': '账户总余额（含赠金）',
   'stats.moneyDailySub': '今日累计',
   'stats.moneyTurnSub': '最近一轮',
   'stats.moneyEdit': '修改预算',
@@ -240,7 +240,7 @@ const en = {
   'cost.tab.actions': 'Message Actions',
   'cost.tab.billing': 'Cost Statistics',
   'cost.balance': 'Bal',
-  'cost.bonusHint': 'Bonus {bonus}',
+  'cost.bonusHint': 'incl. bonus {bonus}',
   'cost.daily': 'Today',
   'cost.perTurn': 'Turn',
   'cost.peak': 'Peak',
@@ -268,7 +268,7 @@ const en = {
   'cost.settings.layoutDesc': 'Single-line drops the background and keeps all numbers on one row; multi-line keeps the card and the pricing-period line',
   'cost.layout.default': 'Multi-line',
   'cost.layout.compact': 'Single-line',
-  'cost.balanceNote': 'Balance is read directly from the DeepSeek account recharge balance (truncated to the cent like the official page, excluding bonus credits, which are shown separately on hover). "Today" is observed from the actual balance drop; "Turn" is converted from official list prices — different bases, so they need not match turn by turn.',
+  'cost.balanceNote': 'Balance is the DeepSeek account total available balance (recharge wallets + bonus wallets, each truncated to the cent like the official page; bonus is merged into the main figure and broken out on hover). "Today" observes drops in that same total; "Turn" is converted from official list prices — different bases, so they need not match turn by turn.',
   'cost.settings.statsTable': 'Stats table',
   'cost.settings.statsTableDesc': 'Token usage, usage timeline and per-session cost',
   'cost.settings.statsTableButton': 'Open stats table',
@@ -319,7 +319,7 @@ const en = {
   'stats.budgetUsed': 'used',
   'stats.budgetCancel': 'Cancel',
   'stats.moneyBudget': 'Budget',
-  'stats.moneyBalanceSub': 'Recharge balance',
+  'stats.moneyBalanceSub': 'Total balance (incl. bonus)',
   'stats.moneyDailySub': 'Since midnight',
   'stats.moneyTurnSub': 'Latest turn',
   'stats.moneyEdit': 'Edit budget',

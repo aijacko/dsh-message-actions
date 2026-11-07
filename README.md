@@ -32,7 +32,7 @@ Features you don't use can be turned off in settings. Turn off cost statistics, 
 | **Cost card** | Balance / today / per-turn cost at a glance, with single-line and multi-line billing styles |
 | **Statistics** | Small icon at the end of the cost row opens a panel with token totals, a 24 h / 30 d timeline, per-session cost and budget usage, built from real local session logs |
 | **Peak / off-peak hint** | Peak in orange, off-peak in blue, showing whether now is expensive and when it switches |
-| **Balance scope** | The main figure is the official DeepSeek **top-up balance**, truncated to the cent like the official page; bonus credit is shown in the hover tooltip only, and there is no manual adjustment layer |
+| **Balance scope** | The main figure is the account's **total available balance** (top-up + bonus), each wallet truncated to the cent; bonus is merged into the main figure and broken out in the hover tooltip only, with no manual adjustment layer |
 | **Bilingual UI** | Follows the DSH language; interface and tooltips switch automatically |
 | **Overlay keyboard** | In the share / export overlay, `Enter` runs the primary action (Share image / Export); in a confirmation dialog it confirms, and `Esc` cancels. Enter is ignored while focus is in a text field, and when the primary action is disabled or busy |
 
@@ -63,7 +63,7 @@ New installations default to **single-line**; users who have already saved a pre
 
 | Item | Meaning |
 |---|---|
-| Bal | The DeepSeek account **top-up balance** (CNY), matching the official page; bonus credit is not merged into the main figure and only shown in the hover tooltip. Refreshed at a minimum interval of 60 seconds; clicking the card forces a refresh regardless of that interval |
+| Bal | The DeepSeek account **total available balance** (CNY top-up + bonus), each wallet truncated to the cent; bonus is merged into the main figure and broken out as "incl. bonus ¥x" in the hover tooltip. Refreshed at a minimum interval of 60 seconds; clicking the card forces a refresh regardless of that interval |
 | Today | Today's spend (Beijing time): credited **immediately** when a turn settles, then reconciled against balance drops without double counting |
 | Turn | Converted cost of the most recent turn; shown by default, can hide after 0–600 seconds |
 
@@ -72,13 +72,13 @@ New installations default to **single-line**; users who have already saved a pre
 - Peak / off-peak uses Beijing time: weekdays `09:00–12:00` and `14:00–18:00` are peak, everything else is off-peak; off-peak is `0.5×` the peak price.
 - "Today" is **settlement-first**: `turn/end` immediately credits the estimated cents to today's bucket, at the same moment as "Turn". Balance observations then only add `actual drop − already settled`; when the estimate is higher than reality nothing is subtracted, so the same turn is never counted twice.
 - When the balance goes up (top-up / refund), recorded spend is not reduced and no manual correction is kept; the next observation simply moves the baseline.
-- Money is parsed and displayed in integer **cents**, never rounded at the yuan level. The top-up balance is **truncated to the cent** exactly like the official page, so a raw `5.999…` shows as `¥5.99`, not `¥6.00`. Bonus credit is listed separately in the tooltip to stay aligned with the official account page.
+- Money is parsed and displayed in integer **cents**, never rounded at the yuan level. The main figure is **top-up + bonus**, with each wallet **truncated to the cent** exactly like the official page, so a raw `5.999…` shows as `¥5.99`, not `¥6.00`. Bonus is merged into the main figure and only broken out in the tooltip, not on a separate line.
 
 ---
 
 ## Statistics
 
-A small chart icon sits at the **end of the sidebar cost row** (`Bal ¥6.02 | Today ¥0.00 | Turn`); hovering it shows "Statistics", clicking opens a full-screen overlay. It can also be opened from **Settings → Messages & Cost → Cost Statistics** via the **Open stats table** button between the peak/off-peak row and the account-scope note; there is no separate toggle, and the icon is always available while the cost card is shown.
+A small chart icon sits at the **end of the sidebar cost row** (`Bal ¥6.02 | Today ¥0.00 | Turn`); hovering it shows "Statistics", clicking opens a full-screen overlay. It can also be opened from **Settings → dsh-message-actions → Cost Statistics** via the **Open stats table** button between the peak/off-peak row and the account-scope note; there is no separate toggle, and the icon is always available while the cost card is shown.
 
 - Data comes from the **real local session logs** through the host's official `sessionQuery` service — the same assistant usage records that feed the per-turn figure — so tokens, cost and the card agree.
 - **First row, four cards**: total tokens (with cache-hit share), session count (with running count), **budget** (amount + progress bar), **budget usage** (percent + remaining).
@@ -113,7 +113,7 @@ CPU, process memory, system load and uptime are deliberately **not** included; t
 npm install dsh-message-actions
 ```
 
-The published package is `dsh-message-actions@0.2.1`.
+The published package is `dsh-message-actions@0.2.3`.
 
 ### Self-hosted market index source (optional)
 
@@ -160,17 +160,18 @@ pnpm add "file:/path/to/dsh-message-actions"
 
 ### Balance scope
 
-The card's **Bal** is read directly from the DeepSeek account service and matches the official **Account & balance** page:
+The card's **Bal** is read directly from the DeepSeek account service and shows the **total available balance**:
 
-- Main figure = **top-up balance** (CNY wallets), **truncated to the cent** exactly like the official page: a raw `5.999…` renders `¥5.99`, not `¥6.00`.
-- Bonus credit (`bonusWallets`) is **not** merged into the main figure; it appears only in the hover tooltip.
-- There is **no manual correction layer**: top-ups and refunds simply move the observed baseline, so the figure always mirrors the official one and nothing typed can silently override it. The settings page keeps a short note explaining this scope.
+- Main figure = **top-up balance (CNY wallets) + bonus / reward wallets (`bonusWallets`)**, each wallet **truncated to the cent** exactly like the official page: a raw `5.999…` renders `¥5.99`, not `¥6.00`.
+- Bonus is **merged into the main figure**, not split onto its own line; the hover tooltip breaks it out as "incl. bonus ¥x" so it can still be compared with the official **Bonus balance** row.
+- "Today" observes drops in that same total, so the displayed balance and the accounting basis agree.
+- There is **no manual correction layer**: top-ups and refunds simply move the observed baseline, and nothing typed can silently override the figure. The settings page keeps a short note explaining this scope.
 
 ---
 
 ## Settings
 
-Settings → Plugins → **Messages & Cost**; the page has two tabs, and changes **save immediately and apply right away**.
+Settings → Plugins → **dsh-message-actions**; the page has two tabs, and changes **save immediately and apply right away**.
 
 **Message Actions**
 
@@ -196,7 +197,7 @@ Settings → Plugins → **Messages & Cost**; the page has two tabs, and changes
 | Auto-hide | Seconds before the turn cost hides (0–600, 0 = always) |
 | Peak/off-peak | Show the current pricing period and the next switch |
 | Statistics | The button reads "Open stats table" and opens the overlay; sits between the peak/off-peak row and the account-scope note. The settings row describes only what the data is; the budget note lives inside the overlay only |
-| Balance scope | Main figure = official top-up balance, truncated to the cent; bonus credit in the tooltip only; no manual correction |
+| Balance scope | Main figure = top-up + bonus, each wallet truncated to the cent; bonus broken out in the tooltip only, not on its own line; no manual correction |
 
 ---
 
@@ -260,7 +261,7 @@ This section only describes what the code actually does. It is risk reduction, n
 
 ```bash
 node build.mjs        # build to lib/
-node test/check.mjs   # offline assertions, 2897 currently
+node test/check.mjs   # offline assertions, 2909 currently
 # plus a real session-log regression: 18/18
 ```
 
@@ -276,9 +277,9 @@ test/check.mjs   # dependency-free assertion script
 ```
 
 
-- Version: `0.2.2` (published on both npm and GitHub Releases)
-- Release: [v0.2.2](https://github.com/aijacko/dsh-message-actions/releases/tag/v0.2.2)
-- Compatible with: tested on DSH `0.2.1-rc.5` desktop (profile `desktop`)
+- Version: `0.2.3` (published on both npm and GitHub Releases)
+- Release: [v0.2.3](https://github.com/aijacko/dsh-message-actions/releases/tag/v0.2.3)
+- Compatible with: DSH `0.2.1-rc.5` and `0.2.2-rc.1`; `0.2.2-rc.1` (web profile) verified, older hosts take the portal fallback
 - Dependencies: none at runtime
 
 ---

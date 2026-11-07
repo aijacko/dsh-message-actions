@@ -19,6 +19,15 @@ window.__ModuleLoader__.load({
       ReactDOMClient = null;
     }
 
+    // createPortal 来自 react-dom（不是 react-dom/client）。单独探测：
+    // 拿不到时浮层退回宿主槽位渲染，不影响按钮与弹窗功能。
+    let ReactDOM = null;
+    try {
+      ReactDOM = require("react-dom");
+    } catch {
+      ReactDOM = null;
+    }
+
     let PRIMITIVES = null;
     try {
       PRIMITIVES = require("@deepseek-ai/dsh-client-ui-primitives");
@@ -1532,7 +1541,26 @@ window.__ModuleLoader__.load({
       ));
     }
 
-    // 确认弹窗 + 分享/导出浮层控制器（input.overlay 槽位）
+    /**
+     * 确认框与分享/导出面板的唯一挂载路径。
+     * 新版宿主会给输入区容器加 `will-change: transform`，使 `position:fixed`
+     * 的包含块变成输入区而不是视口；portal 到 document.body 可彻底脱离该容器，
+     * 同时不受其 `overflow:hidden` 裁剪。
+     * 拿不到 createPortal / body 时原样返回，退回槽位渲染，保证旧宿主可用。
+     */
+    function mountOverlay(node) {
+      if (node && ReactDOM && typeof ReactDOM.createPortal === "function" &&
+          typeof document !== "undefined" && document.body) {
+        try {
+          return ReactDOM.createPortal(node, document.body);
+        } catch {
+          // 探测失败按旧路径渲染，弹窗不会消失。
+        }
+      }
+      return node;
+    }
+
+    // 确认弹窗 + 分享/导出浮层控制器（input.overlay 槽位只作为渲染触发点）
     function OverlayController(props) {
       const { t: tt, useOverlay, useData, confirmAction, dismiss, runShare, runExport } = props;
       const view = useOverlay((v) => v.view);
@@ -1540,17 +1568,16 @@ window.__ModuleLoader__.load({
 
       if (!view) return null;
 
+      let panel = null;
       if (view.kind === "confirm") {
-        return e(ConfirmOverlay, {
+        panel = e(ConfirmOverlay, {
           t: tt,
           view,
           onDismiss: dismiss,
           confirmAction
         });
-      }
-
-      if (view.kind === "pick") {
-        return e(PickOverlay, {
+      } else if (view.kind === "pick") {
+        panel = e(PickOverlay, {
           t: tt,
           mode: view.mode,
           seedTurn: view.turn,
@@ -1561,7 +1588,7 @@ window.__ModuleLoader__.load({
         });
       }
 
-      return null;
+      return panel ? mountOverlay(panel) : null;
     }
 
     // 分享/导出多选列表
@@ -2205,10 +2232,7 @@ window.__ModuleLoader__.load({
                   e("span", { className: "dma-stats-card-label" }, tt("cost.balance")),
                   e("span", { className: "dma-stats-card-value" },
                     Number.isFinite(ledger.balanceCents) ? formatYuanCents(ledger.balanceCents) : "—"),
-                  e("span", { className: "dma-stats-card-sub" },
-                    ledger.bonusCents > 0
-                      ? tt("cost.bonusHint", { bonus: formatYuanCents(ledger.bonusCents) })
-                      : tt("stats.moneyBalanceSub"))
+                  e("span", { className: "dma-stats-card-sub" }, tt("stats.moneyBalanceSub"))
                 )
                 : null,
               ledger
@@ -2670,13 +2694,13 @@ window.__ModuleLoader__.load({
       const status = value ? value.status : "stale";
       const lastTurn = value && value.lastTurn ? value.lastTurn : null;
 
-      // 余额口径：直接展示官方「充值余额」（不含赠金；赠金在提示里单列），
-      // 全部按分计，不做元级四舍五入。缺充值字段时才退回总额。
+      // 余额口径：主数字 = 充值余额 + 赠金钱包（与「日用」观测的总额同基准），
+      // 全部按分计，不做元级四舍五入；赠金拆分只在悬停提示，不再单独占行。
       const rechargeCents = balance && Number.isFinite(balance.rechargeCents) ? balance.rechargeCents : null;
       const bonusCents = balance && Number.isFinite(balance.bonusCents) ? balance.bonusCents : null;
       const totalCents = balance && Number.isFinite(balance.totalCents) ? balance.totalCents : null;
       const balanceCents = balance && balance.updatedAt > 0
-        ? (rechargeCents !== null ? rechargeCents : totalCents)
+        ? (totalCents !== null ? totalCents : rechargeCents)
         : null;
       const bonusTitle = bonusCents !== null && bonusCents > 0
         ? " · " + tt("cost.bonusHint", { bonus: formatYuanCents(bonusCents) })

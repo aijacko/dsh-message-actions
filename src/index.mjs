@@ -1058,8 +1058,8 @@ function createStatsService(ctx, cost, config) {
       const rechargeCents = Number.isFinite(b.rechargeCents) ? b.rechargeCents : null;
       const bonusCents = Number.isFinite(b.bonusCents) ? b.bonusCents : null;
       const totalCents = Number.isFinite(b.totalCents) ? b.totalCents : null;
-      // 与侧边栏费用卡片完全同一口径：直接展示官方「充值余额」（不含赠金）。
-      const balanceCents = rechargeCents !== null ? rechargeCents : totalCents;
+      // 与侧边栏费用卡片完全同一口径：充值余额 + 赠金钱包 = 账户可用总余额。
+      const balanceCents = totalCents !== null ? totalCents : rechargeCents;
       ledger = {
         balanceCents,
         rechargeCents,
