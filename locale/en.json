@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "Message Butler",
-    "description": "Features: recall, delete, delete-to-end, multi-select share and export; per-reply usage billing, balance and cost display, and a completion sound."
+    "description": "Features: recall, delete, delete-to-end, multi-select share and export; session management with a trash bin; per-reply usage billing, balance and cost display, and a completion sound."
   }
 }

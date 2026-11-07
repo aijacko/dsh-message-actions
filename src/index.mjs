@@ -4,6 +4,8 @@ import z from "@deepseek-ai/schemastery";
 import shared from "./shared.cjs";
 import store from "./store.cjs";
 import http from "./http.cjs";
+import sessionsPure from "./sessions.cjs";
+import { createSessionManager } from "./session-manager.mjs";
 
 const {
   sendJson,
@@ -1561,6 +1563,119 @@ function makeBillingHandler(ctx, cost) {
 }
 
 // ---------------------------------------------------------------------------
+// 会话管理路由
+// ---------------------------------------------------------------------------
+
+const SESSIONS_ROUTE = "/dsh-message-actions/sessions";
+const MAX_SESSION_BATCH = 50;
+
+/** 解析去重后的 id 数组；数量、类型或重复项不合法都返回 null。 */
+function readIdList(body, key) {
+  const list = body ? body[key] : null;
+  if (!Array.isArray(list) || list.length === 0 || list.length > MAX_SESSION_BATCH) return null;
+  const out = [];
+  const seen = new Set();
+  for (const value of list) {
+    if (typeof value !== "string" || value === "" || seen.has(value)) return null;
+    seen.add(value);
+    out.push(value);
+  }
+  return out;
+}
+
+function makeSessionsHandler(ctx, sessions) {
+  return async function handleSessions(req, res) {
+    if (req.method !== "GET" && req.method !== "POST") {
+      drainRequest(req);
+      sendMethodNotAllowed(res, "GET, POST");
+      return;
+    }
+    if (!isTrusted(req, ctx.webServer)) {
+      drainRequest(req);
+      sendForbidden(res);
+      return;
+    }
+    if (req.method === "GET") {
+      try {
+        sendJson(res, 200, { ok: true, value: await sessions.payload() });
+      } catch (err) {
+        ctx.logger?.warn?.(`[dsh-message-actions] session list failed: ${err instanceof Error ? err.message : String(err)}`);
+        sendError(res, 500, "INTERNAL");
+      }
+      return;
+    }
+
+    const contentType = (req.headers["content-type"] || "").split(";")[0].trim().toLowerCase();
+    if (contentType !== "application/json") {
+      drainRequest(req);
+      sendBadRequest(res);
+      return;
+    }
+    const body = await readJsonBody(req, res);
+    if (body === null) return;
+    if (!body || typeof body !== "object" || Array.isArray(body)) {
+      sendBadRequest(res);
+      return;
+    }
+
+    try {
+      if (body.action === "delete") {
+        const ids = readIdList(body, "sessionIds");
+        if (!ids || !ids.every(sessionsPure.isSessionId)) {
+          sendBadRequest(res);
+          return;
+        }
+        sendJson(res, 200, { ok: true, value: { results: await sessions.removeToTrash(ids) } });
+        return;
+      }
+      if (body.action === "restore") {
+        const ids = readIdList(body, "trashIds");
+        if (!ids || !ids.every(sessionsPure.isTrashId)) {
+          sendBadRequest(res);
+          return;
+        }
+        sendJson(res, 200, { ok: true, value: { results: await sessions.restore(ids) } });
+        return;
+      }
+      if (body.action === "purge") {
+        if (body.all === true) {
+          // 清空回收站需要一个显式口令，避免误触或伪造请求直接清空。
+          if (body.confirm !== "PURGE_ALL") {
+            sendError(res, 400, "CONFIRM_REQUIRED");
+            return;
+          }
+          sendJson(res, 200, { ok: true, value: await sessions.purge([], true) });
+          return;
+        }
+        if (body.confirm !== true) {
+          sendError(res, 400, "CONFIRM_REQUIRED");
+          return;
+        }
+        const ids = readIdList(body, "trashIds");
+        if (!ids || !ids.every(sessionsPure.isTrashId)) {
+          sendBadRequest(res);
+          return;
+        }
+        sendJson(res, 200, { ok: true, value: await sessions.purge(ids, false) });
+        return;
+      }
+      if (body.action === "move") {
+        if (!sessionsPure.isSessionId(body.sessionId) || !sessionsPure.isWorkspaceId(body.workspaceId)) {
+          sendBadRequest(res);
+          return;
+        }
+        sendJson(res, 200, { ok: true, value: await sessions.move(body.sessionId, body.workspaceId) });
+        return;
+      }
+      sendBadRequest(res);
+    } catch (err) {
+      ctx.logger?.warn?.(`[dsh-message-actions] session action failed: ${err instanceof Error ? err.message : String(err)}`);
+      sendError(res, 500, "INTERNAL");
+    }
+  };
+}
+
+// ---------------------------------------------------------------------------
 // 插件主体
 // ---------------------------------------------------------------------------
 
@@ -1568,6 +1683,9 @@ function apply(ctx, config) {
   // —— 费用统计 ——
   const cost = createCostService(ctx, config);
   const stats = createStatsService(ctx, cost, config);
+  const sessions = createSessionManager(ctx);
+  // 清理上次崩溃留下的暂存目录（只动一小时前的）。
+  sessions.sweepStaging().catch(() => {});
   // 启动即探测一次 provider → baseURL；失败静默，不影响任何路由注册。
   cost.refreshEndpoints(false).catch(() => {});
 
@@ -1628,6 +1746,15 @@ function apply(ctx, config) {
       handler: makeBillingHandler(ctx, cost)
     }),
     "dsh-message-actions: billing route"
+  );
+  // —— 会话管理（删除到回收站 / 恢复 / 彻底清理 / 移动到工作区）——
+  ctx.effect(
+    () => ctx.webServer.register({
+      kind: "exact",
+      path: SESSIONS_ROUTE,
+      handler: makeSessionsHandler(ctx, sessions)
+    }),
+    "dsh-message-actions: sessions route"
   );
 
   ctx.effect(() => {

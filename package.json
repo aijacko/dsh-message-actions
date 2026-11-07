@@ -1,7 +1,7 @@
 {
   "name": "dsh-message-actions",
-  "version": "0.2.5",
-  "description": "功能：撤回、删除、删至末尾、多选分享与导出，每条回答的用量计费、余额费用展示、对话完成声音提示等。",
+  "version": "0.2.6",
+  "description": "功能：撤回、删除、删至末尾、多选分享与导出，会话管理（回收站、恢复、移动到其他工作区），每条回答的用量计费、余额费用展示、对话完成声音提示等。",
   "type": "module",
   "license": "MIT",
   "repository": {
@@ -37,6 +37,8 @@
     "lib/shared.cjs",
     "lib/store.cjs",
     "lib/http.cjs",
+    "lib/sessions.cjs",
+    "lib/session-manager.mjs",
     "cordis.patch.yml",
     "locale/*.json",
     "icon.svg"

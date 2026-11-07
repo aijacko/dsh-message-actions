@@ -34,9 +34,24 @@ Features you don't use can be turned off in settings. Turn off cost statistics, 
 | **Peak / off-peak hint** | Peak in orange, off-peak in blue, showing whether now is expensive and when it switches |
 | **Balance scope** | The main figure is the account's **total available balance** (top-up + bonus), each wallet truncated to the cent; bonus is merged into the main figure and broken out in the hover tooltip only, with no manual adjustment layer |
 | **Bilingual UI** | Follows the DSH language; interface and tooltips switch automatically |
+| **Session management** | Sidebar footer entry: search sessions, group by workspace, delete to trash, restore, move to another workspace |
+| **Trash bin** | Deleted sessions move to `~/.dsh/dsh-message-actions-trash`; restore one, purge one, or empty all with explicit confirmation |
 | **Overlay keyboard** | In the share / export overlay, `Enter` runs the primary action (Share image / Export); in a confirmation dialog it confirms, and `Esc` cancels. Enter is ignored while focus is in a text field, and when the primary action is disabled or busy |
 
 Deletion uses **tombstone-style surface replacement**: it only appends a marker and hides the original span; it never rewrites the history log and doesn't affect other sessions. The marker is persisted in the session event log, so deleted content stays hidden after a page refresh, after switching to another conversation and back, and after restarting DSH. `/messages` and `full=1` both recompute the visible set from those markers instead of trusting the host surface alone.
+
+---
+
+## Session management
+
+Open the panel from the **Message Butler** entry at the sidebar footer (same area as the cost card) or Settings → Message Butler → **Sessions**:
+
+- **Delete a session**: moves it to the trash instead of destroying the log; live / running sessions are refused so an in-flight write is never broken.
+- **Trash**: restore one entry to its original location and workspace, purge one after confirmation, or empty the trash behind a second explicit confirmation. The trash lives at `~/.dsh/dsh-message-actions-trash` (directory `0700`, metadata `0600`), outside the session scan path, so the host never mistakes it for a project.
+- **Move to another workspace**: rebuilds the log with the official `create + append` path, verifies `header.cwd`, then switches the workspace index; on failure it rolls back and leaves the source untouched.
+- **Freshness**: trash and move results are written to disk immediately; on a few host builds the workspace membership index cannot refresh live, and the UI asks for a DSH restart.
+
+Known limits: the target workspace directory must exist; moving re-encodes the log, so very large sessions take a moment; the trash is managed by this plugin only and is not part of DSH's own session cleanup.
 
 ---
 
@@ -261,7 +276,7 @@ This section only describes what the code actually does. It is risk reduction, n
 
 ```bash
 node build.mjs        # build to lib/
-node test/check.mjs   # offline assertions, 2937 currently
+node test/check.mjs   # offline assertions, 2972 currently
 # plus a real session-log regression: 18/18
 ```
 
@@ -277,7 +292,7 @@ test/check.mjs   # dependency-free assertion script
 ```
 
 
-- Version: `0.2.5` (source version; not published)
+- Version: `0.2.6` (source version; not published)
 - Latest release: [v0.2.4](https://github.com/aijacko/dsh-message-actions/releases/tag/v0.2.4)
 - Compatible with: DSH `0.2.1-rc.5` and `0.2.2-rc.1`; `0.2.2-rc.1` (web profile) verified, older hosts take the portal fallback
 - Dependencies: none at runtime

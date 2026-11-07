@@ -17,6 +17,7 @@ const s = require("../src/shared.cjs");
 const store = require("../src/store.cjs");
 const http = require("../src/http.cjs");
 const i18n = require("../src/i18n.cjs");
+const sessionsPure = require("../src/sessions.cjs");
 
 const {
   planAction,
@@ -1273,8 +1274,8 @@ function fakeRes() {
   ok("i18n en 非空", enKeys.length > 50);
   eq("i18n meta.zh.title 为显示名", i18n.meta.zh.title, "消息管家");
   eq("i18n meta.en.title 为显示名", i18n.meta.en.title, "Message Butler");
-  eq("i18n meta.zh.description 按定稿原文", i18n.meta.zh.description, "功能：撤回、删除、删至末尾、多选分享与导出，每条回答的用量计费、余额费用展示、对话完成声音提示等。");
-  eq("i18n meta.en.description 与中文同义", i18n.meta.en.description, "Features: recall, delete, delete-to-end, multi-select share and export; per-reply usage billing, balance and cost display, and a completion sound.");
+  eq("i18n meta.zh.description 按定稿原文", i18n.meta.zh.description, "功能：撤回、删除、删至末尾、多选分享与导出，会话管理与回收站，每条回答的用量计费、余额费用展示、对话完成声音提示等。");
+  eq("i18n meta.en.description 与中文同义", i18n.meta.en.description, "Features: recall, delete, delete-to-end, multi-select share and export; session management with a trash bin; per-reply usage billing, balance and cost display, and a completion sound.");
   const iconSrc = fs.readFileSync(fileURLToPath(new URL("../icon.svg", import.meta.url)), "utf8");
   ok("插件图标：蓝底对话气泡内嵌三档滑块", /viewBox="0 0 64 64"/.test(iconSrc) &&
     iconSrc.includes('fill="#2563eb"') && iconSrc.includes("M23 23h18M23 30h18M23 37h18") &&
@@ -2679,10 +2680,89 @@ function pushTombstone(bag, plan, id, action) {
 }
 
 // ---------------------------------------------------------------------------
-// 56. 附件响应头安全（media type 白名单）
+// 56. 会话管理纯函数（参数校验 / 路径 / 回收站元数据 / 响应头）
 // ---------------------------------------------------------------------------
 
 {
+  const sp = sessionsPure;
+
+  ok("会话 id：接受 session-<uuid>", sp.isSessionId("session-0b9f5c1e-7d2a-4c31-9a0e-3f4b5c6d7e8f"));
+  ok("会话 id：拒绝路径穿越", !sp.isSessionId("../session-abc") && !sp.isSessionId("session/abc"));
+  ok("会话 id：拒绝控制字符与空值", !sp.isSessionId("session\nabc") && !sp.isSessionId(""));
+  ok("会话 id：拒绝超长值", !sp.isSessionId("a".repeat(200)));
+  ok("工作区 id：接受 uuid", sp.isWorkspaceId("5d0c4b1a-1f7e-4a3b-8894-2c2f8e8a9c11"));
+  ok("工作区 id：拒绝分隔符", !sp.isWorkspaceId("ws/one") && !sp.isWorkspaceId("ws\\one"));
+  ok("回收站 id：只接受 trash- 前缀", sp.isTrashId("trash-m3f8x-0b9f5c1e") && !sp.isTrashId("meta.json") &&
+    !sp.isTrashId("trash-../../x"));
+
+  const sep = path.sep;
+  const base = path.join(path.parse(process.cwd()).root, "data", "sessions");
+  ok("路径包含：自身为真", sp.isContainedPath(base, base));
+  ok("路径包含：子目录为真", sp.isContainedPath(base, path.join(base, "a", "b")));
+  ok("路径包含：同级前缀不算包含", !sp.isContainedPath(base, base + "2"));
+  ok("路径包含：.. 逃逸为假", !sp.isContainedPath(base, path.join(base, "..", "outside")));
+  ok("路径包含：非字符串为假", !sp.isContainedPath(null, base) && !sp.isContainedPath(base, 42));
+
+  eq("编码：安全字符原样保留", sp.encodeSegment("session-0b9f.5c"), "session-0b9f.5c");
+  eq("编码：分隔符转义", sp.encodeSegment("a/b\\c"), "a~002Fb~005Cc");
+  eq("编码：点目录转义", sp.encodeSegment(".."), "~002E~002E");
+  eq("编码：中文按码元转义", sp.encodeSegment("你"), "~4F60");
+  let encodeThrows = false;
+  try {
+    sp.encodeSegment("");
+  } catch {
+    encodeThrows = true;
+  }
+  ok("编码：空串抛错", encodeThrows);
+
+  eq("项目目录：Windows 路径",
+    sp.projectKeyOf("D:\\DATA\\Documents\\Projects\\DeepSeek Harness"),
+    "--D-DATA-Documents-Projects-DeepSeek~0020Harness--");
+  eq("项目目录：POSIX 路径", sp.projectKeyOf("/home/u/app"), "--home-u-app--");
+  eq("项目目录：根路径", sp.projectKeyOf("/"), "--root--");
+  ok("项目目录：不会生成 .. 段", sp.projectKeyOf("..") !== ".." && !sp.projectKeyOf("..").startsWith("."));
+  eq("会话目录：拼接", sp.sessionDirOf("/root", "/home/u/app", "session-1"),
+    path.join("/root", "--home-u-app--", "session-1"));
+  eq("会话目录：无 cwd", sp.sessionDirOf("/root", "", "session-1"),
+    path.join("/root", "_no-cwd", "session-1"));
+
+  eq("标题：字符串", sp.titleTextOf("  hello  "), "hello");
+  eq("标题：快照对象", sp.titleTextOf({ title: "会话标题" }), "会话标题");
+  eq("标题：嵌套快照", sp.titleTextOf({ value: { title: "嵌套" } }), "嵌套");
+  eq("标题：无效值", sp.titleTextOf(null) + sp.titleTextOf(42), "");
+
+  const meta = {
+    version: 1,
+    trashId: "trash-m3f8x-0b9f5c1e",
+    id: "session-1",
+    deletedAt: 1760000000000,
+    title: "标题",
+    header: { id: "session-1", cwd: "/home/u/app", createdAt: 1750000000000 },
+    originalDir: "/root/--home-u-app--/session-1",
+    sizeBytes: 1234,
+    workspaceId: "5d0c4b1a-1f7e-4a3b-8894-2c2f8e8a9c11",
+    workspaceTitle: "工作区"
+  };
+  const normalized = sp.normalizeTrashMeta(meta);
+  ok("回收站元数据：合法条目通过", normalized && normalized.id === "session-1" && normalized.sizeBytes === 1234);
+  ok("回收站元数据：版本不符拒绝", sp.normalizeTrashMeta({ ...meta, version: 2 }) === null);
+  ok("回收站元数据：header 不匹配拒绝", sp.normalizeTrashMeta({ ...meta, header: { ...meta.header, id: "session-2" } }) === null);
+  ok("回收站元数据：bad id 拒绝", sp.normalizeTrashMeta({ ...meta, id: "../x" }) === null);
+  ok("回收站元数据：时间非法拒绝", sp.normalizeTrashMeta({ ...meta, deletedAt: Number.NaN }) === null);
+  eq("回收站元数据：超长标题截断", sp.normalizeTrashMeta({ ...meta, title: "x".repeat(400) }).title.length, 300);
+
+  const sorted = sp.sortSessionsNewestFirst([
+    { id: "session-a", createdAt: 100 },
+    { id: "session-c", createdAt: "2026-01-02T00:00:00.000Z" },
+    { id: "session-b", createdAt: 300 }
+  ]);
+  eq("会话排序：新的在前", sorted.map((row) => row.id), ["session-c", "session-b", "session-a"]);
+  const trashSorted = sp.sortTrashNewestFirst([
+    { trashId: "trash-a", deletedAt: 1 },
+    { trashId: "trash-b", deletedAt: 9 }
+  ]);
+  eq("回收站排序：删除时间倒序", trashSorted.map((row) => row.trashId), ["trash-b", "trash-a"]);
+
   eq("附件类型：白名单栅格原样返回", s.attachmentMediaType("image/jpeg", "image"), "image/jpeg");
   eq("附件类型：SVG 降级", s.attachmentMediaType("image/svg+xml", "image"), "image/png");
   eq("附件类型：text/html 降级", s.attachmentMediaType("text/html", "file"), "application/octet-stream");

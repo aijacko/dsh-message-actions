@@ -5,6 +5,8 @@
 //   - lib/shared.cjs 共享纯函数（原样复制，供宿主 require）
 //   - lib/store.cjs  费用状态文件读写（原样复制，供宿主 require）
 //   - lib/http.cjs   HTTP 工具（原样复制，供宿主 require）
+//   - lib/sessions.cjs 会话管理纯函数（原样复制，供宿主 require）
+//   - lib/session-manager.mjs 会话管理宿主服务（由 src/session-manager.mjs 原样复制）
 //   - lib/client.js  客户端浏览器模块（将 shared.cjs / i18n.cjs 内联 + 注入构建时间戳）
 // 同时由 src/i18n.cjs 的 meta 生成 locale/zh.json 与 locale/en.json。
 //
@@ -51,6 +53,8 @@ writeFileSync(join(lib, "index.js"), read("src/index.mjs"));
 writeFileSync(join(lib, "shared.cjs"), sharedSource);
 writeFileSync(join(lib, "store.cjs"), read("src/store.cjs"));
 writeFileSync(join(lib, "http.cjs"), read("src/http.cjs"));
+writeFileSync(join(lib, "sessions.cjs"), read("src/sessions.cjs"));
+writeFileSync(join(lib, "session-manager.mjs"), read("src/session-manager.mjs"));
 writeFileSync(join(lib, "client.js"), client);
 
 // locale 文件只携带 meta（标题 / 描述），客户端 UI 文案由 i18n.cjs 内联。
@@ -86,5 +90,7 @@ console.log("  lib/index.js   (host ESM)");
 console.log("  lib/shared.cjs (shared pure functions)");
 console.log("  lib/store.cjs  (host cost state store)");
 console.log("  lib/http.cjs   (host HTTP helpers)");
+console.log("  lib/sessions.cjs (session manager pure functions)");
+console.log("  lib/session-manager.mjs (host session manager)");
 console.log("  lib/client.js  (browser client, shared + i18n inlined)");
 console.log("  locale/*.json  (generated from src/i18n.cjs meta)");

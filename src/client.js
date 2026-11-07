@@ -2737,6 +2737,637 @@ window.__ModuleLoader__.load({
       );
     }
 
+    // -------------------------------------------------------------------------
+    // 对话管理：删除到回收站 / 恢复 / 彻底清理 / 移动到工作区
+    // -------------------------------------------------------------------------
+
+    const SESSIONS_ROUTE = "/dsh-message-actions/sessions";
+    const SESSIONS_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" '
+      + 'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
+      + '<path d="M4 6.5h16v9.5H9.5L4 19z"/><path d="M8 10h8M8 12.8h5"/></svg>';
+
+    let sessionsHost = null;
+    let sessionsOpener = null;
+    const sessionsStore = createStore({ open: false, seq: 0 });
+
+    function openSessionsPanel(opener) {
+      if (typeof document === "undefined" || !document.body) return;
+      if (!ReactDOMClient || typeof ReactDOMClient.createRoot !== "function") return;
+      sessionsOpener = opener || (document.activeElement instanceof HTMLElement ? document.activeElement : null);
+      if (!sessionsHost) {
+        sessionsHost = document.createElement("div");
+        sessionsHost.className = "dma-sessions-root";
+        document.body.appendChild(sessionsHost);
+        ReactDOMClient.createRoot(sessionsHost).render(e(SessionsOverlay));
+      }
+      const snapshot = sessionsStore.getSnapshot();
+      sessionsStore.set({ open: true, seq: snapshot.seq + 1 });
+    }
+
+    function closeSessionsPanel() {
+      const snapshot = sessionsStore.getSnapshot();
+      if (!snapshot.open) return;
+      sessionsStore.set({ open: false, seq: snapshot.seq + 1 });
+      const opener = sessionsOpener;
+      sessionsOpener = null;
+      if (opener && typeof opener.focus === "function" && opener.isConnected) {
+        try {
+          opener.focus({ preventScroll: true });
+        } catch {
+          /* ignore */
+        }
+      }
+    }
+
+    function SessionsOverlay() {
+      const snapshot = React.useSyncExternalStore(sessionsStore.subscribe, sessionsStore.getSnapshot, sessionsStore.getSnapshot);
+      if (!snapshot.open) return null;
+      return e(SessionsPanel, { key: snapshot.seq, onClose: closeSessionsPanel });
+    }
+
+    /** 兼容 ISO 字符串与毫秒时间戳。 */
+    function sessionTime(value) {
+      if (typeof value === "number" && Number.isFinite(value)) return value;
+      if (typeof value === "string" && value !== "") {
+        const parsed = Date.parse(value);
+        return Number.isFinite(parsed) ? parsed : 0;
+      }
+      return 0;
+    }
+
+    function sessionClock(value) {
+      const ts = sessionTime(value);
+      return ts > 0 ? statsClock(ts) : "—";
+    }
+
+    function sessionSize(bytes) {
+      const n = Number(bytes);
+      if (!Number.isFinite(n) || n <= 0) return "—";
+      if (n < 1024) return n + " B";
+      if (n < 1024 * 1024) return (Math.round((n / 1024) * 10) / 10) + " KB";
+      return (Math.round((n / (1024 * 1024)) * 10) / 10) + " MB";
+    }
+
+    /** 服务端错误码 → 当前语言的文案；未知码原样返回。 */
+    function sessionErrorText(code) {
+      if (!code) return t("sessions.actionFailed");
+      const dict = ERROR_LABELS[detectLang()] || ERROR_LABELS.zh;
+      return dict[code] || code;
+    }
+
+    function sessionFailure(results) {
+      for (const item of Array.isArray(results) ? results : []) {
+        if (item && item.ok === false) return sessionErrorText(item.error);
+      }
+      return "";
+    }
+
+    async function fetchSessions() {
+      const res = await getJson(SESSIONS_ROUTE);
+      const payload = res.data;
+      if (res.status !== 200 || !payload || payload.ok !== true || !payload.value) {
+        throw new Error(sessionErrorText(payload && payload.error) || ("HTTP " + res.status));
+      }
+      return payload.value;
+    }
+
+    async function postSessionAction(body) {
+      const res = await postJson(SESSIONS_ROUTE, body);
+      const payload = res.data;
+      if (res.status !== 200 || !payload || payload.ok !== true) {
+        throw new Error(sessionErrorText(payload && payload.error) || ("HTTP " + res.status));
+      }
+      return payload.value;
+    }
+
+    function SessionsPanel({ onClose }) {
+      const tt = t;
+      const [tab, setTab] = React.useState("list");
+      const [version, setVersion] = React.useState(0);
+      const [snapshot, setSnapshot] = React.useState({ status: "loading", data: null, error: "" });
+      const [query, setQuery] = React.useState("");
+      const [busy, setBusy] = React.useState("");
+      const [dialog, setDialog] = React.useState(null);
+      const [target, setTarget] = React.useState("");
+      const [actionError, setActionError] = React.useState("");
+      const [hint, setHint] = React.useState("");
+      const panelRef = React.useRef(null);
+
+      React.useEffect(() => {
+        let cancelled = false;
+        setSnapshot((prev) => ({ status: prev.data ? "stale" : "loading", data: prev.data, error: "" }));
+        (async () => {
+          try {
+            const value = await fetchSessions();
+            if (!cancelled) setSnapshot({ status: "ready", data: value, error: "" });
+          } catch (err) {
+            if (!cancelled) {
+              setSnapshot((prev) => ({
+                status: "error",
+                data: prev.data,
+                error: err && err.message ? err.message : String(err)
+              }));
+            }
+          }
+        })();
+        return () => {
+          cancelled = true;
+        };
+      }, [version]);
+
+      React.useEffect(() => {
+        function onKey(event) {
+          if (event.key !== "Escape") return;
+          event.preventDefault();
+          event.stopPropagation();
+          if (dialog) {
+            setDialog(null);
+            setActionError("");
+          } else {
+            onClose();
+          }
+        }
+        window.addEventListener("keydown", onKey, true);
+        return () => window.removeEventListener("keydown", onKey, true);
+      }, [dialog, onClose]);
+
+      const data = snapshot.data;
+      const rows = data && Array.isArray(data.sessions) ? data.sessions : [];
+      const workspaces = data && Array.isArray(data.workspaces) ? data.workspaces : [];
+      const trash = data && data.trash && Array.isArray(data.trash.entries) ? data.trash.entries : [];
+      const trashCount = data && data.trash && Number.isFinite(data.trash.count) ? data.trash.count : trash.length;
+      const available = !data || data.available !== false;
+      const loading = snapshot.status === "loading";
+      const stale = snapshot.status === "stale";
+
+      const filtered = React.useMemo(() => {
+        const needle = query.trim().toLowerCase();
+        if (needle === "") return rows;
+        return rows.filter((row) => {
+          const haystack = [row.title, row.cwd, row.workspaceTitle].join("\n").toLowerCase();
+          return haystack.includes(needle);
+        });
+      }, [rows, query]);
+
+      const groups = React.useMemo(() => {
+        const byId = new Map();
+        for (const ws of workspaces) {
+          byId.set(ws.id, { id: ws.id, title: ws.title, path: ws.path, rows: [] });
+        }
+        const others = { id: "", title: "", path: "", rows: [] };
+        for (const row of filtered) {
+          const group = row.workspaceId && byId.get(row.workspaceId) ? byId.get(row.workspaceId) : others;
+          group.rows.push(row);
+        }
+        const out = [];
+        for (const ws of workspaces) {
+          const group = byId.get(ws.id);
+          if (group && group.rows.length > 0) out.push(group);
+        }
+        if (others.rows.length > 0) out.push(others);
+        return out;
+      }, [filtered, workspaces]);
+
+      function rowTitle(row) {
+        return row.title || tt("sessions.untitled");
+      }
+
+      function reload() {
+        setVersion((value) => value + 1);
+      }
+
+      async function doDelete(row) {
+        setBusy(row.id);
+        setActionError("");
+        try {
+          const value = await postSessionAction({ action: "delete", sessionIds: [row.id] });
+          const error = sessionFailure(value && value.results);
+          if (error) throw new Error(error);
+          setDialog(null);
+          showToast(tt("sessions.doneDelete"));
+          reload();
+        } catch (err) {
+          setActionError(err && err.message ? err.message : tt("sessions.actionFailed"));
+        } finally {
+          setBusy("");
+        }
+      }
+
+      async function doMove(row, workspaceId) {
+        if (!workspaceId) {
+          setActionError(tt("sessions.noTargets"));
+          return;
+        }
+        setBusy(row.id);
+        setActionError("");
+        try {
+          const value = await postSessionAction({ action: "move", sessionId: row.id, workspaceId });
+          if (!value || value.ok !== true) throw new Error(sessionErrorText(value && value.error));
+          const ws = workspaces.find((item) => item.id === workspaceId);
+          const name = value.workspaceTitle || (ws ? ws.title || ws.path : "");
+          setDialog(null);
+          showToast(tt("sessions.doneMove", { workspace: name }));
+          if (value.restartRequired) setHint(tt("sessions.restartHint"));
+          reload();
+        } catch (err) {
+          setActionError(err && err.message ? err.message : tt("sessions.actionFailed"));
+        } finally {
+          setBusy("");
+        }
+      }
+
+      async function doRestore(entry) {
+        setBusy(entry.trashId);
+        setActionError("");
+        try {
+          const value = await postSessionAction({ action: "restore", trashIds: [entry.trashId] });
+          const error = sessionFailure(value && value.results);
+          if (error) throw new Error(error);
+          const result = value && value.results ? value.results[0] : null;
+          if (result && result.restartRequired) setHint(tt("sessions.restartHint"));
+          showToast(tt("sessions.doneRestore"));
+          reload();
+        } catch (err) {
+          setActionError(err && err.message ? err.message : tt("sessions.actionFailed"));
+        } finally {
+          setBusy("");
+        }
+      }
+
+      async function doPurge(entry) {
+        setBusy(entry.trashId);
+        setActionError("");
+        try {
+          const value = await postSessionAction({ action: "purge", confirm: true, trashIds: [entry.trashId] });
+          const error = sessionFailure(value && value.results);
+          if (error) throw new Error(error);
+          setDialog(null);
+          showToast(tt("sessions.donePurge"));
+          reload();
+        } catch (err) {
+          setActionError(err && err.message ? err.message : tt("sessions.actionFailed"));
+        } finally {
+          setBusy("");
+        }
+      }
+
+      async function doPurgeAll() {
+        setBusy("all");
+        setActionError("");
+        try {
+          const value = await postSessionAction({ action: "purge", all: true, confirm: "PURGE_ALL" });
+          const error = sessionFailure(value && value.results);
+          if (error) throw new Error(error);
+          setDialog(null);
+          showToast(tt("sessions.donePurge"));
+          reload();
+        } catch (err) {
+          setActionError(err && err.message ? err.message : tt("sessions.actionFailed"));
+        } finally {
+          setBusy("");
+        }
+      }
+
+      function openMove(row) {
+        const targets = workspaces.filter((ws) => ws.id !== row.workspaceId);
+        setTarget(targets.length > 0 ? targets[0].id : "");
+        setActionError("");
+        setDialog({ kind: "move", row });
+      }
+
+      function confirmDialog() {
+        if (!dialog) return;
+        if (dialog.kind === "delete") doDelete(dialog.row);
+        else if (dialog.kind === "purge") doPurge(dialog.entry);
+        else if (dialog.kind === "purgeAll") doPurgeAll();
+      }
+
+      function renderBadges(row) {
+        const badges = [];
+        if (row.live) badges.push(e("span", { key: "live", className: "dma-session-badge dma-session-badge-live" }, tt("sessions.live")));
+        if (row.running) badges.push(e("span", { key: "running", className: "dma-session-badge dma-session-badge-run" }, tt("sessions.running")));
+        if (row.archived) badges.push(e("span", { key: "archived", className: "dma-session-badge" }, tt("sessions.archived")));
+        if (row.child) badges.push(e("span", { key: "child", className: "dma-session-badge" }, tt("sessions.child")));
+        return badges.length > 0 ? badges : null;
+      }
+
+      function renderSessionRow(row) {
+        const locked = row.live || row.running;
+        const lockedTitle = locked ? tt("sessions.liveHint") : undefined;
+        return e("div", { key: row.id, className: "dma-session-row" },
+          e("div", { className: "dma-session-main" },
+            e("div", { className: "dma-session-title-line" },
+              e("span", { className: "dma-session-title", title: rowTitle(row) }, rowTitle(row)),
+              renderBadges(row)
+            ),
+            e("div", { className: "dma-session-meta" },
+              e("span", null, sessionClock(row.createdAt)),
+              row.cwd ? e("span", { className: "dma-session-path", title: row.cwd }, row.cwd) : null
+            )
+          ),
+          e("div", { className: "dma-session-actions" },
+            e("button", {
+              type: "button",
+              className: "dma-btn dma-session-act",
+              title: lockedTitle || (data && data.canMove === false ? tt("sessions.unavailable") : tt("sessions.move")),
+              disabled: locked || busy !== "" || !data || data.canMove === false || workspaces.length < 2,
+              onClick: () => openMove(row)
+            }, tt("sessions.move")),
+            e("button", {
+              type: "button",
+              className: "dma-btn dma-session-act dma-session-danger",
+              title: lockedTitle || tt("sessions.deleteHint"),
+              disabled: locked || busy !== "",
+              onClick: () => {
+                setActionError("");
+                setDialog({ kind: "delete", row });
+              }
+            }, tt("sessions.delete"))
+          )
+        );
+      }
+
+      function renderGroup(group) {
+        const title = group.id === "" ? tt("sessions.otherWorkspace") : (group.title || group.path || tt("sessions.otherWorkspace"));
+        return e("section", { key: group.id || "others", className: "dma-sessions-group" },
+          e("div", { className: "dma-sessions-group-head" },
+            e("span", { className: "dma-sessions-group-title", title }, title),
+            group.path ? e("span", { className: "dma-sessions-group-path", title: group.path }, group.path) : null,
+            e("span", { className: "dma-sessions-group-count" }, String(group.rows.length))
+          ),
+          group.rows.map(renderSessionRow)
+        );
+      }
+
+      function renderTrashRow(entry) {
+        const title = entry.title || tt("sessions.untitled");
+        const running = busy === entry.trashId;
+        return e("div", { key: entry.trashId, className: "dma-session-row" + (entry.missing ? " dma-session-row-missing" : "") },
+          e("div", { className: "dma-session-main" },
+            e("div", { className: "dma-session-title-line" },
+              e("span", { className: "dma-session-title", title }, title),
+              entry.missing ? e("span", { className: "dma-session-badge dma-session-badge-warn" }, tt("sessions.missing")) : null
+            ),
+            e("div", { className: "dma-session-meta" },
+              e("span", null, tt("sessions.deletedAt", { time: sessionClock(entry.deletedAt) })),
+              entry.workspaceTitle ? e("span", { className: "dma-session-path", title: entry.workspaceTitle }, entry.workspaceTitle) : null,
+              e("span", null, sessionSize(entry.sizeBytes))
+            )
+          ),
+          e("div", { className: "dma-session-actions" },
+            e("button", {
+              type: "button",
+              className: "dma-btn dma-session-act",
+              disabled: running || busy !== "" || entry.missing,
+              title: entry.missing ? tt("sessions.missing") : tt("sessions.restore"),
+              onClick: () => doRestore(entry)
+            }, tt("sessions.restore")),
+            e("button", {
+              type: "button",
+              className: "dma-btn dma-session-act dma-session-danger",
+              disabled: running || busy !== "",
+              title: tt("sessions.purgeHint"),
+              onClick: () => {
+                setActionError("");
+                setDialog({ kind: "purge", entry });
+              }
+            }, tt("sessions.purge"))
+          )
+        );
+      }
+
+      function renderDialog() {
+        if (!dialog) return null;
+        let title = "";
+        let desc = "";
+        let confirmLabel = "";
+        let danger = false;
+        let toolbar = null;
+        if (dialog.kind === "delete") {
+          title = tt("sessions.deleteTitle");
+          desc = tt("sessions.deleteDesc", { title: rowTitle(dialog.row) });
+          confirmLabel = tt("sessions.deleteConfirm");
+        } else if (dialog.kind === "move") {
+          const targets = workspaces.filter((ws) => ws.id !== dialog.row.workspaceId);
+          const value = target || (targets.length > 0 ? targets[0].id : "");
+          title = tt("sessions.moveTitle");
+          desc = tt("sessions.moveDesc", { title: rowTitle(dialog.row) });
+          confirmLabel = tt("sessions.moveConfirm");
+          toolbar = targets.length === 0
+            ? e("p", { className: "dma-session-warn" }, tt("sessions.noTargets"))
+            : e("div", { className: "dma-session-field" },
+              e("label", { className: "dma-session-field-label", htmlFor: "dma-session-target" }, tt("sessions.targetWorkspace")),
+              e("select", {
+                id: "dma-session-target",
+                className: "dma-session-select",
+                value,
+                onChange: (ev) => setTarget(ev.target.value)
+              }, targets.map((ws) => e("option", { key: ws.id, value: ws.id }, ws.title || ws.path)))
+            );
+        } else if (dialog.kind === "purge") {
+          title = tt("sessions.purgeTitle");
+          desc = tt("sessions.purgeDesc", { title: dialog.entry.title || tt("sessions.untitled") });
+          confirmLabel = tt("sessions.purgeConfirm");
+          danger = true;
+        } else if (dialog.kind === "purgeAll") {
+          title = tt("sessions.purgeAllTitle");
+          desc = tt("sessions.purgeAllDesc", { n: trashCount });
+          confirmLabel = tt("sessions.purgeAllConfirm");
+          danger = true;
+        }
+        const confirmDisabled = busy !== "" || (dialog.kind === "move" && workspaces.filter((ws) => ws.id !== dialog.row.workspaceId).length === 0);
+        return e("div", { className: "dma-session-dialog-layer" },
+          e("div", {
+            className: "dma-session-dialog-backdrop",
+            onClick: () => {
+              setDialog(null);
+              setActionError("");
+            }
+          }),
+          e("div", { className: "dma-session-dialog", role: "alertdialog", "aria-modal": "true", "aria-label": title },
+            e("h4", { className: "dma-session-dialog-title" }, title),
+            e("p", { className: "dma-session-dialog-desc" }, desc),
+            toolbar,
+            e("p", { className: danger ? "dma-session-warn" : "dma-session-okhint" },
+              danger
+                ? tt("sessions.purgeHint")
+                : dialog.kind === "move" ? tt("sessions.moveHint") : tt("sessions.deleteHint")),
+            actionError ? e("p", { className: "dma-stats-error" }, actionError) : null,
+            e("div", { className: "dma-session-dialog-actions" },
+              e("button", {
+                type: "button",
+                className: "dma-btn",
+                disabled: busy !== "",
+                onClick: () => {
+                  setDialog(null);
+                  setActionError("");
+                }
+              }, tt("sessions.cancel")),
+              e("button", {
+                type: "button",
+                className: "dma-btn " + (danger ? "dma-session-danger-solid" : "dma-primary"),
+                disabled: confirmDisabled,
+                onClick: () => {
+                  if (dialog.kind === "move") doMove(dialog.row, target);
+                  else confirmDialog();
+                }
+              }, busy !== "" ? tt("sessions.busy") : confirmLabel)
+            )
+          )
+        );
+      }
+
+      return e("div", {
+        className: "dma-overlay dma-sessions-overlay",
+        onMouseDown: (ev) => {
+          if (ev.target === ev.currentTarget) onClose();
+        }
+      },
+        e("div", {
+          className: "dma-panel dma-sessions-panel",
+          role: "dialog",
+          "aria-modal": "true",
+          "aria-label": tt("sessions.title"),
+          ref: panelRef
+        },
+          e("div", { className: "dma-panel-head dma-stats-head" },
+            e("span", { className: "dma-stats-title" }, tt("sessions.title")),
+            e("span", { className: "dma-stats-live" },
+              e("i", { className: "dma-stats-dot" }),
+              loading || stale ? tt("sessions.loading") : tt("sessions.count", { n: rows.length })),
+            e("button", {
+              type: "button",
+              className: "dma-stats-icon",
+              title: tt("sessions.refresh"),
+              "aria-label": tt("sessions.refresh"),
+              disabled: loading || busy !== "",
+              onClick: reload
+            }, e("span", { className: "dma-stats-ico", dangerouslySetInnerHTML: { __html: REFRESH_ICON } })),
+            e("button", {
+              type: "button",
+              className: "dma-stats-icon",
+              title: tt("sessions.close"),
+              "aria-label": tt("sessions.close"),
+              onClick: onClose
+            }, "×")
+          ),
+          e("div", { className: "dma-panel-body dma-sessions-body" },
+            e("p", { className: "dma-stats-intro" }, tt("sessions.intro")),
+            !available ? e("p", { className: "dma-stats-error" }, tt("sessions.unavailable")) : null,
+            snapshot.status === "error" ? e("p", { className: "dma-stats-error" }, tt("sessions.loadFailed") + "：" + snapshot.error) : null,
+            hint ? e("p", { className: "dma-session-hint" }, hint) : null,
+            e("div", { className: "dma-sessions-tabs", role: "tablist" },
+              e("button", {
+                type: "button",
+                role: "tab",
+                "aria-selected": tab === "list" ? "true" : "false",
+                className: "dma-sessions-tab" + (tab === "list" ? " dma-sessions-tab-active" : ""),
+                onClick: () => setTab("list")
+              }, tt("sessions.tab.list") + " · " + rows.length),
+              e("button", {
+                type: "button",
+                role: "tab",
+                "aria-selected": tab === "trash" ? "true" : "false",
+                className: "dma-sessions-tab" + (tab === "trash" ? " dma-sessions-tab-active" : ""),
+                onClick: () => setTab("trash")
+              }, tt("sessions.tab.trash") + (trashCount > 0 ? " · " + trashCount : ""))
+            ),
+            tab === "list"
+              ? e("div", { className: "dma-sessions-list-wrap" },
+                e("div", { className: "dma-sessions-search" },
+                  e("input", {
+                    type: "search",
+                    className: "dma-sessions-search-input",
+                    value: query,
+                    placeholder: tt("sessions.searchPlaceholder"),
+                    "aria-label": tt("sessions.searchPlaceholder"),
+                    onChange: (ev) => setQuery(ev.target.value)
+                  })
+                ),
+                loading && rows.length === 0
+                  ? e("p", { className: "dma-stats-empty" }, tt("sessions.loading"))
+                  : groups.length === 0
+                    ? e("p", { className: "dma-stats-empty" }, query.trim() !== "" ? tt("sessions.noMatch") : tt("sessions.empty"))
+                    : groups.map(renderGroup)
+              )
+              : e("div", { className: "dma-sessions-list-wrap" },
+                e("p", { className: "dma-sessions-note" }, tt("sessions.trashNote")),
+                loading && trash.length === 0
+                  ? e("p", { className: "dma-stats-empty" }, tt("sessions.loading"))
+                  : trash.length === 0
+                    ? e("p", { className: "dma-stats-empty" }, tt("sessions.emptyTrash"))
+                    : trash.map(renderTrashRow),
+                trash.length > 0
+                  ? e("div", { className: "dma-sessions-foot" },
+                    e("button", {
+                      type: "button",
+                      className: "dma-btn dma-session-danger-outline",
+                      disabled: busy !== "",
+                      onClick: () => {
+                        setActionError("");
+                        setDialog({ kind: "purgeAll" });
+                      }
+                    }, tt("sessions.emptyAll"))
+                  )
+                  : null
+              ),
+            renderDialog()
+          )
+        )
+      );
+    }
+
+    function SessionsTab({ t: tt }) {
+      const [info, setInfo] = React.useState(null);
+      const [failed, setFailed] = React.useState(false);
+      React.useEffect(() => {
+        let cancelled = false;
+        fetchSessions().then((value) => {
+          if (!cancelled) setInfo(value);
+        }).catch(() => {
+          if (!cancelled) setFailed(true);
+        });
+        return () => {
+          cancelled = true;
+        };
+      }, []);
+      const count = info && info.trash && Number.isFinite(info.trash.count) ? info.trash.count : 0;
+      const available = info ? info.available !== false : !failed;
+      return e("div", { className: "dma-settings-panel" },
+        e("p", { className: "dma-cost-note" }, tt("sessions.settingsDesc")),
+        count > 0 ? e("p", { className: "dma-sessions-settings-trash" }, tt("sessions.settingsTrash", { n: count })) : null,
+        !available ? e("p", { className: "dma-stats-error" }, tt("sessions.unavailable")) : null,
+        e("button", {
+          type: "button",
+          className: "dma-setting-primary dma-setting-btn",
+          disabled: !available,
+          onClick: (ev) => openSessionsPanel(ev.currentTarget)
+        }, tt("sessions.settingsOpen")),
+        e("div", { className: "dma-settings-version" }, "v" + VERSION)
+      );
+    }
+
+    /** 侧边栏底部的「对话管理」入口：宽栏显示图标 + 文字，窄栏与费用入口同形。 */
+    function SessionsEntry({ t: tt, wide }) {
+      const title = tt("sessions.entryTitle");
+      return e("div", { className: "dma-cost-item" },
+        e("button", {
+          type: "button",
+          className: wide ? "dma-sessions-entry" : "dma-cost-rail",
+          title,
+          "aria-label": title,
+          onClick: (ev) => openSessionsPanel(ev.currentTarget)
+        },
+          e("span", {
+            className: "dma-sessions-entry-icon",
+            "aria-hidden": "true",
+            dangerouslySetInnerHTML: { __html: SESSIONS_ICON }
+          }),
+          wide ? e("span", { className: "dma-sessions-entry-label" }, tt("sessions.entry")) : null
+        )
+      );
+    }
+
     let settingsTab = "actions";
 
     function SettingsSection({ t: tt, form }) {
@@ -2790,7 +3421,8 @@ window.__ModuleLoader__.load({
       return e("div", { className: "dma-settings" },
         e("div", { className: "dma-tabs", role: "tablist" },
           tabButton("actions", "cost.tab.actions"),
-          tabButton("billing", "cost.tab.billing")
+          tabButton("billing", "cost.tab.billing"),
+          tabButton("sessions", "cost.tab.sessions")
         ),
         tab === "actions"
           ? e("div", { className: "dma-settings-panel" },
@@ -2830,7 +3462,9 @@ window.__ModuleLoader__.load({
             // 第一个标签页底部：只读版本号，不抢设置项视觉焦点。
             e("div", { className: "dma-settings-version" }, "v" + VERSION)
           )
-          : e(BillingTab, { t: tt, form, value, save }),
+          : tab === "billing"
+            ? e(BillingTab, { t: tt, form, value, save })
+            : e(SessionsTab, { t: tt }),
         error ? e("div", { className: "dma-setting-error" }, error) : null
       );
     }
@@ -3316,6 +3950,71 @@ window.__ModuleLoader__.load({
 .dma-stats-money-value-row .dma-stats-money-mini{flex:none;white-space:nowrap}
 .dma-stats-error{margin:0;font-size:12px;line-height:1.5;color:var(--dsw-alias-state-error-primary,#e5484d)}
 .dma-setting-btn{flex:none;margin-top:2px;align-self:flex-start}
+.dma-sessions-panel{position:relative;width:min(760px,calc(100vw - 40px));max-height:86vh}
+.dma-sessions-body{gap:10px;padding:14px 18px 16px}
+.dma-sessions-tabs{display:inline-flex;gap:4px;align-self:flex-start;padding:3px;border-radius:9px;background:var(--dsw-alias-bg-layer-2,#f2f3f5)}
+.dma-sessions-tab{border:0;border-radius:7px;padding:5px 12px;background:transparent;color:var(--dsw-alias-label-secondary,#5b6472);font-size:12.5px;line-height:1.4;cursor:pointer;white-space:nowrap}
+.dma-sessions-tab-active{background:var(--dsw-alias-bg-layer-1,#fff);color:var(--dsw-alias-label-primary,#1f2329);font-weight:600;box-shadow:0 1px 3px rgba(0,0,0,.08)}
+.dma-sessions-tab:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary,#4c8dff);outline-offset:2px}
+.dma-sessions-list-wrap{display:flex;flex-direction:column;gap:12px;min-height:120px;min-width:0}
+.dma-sessions-search-input{box-sizing:border-box;width:100%;height:30px;padding:0 10px;border:.5px solid var(--dsw-alias-border-l3,#c9ced6);border-radius:7px;background:var(--dsw-alias-bg-layer-1,#fff);color:var(--dsw-alias-label-primary,#1f2329);font-size:12.5px;outline:0}
+.dma-sessions-search-input::placeholder{color:var(--dsw-alias-label-tertiary,#8a919e)}
+.dma-sessions-search-input:focus{border-color:var(--dsw-alias-state-business-primary,#4c8dff)}
+.dma-sessions-group{display:flex;flex-direction:column;min-width:0;border:.5px solid var(--dsw-alias-border-l2,rgba(0,0,0,.08));border-radius:9px;overflow:hidden;background:var(--dsw-alias-bg-layer-1,#fff)}
+.dma-sessions-group-head{display:flex;align-items:center;gap:8px;min-width:0;padding:7px 10px;background:var(--dsw-alias-bg-layer-2,#f2f3f5)}
+.dma-sessions-group-title{flex:0 1 auto;max-width:46%;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;font-size:12px;font-weight:600;color:var(--dsw-alias-label-primary,#1f2329)}
+.dma-sessions-group-path{flex:1 1 auto;min-width:0;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;font-size:10.5px;color:var(--dsw-alias-label-tertiary,#8a919e)}
+.dma-sessions-group-count{flex:none;min-width:20px;padding:0 6px;border-radius:9px;background:var(--dsw-alias-bg-layer-1,#fff);font-size:10.5px;line-height:16px;text-align:center;color:var(--dsw-alias-label-secondary,#5b6472)}
+.dma-session-row{display:flex;align-items:center;gap:10px;min-width:0;padding:8px 10px;border-top:.5px solid var(--dsw-alias-border-l2,rgba(0,0,0,.08))}
+.dma-session-row-missing{opacity:.72}
+.dma-session-main{flex:1 1 auto;min-width:0;display:flex;flex-direction:column;gap:2px}
+.dma-session-title-line{display:flex;align-items:center;gap:6px;min-width:0}
+.dma-session-title{flex:0 1 auto;min-width:0;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;font-size:13px;font-weight:500;line-height:1.35;color:var(--dsw-alias-label-primary,#1f2329)}
+.dma-session-meta{display:flex;align-items:center;gap:8px;min-width:0;font-size:10.5px;line-height:1.35;color:var(--dsw-alias-label-tertiary,#8a919e)}
+.dma-session-path{flex:1 1 auto;min-width:0;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;opacity:.85}
+.dma-session-actions{flex:none;display:flex;align-items:center;gap:4px}
+.dma-session-act{height:26px;padding:0 9px;border:.5px solid var(--dsw-alias-border-l3,#c9ced6);border-radius:6px;background:transparent;color:var(--dsw-alias-label-secondary,#5b6472);font-size:11.5px;line-height:1;cursor:pointer;white-space:nowrap}
+.dma-session-act:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover,rgba(0,0,0,.05));color:var(--dsw-alias-label-primary,#1f2329)}
+.dma-session-act:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary,#4c8dff);outline-offset:2px}
+.dma-session-act:disabled{opacity:.4;cursor:default}
+.dma-session-danger{color:var(--dsw-alias-state-error-primary,#e5484d)}
+.dma-session-danger-solid{border-color:transparent;background:var(--dsw-alias-state-error-primary,#e5484d);color:#fff}
+.dma-session-danger-solid:hover:not(:disabled){filter:brightness(.95)}
+.dma-session-danger-outline{height:28px;padding:0 11px;border:.5px solid var(--dsw-alias-state-error-primary,#e5484d);border-radius:7px;background:transparent;color:var(--dsw-alias-state-error-primary,#e5484d);font-size:11.5px;cursor:pointer}
+.dma-session-danger-outline:hover:not(:disabled){background:var(--dsw-alias-state-error-primary,#e5484d);color:#fff}
+.dma-session-danger-outline:disabled{opacity:.45;cursor:default}
+.dma-session-badge{flex:none;padding:0 5px;border-radius:4px;background:var(--dsw-alias-bg-layer-2,#f2f3f5);font-size:10px;line-height:16px;color:var(--dsw-alias-label-tertiary,#8a919e);white-space:nowrap}
+.dma-session-badge-live{background:var(--dsw-alias-bg-layer-1,#fff);color:var(--dsw-alias-state-business-primary,#4c8dff);box-shadow:inset 0 0 0 .5px var(--dsw-alias-state-business-primary,#4c8dff)}
+.dma-session-badge-run{background:var(--dsw-alias-bg-layer-1,#fff);color:var(--dsw-alias-state-success-primary,#22a06b);box-shadow:inset 0 0 0 .5px var(--dsw-alias-state-success-primary,#22a06b)}
+.dma-session-badge-warn{background:var(--dsw-alias-bg-layer-1,#fff);color:var(--dsw-alias-state-warning-primary,#c2610b);box-shadow:inset 0 0 0 .5px var(--dsw-alias-state-warning-primary,#c2610b)}
+.dma-session-dialog-layer{position:absolute;inset:0;z-index:3;display:flex;align-items:center;justify-content:center;padding:18px}
+.dma-session-dialog-backdrop{position:absolute;inset:0;background:rgba(0,0,0,.34);border-radius:inherit}
+.dma-session-dialog{position:relative;display:flex;flex-direction:column;gap:9px;width:min(400px,100%);padding:16px;border-radius:11px;background:var(--dsw-alias-bg-layer-1,#fff);box-shadow:0 14px 36px rgba(0,0,0,.22)}
+.dma-session-dialog-title{margin:0;font-size:14px;font-weight:600;color:var(--dsw-alias-label-primary,#1f2329)}
+.dma-session-dialog-desc{margin:0;font-size:12.5px;line-height:1.6;color:var(--dsw-alias-label-secondary,#5b6472);overflow-wrap:anywhere}
+.dma-session-dialog-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:2px}
+.dma-session-warn{margin:0;font-size:11px;line-height:1.5;color:var(--dsw-alias-state-error-primary,#e5484d)}
+.dma-session-okhint{margin:0;font-size:11px;line-height:1.5;color:var(--dsw-alias-label-tertiary,#8a919e)}
+.dma-session-field{display:flex;flex-direction:column;gap:4px;min-width:0}
+.dma-session-field-label{font-size:11px;color:var(--dsw-alias-label-tertiary,#8a919e)}
+.dma-session-select{box-sizing:border-box;width:100%;height:30px;padding:0 8px;border:.5px solid var(--dsw-alias-border-l3,#c9ced6);border-radius:7px;background:var(--dsw-alias-bg-layer-2,#f2f3f5);color:var(--dsw-alias-label-primary,#1f2329);font-size:12.5px}
+.dma-sessions-note{margin:0;font-size:11px;line-height:1.6;color:var(--dsw-alias-label-tertiary,#8a919e)}
+.dma-sessions-foot{display:flex;justify-content:flex-end;margin-top:2px;padding-top:10px;border-top:.5px solid var(--dsw-alias-border-l2,rgba(0,0,0,.08))}
+.dma-sessions-settings-trash{margin:6px 0 0;font-size:12px;color:var(--dsw-alias-label-secondary,#5b6472)}
+.dma-sessions-entry{display:flex;align-items:center;gap:7px;width:100%;min-width:0;height:30px;padding:0 8px;border:0;border-radius:7px;background:transparent;color:var(--dsw-alias-label-secondary,#5b6472);font-size:12.5px;line-height:1.3;cursor:pointer;text-align:left}
+.dma-sessions-entry:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(0,0,0,.05));color:var(--dsw-alias-label-primary,#1f2329)}
+.dma-sessions-entry:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary,#4c8dff);outline-offset:2px}
+.dma-sessions-entry-icon{flex:none;display:inline-flex;width:16px;height:16px}
+.dma-sessions-entry-icon svg{display:block;width:16px;height:16px}
+.dma-sessions-entry-label{overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
+.dma-session-hint{margin:0;padding:6px 9px;border-radius:7px;background:var(--dsw-alias-bg-layer-2,#f2f3f5);font-size:11.5px;line-height:1.55;color:var(--dsw-alias-label-secondary,#5b6472)}
+@media (max-width:560px){
+.dma-sessions-panel{width:calc(100vw - 20px);max-height:92vh}
+.dma-sessions-body{padding:12px}
+.dma-session-row{flex-wrap:wrap}
+.dma-session-actions{width:100%;justify-content:flex-end}
+.dma-sessions-group-path{display:none}
+}
 @keyframes dma-spin{to{transform:rotate(360deg)}}
 @media (prefers-color-scheme:dark){
 .dma-cost-peak .dma-cost-period-text{color:#f0a24a}
@@ -3550,6 +4249,16 @@ window.__ModuleLoader__.load({
           locale: NS,
           inject: () => ({ form: settingsForm })
         }, CostCard)
+      );
+
+      // 侧边栏底部对话管理入口（与费用卡片同一区域、同一套视觉）
+      ctx.slots.inject("sidebar.footer.action", () =>
+        ctx.slots.register({
+          name: "sidebar.footer.action",
+          id: "dsh-message-actions-sessions",
+          order: 21,
+          locale: NS
+        }, SessionsEntry)
       );
 
       // 费用状态轮询（5s；usageStats 关闭 / 页面隐藏时暂停）
