@@ -32,12 +32,12 @@
     {
       "name": "dsh-message-actions",
       "title": {
-        "en": "Messages & Cost",
-        "zh": "消息费用"
+        "en": "dsh-message-actions",
+        "zh": "dsh-message-actions"
       },
       "description": {
-        "en": "Undo, delete, share and export messages, with DeepSeek balance and cost statistics.",
-        "zh": "撤回、删除、删至末尾、分享、导出消息，并统计 DeepSeek 余额与费用。"
+        "en": "Completion sound; per-reply tokens, words, and cost; per-turn spend, stats panel, budget, and balance; recall, delete, and delete-to-end; multi-select share and export.",
+        "zh": "对话完成声音提示；每条回答的 token、字数与费用；单次花费、统计表、预算与余额；撤回、删除、删至末尾；多选分享与导出对话。"
       },
       "icon": "../icon.svg",
       "author": "aijacko",
@@ -53,6 +53,13 @@
         ]
       },
       "versions": [
+        {
+          "version": "0.2.3",
+          "publishTimestamp": 1794047625,
+          "source": {
+            "type": "npm"
+          }
+        },
         {
           "version": "0.2.2",
           "publishTimestamp": 1793995383,
