@@ -113,7 +113,7 @@ CPU, process memory, system load and uptime are deliberately **not** included; t
 npm install dsh-message-actions
 ```
 
-The published package is `dsh-message-actions@0.2.3`.
+The published package is `dsh-message-actions@0.2.4`.
 
 ### Self-hosted market index source (optional)
 
@@ -277,8 +277,8 @@ test/check.mjs   # dependency-free assertion script
 ```
 
 
-- Version: `0.2.3` (published on both npm and GitHub Releases)
-- Release: [v0.2.3](https://github.com/aijacko/dsh-message-actions/releases/tag/v0.2.3)
+- Version: `0.2.4` (published on both npm and GitHub Releases)
+- Release: [v0.2.4](https://github.com/aijacko/dsh-message-actions/releases/tag/v0.2.4)
 - Compatible with: DSH `0.2.1-rc.5` and `0.2.2-rc.1`; `0.2.2-rc.1` (web profile) verified, older hosts take the portal fallback
 - Dependencies: none at runtime
 

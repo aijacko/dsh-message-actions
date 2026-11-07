@@ -9,11 +9,11 @@
 const meta = {
   zh: {
     title: 'dsh-message-actions',
-    description: '对话完成声音提示；每条回答的 token、字数与费用；单次花费、统计表、预算与余额；撤回、删除、删至末尾；多选分享与导出对话。'
+    description: '功能：撤回、删除、删至末尾、多选分享与导出，每条回答的用量计费、余额费用展示、对话完成声音提示等。'
   },
   en: {
     title: 'dsh-message-actions',
-    description: 'Completion sound; per-reply tokens, words, and cost; per-turn spend, stats panel, budget, and balance; recall, delete, and delete-to-end; multi-select share and export.'
+    description: 'Features: recall, delete, delete-to-end, multi-select share and export; per-reply usage billing, balance and cost display, and a completion sound.'
   }
 };
 

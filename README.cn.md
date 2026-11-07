@@ -113,7 +113,7 @@ CPU、进程内存、系统负载与运行时间**不并入**：本插件只关�
 npm install dsh-message-actions
 ```
 
-已发布包为 `dsh-message-actions@0.2.3`。
+已发布包为 `dsh-message-actions@0.2.4`。
 
 ### 自建市场索引源（可选）
 
@@ -277,8 +277,8 @@ test/check.mjs   # 无依赖的断言脚本
 ```
 
 
-- 版本：`0.2.3`（npm 与 GitHub Release 均已发布）
-- 发布说明：[v0.2.3](https://github.com/aijacko/dsh-message-actions/releases/tag/v0.2.3)
+- 版本：`0.2.4`（npm 与 GitHub Release 均已发布）
+- 发布说明：[v0.2.4](https://github.com/aijacko/dsh-message-actions/releases/tag/v0.2.4)
 - 兼容：DSH `0.2.1-rc.5` 与 `0.2.2-rc.1`；`0.2.2-rc.1`（web profile）已实测，旧版走 portal 探测失败回退
 - 依赖：无运行时第三方依赖
 

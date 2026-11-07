@@ -1,7 +1,7 @@
 {
   "name": "dsh-message-actions",
-  "version": "0.2.3",
-  "description": "对话完成声音提示；每条回答的 token、字数与费用；单次花费、统计表、预算与余额；撤回、删除、删至末尾；多选分享与导出对话。",
+  "version": "0.2.4",
+  "description": "功能：撤回、删除、删至末尾、多选分享与导出，每条回答的用量计费、余额费用展示、对话完成声音提示等。",
   "type": "module",
   "license": "MIT",
   "repository": {

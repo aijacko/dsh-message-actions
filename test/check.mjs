@@ -1273,11 +1273,13 @@ function fakeRes() {
   ok("i18n en 非空", enKeys.length > 50);
   eq("i18n meta.zh.title 为插件名", i18n.meta.zh.title, "dsh-message-actions");
   eq("i18n meta.en.title 为插件名", i18n.meta.en.title, "dsh-message-actions");
-  ok("i18n meta.zh.description 覆盖声音、费用、统计与撤回", ["声音", "费用", "统计表", "预算", "撤回", "分享"].every((w) => i18n.meta.zh.description.includes(w)));
-  ok("i18n meta.en.description 覆盖声音、费用、统计与撤回", ["Completion sound", "cost", "stats panel", "budget", "recall", "share"].every((w) => i18n.meta.en.description.includes(w)));
+  eq("i18n meta.zh.description 按定稿原文", i18n.meta.zh.description, "功能：撤回、删除、删至末尾、多选分享与导出，每条回答的用量计费、余额费用展示、对话完成声音提示等。");
+  eq("i18n meta.en.description 与中文同义", i18n.meta.en.description, "Features: recall, delete, delete-to-end, multi-select share and export; per-reply usage billing, balance and cost display, and a completion sound.");
   const iconSrc = fs.readFileSync(fileURLToPath(new URL("../icon.svg", import.meta.url)), "utf8");
-  ok("插件图标：对话气泡内嵌 ¥", /viewBox="0 0 64 64"/.test(iconSrc) &&
-    iconSrc.includes('fill="#2563eb"') && iconSrc.includes("M26 23l6 7 6-7"));
+  ok("插件图标：蓝底对话气泡内嵌三档滑块", /viewBox="0 0 64 64"/.test(iconSrc) &&
+    iconSrc.includes('fill="#2563eb"') && iconSrc.includes("M23 23h18M23 30h18M23 37h18") &&
+    [/cx="34" cy="23"/, /cx="27.5" cy="30"/, /cx="38" cy="37"/].every((re) => re.test(iconSrc)) &&
+    !iconSrc.includes("M26 23l6 7 6-7"));
 
   const localeDir = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "locale");
   for (const lang of ["zh", "en"]) {

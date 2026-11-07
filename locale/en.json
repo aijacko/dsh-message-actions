@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "dsh-message-actions",
-    "description": "Completion sound; per-reply tokens, words, and cost; per-turn spend, stats panel, budget, and balance; recall, delete, and delete-to-end; multi-select share and export."
+    "description": "Features: recall, delete, delete-to-end, multi-select share and export; per-reply usage billing, balance and cost display, and a completion sound."
   }
 }
