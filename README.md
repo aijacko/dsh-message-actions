@@ -1,4 +1,4 @@
-﻿# DSH plugin dsh-message-actions
+﻿# Message Butler (`dsh-message-actions`)
 
 English · [中文](README.cn.md)
 
@@ -59,7 +59,7 @@ New installations default to **single-line**; users who have already saved a pre
 
 - Peak = warm orange, off-peak = cool blue; 14px SVG status icons, readable at a glance on the left.
 - When the sidebar collapses, the card degrades to a coin icon; hover to see the balance.
-- Local models / non-DeepSeek routing collapse to "Local · no billing", out of the way.
+- Local models (localhost / 127.0.0.1 / private subnets / `.local`) collapse to "Local · no billing"; third-party gateways show as separately billed and do not poll the DeepSeek balance.
 
 | Item | Meaning |
 |---|---|
@@ -67,8 +67,8 @@ New installations default to **single-line**; users who have already saved a pre
 | Today | Today's spend (Beijing time): credited **immediately** when a turn settles, then reconciled against balance drops without double counting |
 | Turn | Converted cost of the most recent turn; shown by default, can hide after 0–600 seconds |
 
-- "Turn" (per-turn cost) is estimated from official list prices (`deepseek-flash` / `deepseek-v4-pro`) and actual usage; internal accounting is more precise than the UI, so very small costs are not rounded down to zero. Only DeepSeek-routed usage is billed: local models count tokens but add `0` to "Turn" and "Today", and the card collapses to "Local · no billing".
-- **Per-answer cost**: the stats line under each answer ends with that reply's own estimate, e.g. `240 tok · 18 chars · ¥0.0023` (4 decimals with a `¥` prefix; `<¥0.0001` below one ten-thousandth of a yuan, `¥0.0000` at zero). It sums only this reply's usage, so a multi-step turn is not billed twice; local / non-DeepSeek replies show `Local`. The whole-turn total stays in **Turn**, and the hover text explains the difference.
+- "Turn" (per-turn cost) is estimated from official list prices (`deepseek-flash` / `deepseek-v4-pro`) and actual usage; internal accounting is more precise than the UI, so very small costs are not rounded down to zero. Billing is on by default: only confirmed local/private endpoints are unbilled. Third-party models use the price table in the stats panel; without a price they still show tokens but add `0` to "Turn" and "Today", and history is recalculated once a price is filled in.
+- **Per-answer cost**: the stats line under each answer ends with that reply's own estimate, e.g. `240 tok · 18 chars · ¥0.0023` (4 decimals with a `¥` prefix; `<¥0.0001` below one ten-thousandth of a yuan, `¥0.0000` at zero). It sums only this reply's usage, so a multi-step turn is not billed twice; local replies show `Local` and unpriced third-party replies show `No price`. The whole-turn total stays in **Turn**, and the hover text explains the difference.
 - Peak / off-peak uses Beijing time: weekdays `09:00–12:00` and `14:00–18:00` are peak, everything else is off-peak; off-peak is `0.5×` the peak price.
 - "Today" is **settlement-first**: `turn/end` immediately credits the estimated cents to today's bucket, at the same moment as "Turn". Balance observations then only add `actual drop − already settled`; when the estimate is higher than reality nothing is subtracted, so the same turn is never counted twice.
 - When the balance goes up (top-up / refund), recorded spend is not reduced and no manual correction is kept; the next observation simply moves the baseline.
@@ -78,16 +78,16 @@ New installations default to **single-line**; users who have already saved a pre
 
 ## Statistics
 
-A small chart icon sits at the **end of the sidebar cost row** (`Bal ¥6.02 | Today ¥0.00 | Turn`); hovering it shows "Statistics", clicking opens a full-screen overlay. It can also be opened from **Settings → dsh-message-actions → Cost Statistics** via the **Open stats table** button between the peak/off-peak row and the account-scope note; there is no separate toggle, and the icon is always available while the cost card is shown.
+A small chart icon sits at the **end of the sidebar cost row** (`Bal ¥6.02 | Today ¥0.00 | Turn`); hovering it shows "Statistics", clicking opens a full-screen overlay. It can also be opened from **Settings → Message Butler → Cost Statistics** via the **Open stats table** button between the peak/off-peak row and the account-scope note; there is no separate toggle, and the icon is always available while the cost card is shown.
 
 - Data comes from the **real local session logs** through the host's official `sessionQuery` service — the same assistant usage records that feed the per-turn figure — so tokens, cost and the card agree.
 - **First row, four cards**: total tokens (with cache-hit share), session count (with running count), **budget** (amount + progress bar), **budget usage** (percent + remaining).
 - **Second row, four cards**: balance, today, turn, **estimated cost**, at the same size, radius and type scale as the KPI cards. The **budget card** shows the amount with "Left ¥x · used y%" underneath and a compact **Edit budget** button (25 px height, `0 9px` padding, 11.5 px label, 6 px radius, filled primary) at the right end of the amount row, so it never dominates the figure; clicking the amount still edits in place. The edit state is one no-wrap row with a uniform `gap:7px`: a 92 px input (shrinkable to 64 px, 13 px text, 2×6 px padding) with `¥` / `CNY` affixes, a 25 px **Save** and a 25 px outlined **Cancel**; Enter saves and Esc cancels. Below a ~181 px card width a container query tightens the gap to 4 px and the button paddings to 5 px / 4 px, so the row measures ≈135 px and still fits the 136 px content width of the narrowest card without wrapping. The one-line budget note truncates with an ellipsis instead of wrapping, so the card keeps the same height as its siblings. **Balance / today / turn** are the same state and formatters as the sidebar cost card, so the three figures match character for character. On narrow windows the row wraps to 2×2 with cards 1–2 / 3–4 and 5–6 / 7–8 per line.
-- **Billing scope**: only **official DeepSeek models** are billed. Usage from local / non-DeepSeek providers (ollama, localhost endpoints, custom gateways) still counts toward tokens, but its cost is `0` and it is excluded from estimated cost, budget usage and the daily figure. The timeline adds a separate 3 px **billing bar** under each column — deep blue for DeepSeek-billed tokens, neutral gray for local unbilled tokens — because the four token-category colors already use blue (so the billing split is an additive encode, not a recolor). Its legend now shares the **same row** as the four-colour legend: categories on the left, billing scope right-aligned (`space-between`, same 11 px type); if the row cannot fit both, they wrap as two whole groups instead of overlapping. Local-only session rows show **Local · unbilled** instead of `¥0.00`, and their cost is excluded from the total; the panel note states the rule explicitly.
+- **Billing scope**: billed by default; only confirmed local/private endpoints (localhost, 127.0.0.1, 10/8, 172.16/12, 192.168/16, `.local`, etc.) are unbilled. Third-party models use the price table; without a price their tokens still count but cost `0` and are excluded from estimated cost, budget usage and the daily figure. The timeline adds a separate 3 px **billing bar** under each column — deep blue for priced tokens, neutral gray for local unbilled tokens, amber for unpriced tokens — because the four token-category colors already use blue (so the billing split is an additive encode, not a recolor). Its legend now shares the **same row** as the four-colour legend: categories on the left, billing scope right-aligned (`space-between`, same 11 px type); if the row cannot fit both, they wrap as two whole groups instead of overlapping. Local-only session rows show **Local · unbilled**, unpriced-only rows show **No price**, and unverified sources carry a **Source unverified** pill. The panel footer provides source diagnostics, an override list (`provider=always` / `provider=local`) and a third-party price-table editor.
 - **Timeline**: last 24 hours / last 30 days, split by input / cache hit / cache write / output; legend, billing bar and peak marker included.
 - **Session table**: name, tokens, cost, last updated; running sessions and subagent sessions are tagged, sorted by token usage; local-only sessions show **Local** in the cost column.
 - **Budget**: click **Edit budget** on the budget card (or the amount itself) to edit (CNY, default ¥5, `0` hides the ratio and shows only the estimate). It is saved into the same `cost-state.json` as the rest of the cost data; old state files without the field fall back to ¥5. The budget **only computes the "budget used" ratio and remaining allowance** as a spending hint; it never bills you and does not affect the balance or per-turn figures.
-- The estimate uses the same official prices and peak / off-peak rules as the per-turn figure. A small cross-check line shows the card's "today" and observed total, since those come from balance drops and use a different basis.
+- The estimate is billed by default: only confirmed local/private endpoints are unbilled. Third-party models use the price table in the stats panel (exact model → prefix → provider → global fallback); without a price they still show tokens but add `0` to the estimate, and history is recalculated once a price is filled in. DeepSeek official models keep official prices and peak / off-peak rules. A small cross-check line shows the card's "today" and observed total, since those come from balance drops and use a different basis.
 - `Esc` closes the overlay, the opener regains focus, and focus starts on the close button — same behaviour as the share / export overlays.
 
 CPU, process memory, system load and uptime are deliberately **not** included; this plugin is about messages and cost.
@@ -171,7 +171,7 @@ The card's **Bal** is read directly from the DeepSeek account service and shows 
 
 ## Settings
 
-Settings → Plugins → **dsh-message-actions**; the page has two tabs, and changes **save immediately and apply right away**.
+Settings → Plugins → **Message Butler**; the page has two tabs, and changes **save immediately and apply right away**.
 
 **Message Actions**
 
@@ -261,7 +261,7 @@ This section only describes what the code actually does. It is risk reduction, n
 
 ```bash
 node build.mjs        # build to lib/
-node test/check.mjs   # offline assertions, 2909 currently
+node test/check.mjs   # offline assertions, 2937 currently
 # plus a real session-log regression: 18/18
 ```
 
@@ -277,8 +277,8 @@ test/check.mjs   # dependency-free assertion script
 ```
 
 
-- Version: `0.2.4` (published on both npm and GitHub Releases)
-- Release: [v0.2.4](https://github.com/aijacko/dsh-message-actions/releases/tag/v0.2.4)
+- Version: `0.2.5` (source version; not published)
+- Latest release: [v0.2.4](https://github.com/aijacko/dsh-message-actions/releases/tag/v0.2.4)
 - Compatible with: DSH `0.2.1-rc.5` and `0.2.2-rc.1`; `0.2.2-rc.1` (web profile) verified, older hosts take the portal fallback
 - Dependencies: none at runtime
 

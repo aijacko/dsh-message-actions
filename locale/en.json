@@ -1,6 +1,6 @@
 {
   "meta": {
-    "title": "dsh-message-actions",
+    "title": "Message Butler",
     "description": "Features: recall, delete, delete-to-end, multi-select share and export; per-reply usage billing, balance and cost display, and a completion sound."
   }
 }

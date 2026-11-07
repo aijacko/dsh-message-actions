@@ -14,8 +14,9 @@
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
+const shared = require("./shared.cjs");
 
-const STATE_VERSION = 1;
+const STATE_VERSION = 2;
 /** 默认预算 ¥5：首次运行、旧状态文件缺字段时都落到这里。 */
 const DEFAULT_BUDGET_CENTS = 500;
 const FILE_NAME = "cost-state.json";
@@ -62,6 +63,12 @@ function defaultState() {
     lastSettledKey: "",
     /** 会话统计的预算（分，人民币）；0 表示未启用预算比例。 */
     budgetCents: DEFAULT_BUDGET_CENTS,
+    /** 计费口径：provider 覆盖清单 + 第三方价格表（v2 新增）。 */
+    billing: {
+      overrides: {},
+      prices: { models: {}, prefixes: {}, providers: {}, fallback: null },
+      updatedAt: 0
+    },
     updatedAt: 0
   };
 }
@@ -107,9 +114,22 @@ function normalizeCostState(raw) {
     lastSettledKey: typeof raw.lastSettledKey === "string" ? raw.lastSettledKey : "",
     // 旧状态文件没有该字段：按默认预算补齐，不视为损坏。
     budgetCents: Math.max(0, intOr(raw.budgetCents, DEFAULT_BUDGET_CENTS)),
+    // 旧状态文件（v1）没有 billing：补空配置，可正常升级写入。
+    billing: normalizeBilling(raw.billing),
     updatedAt: intOr(raw.updatedAt, 0)
   };
   return { state, readOnly };
+}
+
+/** 只保留合法的覆盖清单与价格条目；不合法条目静默丢弃。 */
+function normalizeBilling(raw) {
+  const base = defaultState().billing;
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return base;
+  return {
+    overrides: shared.normalizeBillingOverrides(raw.overrides),
+    prices: shared.normalizePriceConfig(raw.prices),
+    updatedAt: intOr(raw.updatedAt, 0)
+  };
 }
 
 function badName(filePath) {

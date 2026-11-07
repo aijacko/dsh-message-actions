@@ -1453,9 +1453,21 @@ window.__ModuleLoader__.load({
 
       // 单条回答金额：只认该条自己的 usage（服务端已算好 costMicros），
       // 中间步骤没有 usage 时不拿同轮其它回答的金额兜底，避免重复计价。
-      const replyCost = row && Number.isFinite(row.costMicros)
-        ? (row.billable === false ? tt("stats.localCost") : formatReplyCost(row.costMicros))
-        : null;
+      // 本地 → 「本地」；第三方未配置价格 → 「未配置」（token 仍显示）。
+      let replyCost = null;
+      let replyCostTitle = null;
+      if (row && Number.isFinite(row.costMicros)) {
+        if (row.billable === false) {
+          replyCost = tt("stats.localCost");
+        } else if (row.costPriced === false) {
+          replyCost = tt("stats.unpricedCost");
+          replyCostTitle = tt("stats.replyUnpricedTitle");
+        } else {
+          replyCost = formatReplyCost(row.costMicros);
+          replyCostTitle = tt("stats.replyCostTitle", { cost: replyCost });
+        }
+      }
+      const replyUnverified = row && row.routeConfirmed === false;
 
       const label = [
         tokens == null ? null : formatTokens(tokens) + " tok",
@@ -1466,7 +1478,8 @@ window.__ModuleLoader__.load({
       return e("span", {
         className: "dma-stats",
         title: tt("stats.title", { tokens: tokens == null ? "?" : tokens, words }) +
-          (replyCost ? " \u00b7 " + tt("stats.replyCostTitle", { cost: replyCost }) : "")
+          (replyCostTitle ? " \u00b7 " + replyCostTitle : "") +
+          (replyUnverified ? " \u00b7 " + tt("stats.unconfirmedTag") : "")
       }, label);
     }
 
@@ -1700,6 +1713,7 @@ window.__ModuleLoader__.load({
 
     const STATS_ROUTE = "/dsh-message-actions/stats";
     const STATS_BUDGET_ROUTE = "/dsh-message-actions/stats/budget";
+    const BILLING_ROUTE = "/dsh-message-actions/billing";
     const STATS_POLL_MS = 10000;
 
     const STATS_ICON = '<svg viewBox="0 0 16 16" fill="none" aria-hidden="true">' +
@@ -1795,10 +1809,11 @@ window.__ModuleLoader__.load({
     function StatsStack({ bucket, max, className }) {
       const total = Number.isFinite(bucket.tokens) ? bucket.tokens : 0;
       const height = max > 0 ? statsShare(total, max) : 0;
-      // 计费口径细条：DeepSeek 计费（深蓝）/ 本地 · 不计费（中性灰）。
+      // 计费口径细条：可计价（深蓝）/ 本地 · 不计费（中性灰）/ 未配置价格（琥珀）。
       // 四色分类已占用蓝色系，因此不重上分类色，而是另加一条独立细条与独立图例。
       const billableTokens = Number.isFinite(bucket.billableTokens) ? bucket.billableTokens : total;
       const localTokens = Number.isFinite(bucket.localTokens) ? bucket.localTokens : 0;
+      const unpricedTokens = Number.isFinite(bucket.unpricedTokens) ? bucket.unpricedTokens : 0;
       const segments = [
         ["input", "dma-stats-seg-input"],
         ["cacheRead", "dma-stats-seg-cacheRead"],
@@ -1827,6 +1842,9 @@ window.__ModuleLoader__.load({
               : null,
             localTokens > 0
               ? e("i", { className: "dma-stats-billing-local", style: { width: statsPct(statsShare(localTokens, total)) } })
+              : null,
+            unpricedTokens > 0
+              ? e("i", { className: "dma-stats-billing-unpriced", style: { width: statsPct(statsShare(unpricedTokens, total)) } })
               : null
           )
           : null
@@ -1838,10 +1856,12 @@ window.__ModuleLoader__.load({
       let max = 0;
       let billableTotal = 0;
       let localTotal = 0;
+      let unpricedTotal = 0;
       for (const bucket of buckets) {
         if (bucket.tokens > max) max = bucket.tokens;
         billableTotal += Number.isFinite(bucket.billableTokens) ? bucket.billableTokens : bucket.tokens;
         localTotal += Number.isFinite(bucket.localTokens) ? bucket.localTokens : 0;
+        unpricedTotal += Number.isFinite(bucket.unpricedTokens) ? bucket.unpricedTokens : 0;
       }
       const first = buckets.length > 0 ? buckets[0].t : 0;
       const last = buckets.length > 0 ? buckets[buckets.length - 1].t : 0;
@@ -1879,6 +1899,9 @@ window.__ModuleLoader__.load({
                 + (Number.isFinite(bucket.localTokens) && bucket.localTokens > 0
                   ? " · " + tt("stats.billingLocal") + " " + formatTokens(bucket.localTokens)
                   : "")
+                + (Number.isFinite(bucket.unpricedTokens) && bucket.unpricedTokens > 0
+                  ? " · " + tt("stats.billingUnpriced") + " " + formatTokens(bucket.unpricedTokens)
+                  : "")
             }, e(StatsStack, { bucket, max })))
           ),
           e("div", { className: "dma-stats-axis" },
@@ -1894,7 +1917,12 @@ window.__ModuleLoader__.load({
                 tt("stats.billingDeepseek") + " " + formatTokens(billableTotal)),
               e("span", {},
                 e("i", { className: "dma-stats-swatch dma-stats-billing-local" }),
-                tt("stats.billingLocal") + " " + formatTokens(localTotal))
+                tt("stats.billingLocal") + " " + formatTokens(localTotal)),
+              unpricedTotal > 0
+                ? e("span", {},
+                  e("i", { className: "dma-stats-swatch dma-stats-billing-unpriced" }),
+                  tt("stats.billingUnpriced") + " " + formatTokens(unpricedTotal))
+                : null
             )
           )
         )
@@ -1917,14 +1945,32 @@ window.__ModuleLoader__.load({
           rows.length === 0
             ? e("div", { className: "dma-stats-empty" }, tt("stats.empty"))
             : rows.map((row) => {
-              // 只有本地用量时成本显示「本地」而不是 ¥0.00，避免误读为「花了 0 元」。
+              // 只有本地用量时成本显示「本地」；只有未配置价格的用量时显示「未配置」，
+              // 避免把「没算钱」误读成「花了 0 元」。
               const localOnly = Number.isFinite(row.localTokens) && row.localTokens > 0 &&
+                !(Number.isFinite(row.billableTokens) && row.billableTokens > 0) &&
+                !(Number.isFinite(row.unpricedTokens) && row.unpricedTokens > 0);
+              const unpricedOnly = Number.isFinite(row.unpricedTokens) && row.unpricedTokens > 0 &&
                 !(Number.isFinite(row.billableTokens) && row.billableTokens > 0);
+              const mixedUnpriced = Number.isFinite(row.unpricedTokens) && row.unpricedTokens > 0 &&
+                Number.isFinite(row.billableTokens) && row.billableTokens > 0;
+              const costLabel = localOnly
+                ? tt("stats.localCost")
+                : unpricedOnly
+                  ? tt("stats.unpricedCost")
+                  : formatCostMicros(row.costMicros) + (mixedUnpriced ? " · " + tt("stats.unpricedSuffix") : "");
+              const costTitle = localOnly
+                ? tt("stats.billingNote")
+                : unpricedOnly || mixedUnpriced
+                  ? tt("stats.replyUnpricedTitle")
+                  : undefined;
               return e("div", { key: row.id, className: "dma-stats-row" },
                 e("div", { className: "dma-stats-cell" },
                   e("div", { className: "dma-stats-row-title" },
                     e("b", { title: row.title }, row.title),
                     localOnly ? e("span", { className: "dma-stats-pill dma-stats-pill-local" }, tt("stats.localTag")) : null,
+                    unpricedOnly ? e("span", { className: "dma-stats-pill dma-stats-pill-unpriced" }, tt("stats.unpricedTag")) : null,
+                    row.unconfirmed ? e("span", { className: "dma-stats-pill dma-stats-pill-unconfirmed" }, tt("stats.unconfirmedTag")) : null,
                     row.running ? e("span", { className: "dma-stats-pill dma-stats-pill-running" }, tt("stats.running")) : null,
                     row.subagent ? e("span", { className: "dma-stats-pill" }, tt("stats.subagent")) : null
                   ),
@@ -1940,12 +1986,131 @@ window.__ModuleLoader__.load({
                 e("span", { className: "dma-stats-cell dma-stats-cell-right" }, formatTokens(row.tokens.total)),
                 e("span", {
                   className: "dma-stats-cell dma-stats-cell-right",
-                  title: localOnly ? tt("stats.billingNote") : undefined
-                }, localOnly ? tt("stats.localCost") : formatCostMicros(row.costMicros)),
+                  title: costTitle
+                }, costLabel),
                 e("span", { className: "dma-stats-cell dma-stats-cell-right dma-stats-meta" },
                   statsRelative(row.lastActiveAt, tt))
               );
             })
+        )
+      );
+    }
+
+    /** 覆盖清单对象 → 文本（provider=always / provider=local）。 */
+    function overridesTextOf(overrides) {
+      if (!overrides || typeof overrides !== "object") return "";
+      return Object.keys(overrides)
+        .sort()
+        .map((key) => key + "=" + (overrides[key] === "always" ? "always" : "local"))
+        .join("\n");
+    }
+
+    /**
+     * 模型计费设置：来源诊断 + 覆盖清单 + 第三方价格表。
+     * 保存后宿主递增 billingRevision，历史统计立即按新价重算。
+     */
+    function BillingSection({ t: tt, billing, onReload }) {
+      const [overridesText, setOverridesText] = React.useState(() => overridesTextOf(billing && billing.overrides));
+      const [pricesText, setPricesText] = React.useState(() =>
+        JSON.stringify((billing && billing.prices) || { models: {}, prefixes: {}, providers: {}, fallback: null }, null, 2)
+      );
+      const [busy, setBusy] = React.useState(false);
+      const [message, setMessage] = React.useState("");
+      const [error, setError] = React.useState("");
+      const endpoints = billing && Array.isArray(billing.endpoints) ? billing.endpoints : [];
+
+      const save = async () => {
+        setMessage("");
+        setError("");
+        let prices;
+        try {
+          prices = JSON.parse(pricesText || "{}");
+        } catch {
+          setError(tt("stats.billingInvalid"));
+          return;
+        }
+        if (!prices || typeof prices !== "object" || Array.isArray(prices)) {
+          setError(tt("stats.billingInvalid"));
+          return;
+        }
+        setBusy(true);
+        try {
+          const res = await postJson(BILLING_ROUTE, { overrides: overridesText, prices });
+          if (res.status === 200 && res.data && res.data.ok) {
+            setMessage(tt("stats.billingSaved"));
+            if (typeof onReload === "function") onReload();
+          } else {
+            setError(tt("stats.billingFailed"));
+          }
+        } catch {
+          setError(tt("stats.billingFailed"));
+        } finally {
+          setBusy(false);
+        }
+      };
+
+      return e("div", { className: "dma-stats-section dma-billing" },
+        e("div", { className: "dma-stats-section-head" },
+          e("h4", { className: "dma-stats-section-title" }, tt("stats.billingConfig")),
+          billing && billing.endpointSource
+            ? e("span", { className: "dma-stats-note" },
+              tt("stats.billingEndpointSource", { source: billing.endpointSource }))
+            : null
+        ),
+        e("div", { className: "dma-billing-endpoints" },
+          endpoints.length === 0
+            ? e("span", { className: "dma-stats-note" }, tt("stats.billingEndpointsEmpty"))
+            : endpoints.map((item) => e("span", { key: item.provider, className: "dma-billing-endpoint" },
+              e("b", {}, item.provider),
+              " · " + (item.host || "—"),
+              e("em", {
+                className: "dma-billing-kind dma-billing-kind-" + (
+                  item.local ? "local" : item.kind === "third-party" ? "third" : "official"
+                )
+              }, item.local ? tt("stats.billingLocal") : item.kind === "third-party" ? tt("stats.billingThird") : tt("stats.billingDeepseek")),
+              item.local ? null : e("em", {
+                className: "dma-billing-kind dma-billing-kind-price-" + (item.priceSource || "unconfigured")
+              }, item.priceSource === "official"
+                ? tt("stats.billingDeepseek")
+                : item.priceSource === "custom"
+                  ? tt("stats.billingCustom")
+                  : item.priceSource === "estimated"
+                    ? tt("stats.billingEstimated")
+                    : tt("stats.billingUnpriced"))
+            ))
+        ),
+        e("label", { className: "dma-billing-field" },
+          e("span", { className: "dma-billing-label" }, tt("stats.billingOverrides")),
+          e("textarea", {
+            className: "dma-billing-input",
+            rows: 3,
+            spellCheck: false,
+            value: overridesText,
+            placeholder: "ninfer-27b=always",
+            onChange: (event) => setOverridesText(event.target.value)
+          }),
+          e("span", { className: "dma-stats-note" }, tt("stats.billingOverridesHint"))
+        ),
+        e("label", { className: "dma-billing-field" },
+          e("span", { className: "dma-billing-label" }, tt("stats.billingPrices")),
+          e("textarea", {
+            className: "dma-billing-input dma-billing-json",
+            rows: 8,
+            spellCheck: false,
+            value: pricesText,
+            onChange: (event) => setPricesText(event.target.value)
+          }),
+          e("span", { className: "dma-stats-note" }, tt("stats.billingPricesHint"))
+        ),
+        e("div", { className: "dma-billing-actions" },
+          e("button", {
+            type: "button",
+            className: "dma-billing-save",
+            disabled: busy,
+            onClick: save
+          }, busy ? tt("stats.billingSaving") : tt("stats.billingSave")),
+          message ? e("span", { className: "dma-billing-ok" }, message) : null,
+          error ? e("span", { className: "dma-billing-error" }, error) : null
         )
       );
     }
@@ -2270,6 +2435,14 @@ window.__ModuleLoader__.load({
               total: data.sessionsTotal || 0
             })
             : null,
+          !loading && data && data.billing
+            ? e(BillingSection, {
+              key: "billing-" + ((data.billing && data.billing.revision) || 0),
+              t: tt,
+              billing: data.billing,
+              onReload: () => load()
+            })
+            : null,
           !loading && data && data.ledger
             ? e("p", { className: "dma-stats-note" }, tt("stats.ledger", {
               daily: formatYuanCents(data.ledger.dailyCents || 0),
@@ -2278,6 +2451,32 @@ window.__ModuleLoader__.load({
             : null
         )
       )
+      );
+    }
+
+    // 设置导航图标（settings.section.icon 槽位）。
+    // 宿主外壳只给内置 section id 配图标，第三方 section 默认落到齿轮；
+    // 用与 icon.svg 同构的「气泡 + 滑块」线稿补上，颜色跟随宿主 currentColor。
+    function SettingsNavIcon({ size }) {
+      const s = Number(size) > 0 ? Number(size) : 16;
+      return e("svg", {
+        width: s,
+        height: s,
+        viewBox: "0 0 24 24",
+        fill: "none",
+        stroke: "currentColor",
+        strokeWidth: 1.7,
+        strokeLinecap: "round",
+        strokeLinejoin: "round",
+        "aria-hidden": "true",
+        focusable: "false"
+      },
+        e("path", {
+          d: "M4 6.5A3.5 3.5 0 0 1 7.5 3h9A3.5 3.5 0 0 1 20 6.5v6a3.5 3.5 0 0 1-3.5 3.5H11l-4.2 3.4V16H7.5A3.5 3.5 0 0 1 4 12.5z"
+        }),
+        e("path", { d: "M8 8h8M8 12h8" }),
+        e("circle", { cx: 10.5, cy: 8, r: 1.35, fill: "currentColor", stroke: "none" }),
+        e("circle", { cx: 13.5, cy: 12, r: 1.35, fill: "currentColor", stroke: "none" })
       );
     }
 
@@ -2692,6 +2891,7 @@ window.__ModuleLoader__.load({
       const value = costSnap && costSnap.status === "ready" ? costSnap.value : null;
       const balance = value ? value.balance : null;
       const status = value ? value.status : "stale";
+      const route = value && value.route ? value.route : null;
       const lastTurn = value && value.lastTurn ? value.lastTurn : null;
 
       // 余额口径：主数字 = 充值余额 + 赠金钱包（与「日用」观测的总额同基准），
@@ -2764,6 +2964,28 @@ window.__ModuleLoader__.load({
         );
       }
 
+      if (status === "third-party") {
+        // 第三方 / 本地直连：不轮询 DeepSeek 余额，只展示按价格表估算的今日累计。
+        const unverified = route && route.confirmed === false;
+        const daily = value && Number.isFinite(value.dailyCents) ? formatYuanCents(value.dailyCents) : "—";
+        return e("div", { className: "dma-cost-item" },
+          e("div", {
+            className: "dma-cost-card dma-cost-local" + (compact ? " dma-cost-plain" : ""),
+            title: unverified ? tt("stats.billingNote") : undefined,
+            "aria-label": unverified ? tt("cost.thirdPartyUnverified") : tt("cost.thirdParty")
+          },
+            e("span", {
+              className: "dma-cost-period-icon",
+              "aria-hidden": "true",
+              dangerouslySetInnerHTML: { __html: LOCAL_SVG }
+            }),
+            e("span", { className: "dma-cost-local-text" },
+              (unverified ? tt("cost.thirdPartyUnverified") : tt("cost.thirdParty")) +
+              " · " + tt("cost.daily") + " " + daily)
+          )
+        );
+      }
+
       if (status === "local") {
         return e("div", { className: "dma-cost-item" },
           e("div", {
@@ -2790,9 +3012,12 @@ window.__ModuleLoader__.load({
         ? formatYuanCents(Math.round(dailyShown))
         : "—";
       const amountsHidden = status === "signed-out" || status === "api-key" || status === "unavailable";
+      const turnHasUnpriced = lastTurn !== null && lastTurn.hasUnpriced === true;
       const turnText = turnHidden || amountsHidden || !Number.isFinite(turnShown)
         ? "—"
-        : formatCostMicros(Math.round(turnShown));
+        : turnHasUnpriced && lastTurn.costMicros === 0
+          ? tt("stats.unpricedCost")
+          : formatCostMicros(Math.round(turnShown)) + (turnHasUnpriced ? " · " + tt("stats.unpricedSuffix") : "");
 
       const stale = status === "stale" && balanceCents !== null;
       const staleTitle = balance && balance.updatedAt > 0
@@ -3003,6 +3228,26 @@ window.__ModuleLoader__.load({
 .dma-stats-section-head{display:flex;align-items:center;justify-content:space-between;gap:10px}
 .dma-stats-section-title{margin:0;font-size:13px;font-weight:600;color:var(--dsw-alias-label-primary,#1f2329)}
 .dma-stats-note{font-size:11px;line-height:1.5;color:var(--dsw-alias-label-tertiary,#8a919e)}
+.dma-billing-endpoints{display:flex;flex-wrap:wrap;gap:6px 10px;font-size:11px;color:var(--dsw-alias-label-secondary,#4d5460)}
+.dma-billing-endpoint{display:inline-flex;align-items:center;gap:5px;padding:2px 7px;border:.5px solid var(--dsw-alias-border-l2,rgba(0,0,0,.08));border-radius:999px;background:var(--dsw-alias-bg-layer-2,#f2f3f5)}
+.dma-billing-endpoint b{font-weight:600;color:var(--dsw-alias-label-primary,#1f2329)}
+.dma-billing-kind{font-style:normal;font-size:10px;padding:0 5px;border-radius:6px;line-height:15px;background:rgba(47,107,216,.12);color:#2f6bd8}
+.dma-billing-kind-local{background:rgba(0,0,0,.06);color:#6b7280}
+.dma-billing-kind-third{background:rgba(217,164,65,.18);color:#8a5b00}
+.dma-billing-kind-price-official{background:rgba(47,107,216,.12);color:#2f6bd8}
+.dma-billing-kind-price-custom{background:rgba(19,122,78,.14);color:#137a4e}
+.dma-billing-kind-price-estimated{background:rgba(217,164,65,.14);color:#8a5b00}
+.dma-billing-kind-price-unconfigured{background:rgba(0,0,0,.06);color:#6b7280}
+.dma-billing-field{display:flex;flex-direction:column;gap:5px;min-width:0}
+.dma-billing-label{font-size:11.5px;font-weight:600;color:var(--dsw-alias-label-secondary,#4d5460)}
+.dma-billing-input{box-sizing:border-box;width:100%;padding:7px 9px;border:.5px solid var(--dsw-alias-border-l3,#c9ced6);border-radius:7px;background:var(--dsw-alias-bg-layer-1,#fff);color:var(--dsw-alias-label-primary,#1f2329);font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;resize:vertical}
+.dma-billing-input:focus{outline:2px solid var(--dsw-alias-state-business-primary,#4c8dff);outline-offset:1px}
+.dma-billing-json{min-height:120px}
+.dma-billing-actions{display:flex;flex-wrap:wrap;align-items:center;gap:10px}
+.dma-billing-save{height:28px;padding:0 14px;border:0;border-radius:7px;background:var(--dsw-alias-button-primary-fill,#4c8dff);color:#fff;font-size:12px;font-weight:500;cursor:pointer}
+.dma-billing-save:disabled{opacity:.6;cursor:default}
+.dma-billing-ok{font-size:11.5px;color:#137a4e}
+.dma-billing-error{font-size:11.5px;color:#c0392b}
 .dma-stats-range{display:inline-flex;gap:2px;padding:2px;border-radius:8px;background:var(--dsw-alias-bg-layer-2,#f2f3f5)}
 .dma-stats-range button{border:0;border-radius:6px;padding:4px 10px;background:transparent;color:var(--dsw-alias-label-secondary,#5b6472);font-size:12px;line-height:1.4;cursor:pointer}
 .dma-stats-range button[aria-pressed="true"]{background:var(--dsw-alias-bg-layer-1,#fff);color:var(--dsw-alias-label-primary,#1f2329);font-weight:600;box-shadow:0 1px 2px rgba(0,0,0,.08)}
@@ -3016,6 +3261,7 @@ window.__ModuleLoader__.load({
 .dma-stats-billing-bar i{display:block;height:100%}
 .dma-stats-billing-deepseek{background:#2f6bd8}
 .dma-stats-billing-local{background:#a8aeb8}
+.dma-stats-billing-unpriced{background:#d9a441}
 .dma-stats-stack{display:flex;flex-direction:column-reverse;width:100%;max-width:26px;border-radius:3px 3px 0 0;overflow:hidden}
 .dma-stats-seg{display:block;width:100%}
 .dma-stats-seg-input{background:var(--dsw-alias-brand-primary,#4c8dff)}
@@ -3040,6 +3286,8 @@ window.__ModuleLoader__.load({
 .dma-stats-pill{flex:none;padding:0 5px;border-radius:7px;background:rgba(76,141,255,.14);color:#2f6bd8;font-size:10px;font-weight:500;line-height:15px}
 .dma-stats-pill-running{background:rgba(34,160,107,.15);color:#137a4e}
 .dma-stats-pill-local{background:rgba(0,0,0,.06);color:#6b7280}
+.dma-stats-pill-unpriced{background:rgba(217,164,65,.18);color:#8a5b00}
+.dma-stats-pill-unconfirmed{background:rgba(217,164,65,.12);color:#8a5b00;border:.5px dashed rgba(217,164,65,.6)}
 .dma-stats-meta{overflow:hidden;font-size:10.5px;line-height:1.45;white-space:nowrap;text-overflow:ellipsis;color:var(--dsw-alias-label-tertiary,#8a919e)}
 .dma-stats-mini{display:flex;height:4px;margin-top:4px;border-radius:2px;overflow:hidden;background:var(--dsw-alias-bg-layer-1,#fff)}
 .dma-stats-mini i{display:block;height:100%}
@@ -3069,6 +3317,32 @@ window.__ModuleLoader__.load({
 .dma-stats-error{margin:0;font-size:12px;line-height:1.5;color:var(--dsw-alias-state-error-primary,#e5484d)}
 .dma-setting-btn{flex:none;margin-top:2px;align-self:flex-start}
 @keyframes dma-spin{to{transform:rotate(360deg)}}
+@media (prefers-color-scheme:dark){
+.dma-cost-peak .dma-cost-period-text{color:#f0a24a}
+.dma-cost-valley .dma-cost-period-text{color:#8fb8ff}
+.dma-cost-spinner{border-color:rgba(255,255,255,.18)}
+.dma-billing-ok{color:#4ecb8d}
+.dma-billing-error{color:#ff8585}
+.dma-billing-kind{background:rgba(110,160,255,.2);color:#9cc0ff}
+.dma-billing-kind-local,.dma-billing-kind-price-unconfigured{background:rgba(255,255,255,.1);color:#b9c0ca}
+.dma-billing-kind-third,.dma-billing-kind-price-estimated{background:rgba(217,164,65,.24);color:#f0c06a}
+.dma-billing-kind-price-custom{background:rgba(78,203,141,.2);color:#68d9a4}
+.dma-stats-pill{background:rgba(110,160,255,.2);color:#9cc0ff}
+.dma-stats-pill-running{background:rgba(78,203,141,.2);color:#68d9a4}
+.dma-stats-pill-local{background:rgba(255,255,255,.1);color:#b9c0ca}
+.dma-stats-pill-unpriced,.dma-stats-pill-unconfirmed{background:rgba(217,164,65,.22);color:#f0c06a}
+}
+@media (max-width:680px){
+.dma-stats-panel{width:calc(100vw - 24px)}
+.dma-stats-body{padding:12px 14px;gap:12px}
+.dma-stats-row{grid-template-columns:minmax(0,1fr) 72px 64px 64px;gap:6px;padding:8px 10px;font-size:11.5px}
+.dma-stats-kpis{grid-template-columns:repeat(auto-fit,minmax(132px,1fr));gap:8px}
+.dma-stats-card{padding:8px 10px}
+.dma-stats-card-value{font-size:17px}
+.dma-setting-row{gap:12px}
+.dma-tabs{margin-bottom:8px}
+.dma-cost-note{font-size:10.5px}
+}
 `;
 
     function injectCss() {
@@ -3255,6 +3529,16 @@ window.__ModuleLoader__.load({
           locale: NS,
           inject: () => ({ form: settingsForm })
         }, SettingsSection)
+      );
+
+      // 设置导航图标：id 必须与 section id 一致。
+      // 旧宿主没有声明该槽位时 inject 只会挂起，不会抛错，也不影响其它注册。
+      ctx.slots.inject("settings.section.icon", () =>
+        ctx.slots.register({
+          name: "settings.section.icon",
+          id: "dsh-message-actions",
+          locale: NS
+        }, SettingsNavIcon)
       );
 
       // 侧边栏底部费用卡片

@@ -967,7 +967,7 @@ function bj(y, m, d, hh, mm) {
     eq("原子写后读取一致", loaded.state.observedSpendTotalCents, 84);
     eq("旧校正字段不落盘", "correctionCreditCents" in loaded.state, false);
     eq("读取非损坏", loaded.recovered, false);
-    eq("状态版本", loaded.state.version, 1);
+    eq("状态版本", loaded.state.version, 2);
     eq("普通版本可写", loaded.readOnly, false);
 
     fs.writeFileSync(file, "{ not json", "utf8");
@@ -999,7 +999,7 @@ function bj(y, m, d, hh, mm) {
     eq("重建后下一次写入成功", store.loadCostState(file).state.baselineBalanceCents, 999);
     ok("状态文件默认上限 4MB", store.MAX_STATE_BYTES === 4 * 1024 * 1024);
 
-    const high = store.normalizeCostState({ version: 2, baselineBalanceCents: 100 });
+    const high = store.normalizeCostState({ version: 3, baselineBalanceCents: 100 });
     eq("高版本只读", high.readOnly, true);
     eq("高版本字段仍可读", high.state.baselineBalanceCents, 100);
 
@@ -1018,8 +1018,8 @@ function bj(y, m, d, hh, mm) {
 {
   eq("账户登录路由", s.routingOfProvider("deepseek-account"), "account");
   eq("官方 API key 路由", s.routingOfProvider("deepseek-official"), "api-key");
-  eq("本地模型路由", s.routingOfProvider("ninfer-27b"), "local");
-  eq("第三方网关按本地处理", s.routingOfProvider("openai-compatible"), "local");
+  eq("本地模型不是余额账户", s.routingOfProvider("ninfer-27b"), "other");
+  eq("第三方网关不是余额账户", s.routingOfProvider("openai-compatible"), "other");
   eq("大小写与空白归一", s.routingOfProvider("  DeepSeek-Account "), "account");
   eq("空 provider", s.routingOfProvider(""), null);
   eq("非字符串 provider", s.routingOfProvider(undefined), null);
@@ -1271,8 +1271,8 @@ function fakeRes() {
   eq("i18n zh / en 键完全一致", zhKeys, enKeys);
   ok("i18n zh 非空", zhKeys.length > 50);
   ok("i18n en 非空", enKeys.length > 50);
-  eq("i18n meta.zh.title 为插件名", i18n.meta.zh.title, "dsh-message-actions");
-  eq("i18n meta.en.title 为插件名", i18n.meta.en.title, "dsh-message-actions");
+  eq("i18n meta.zh.title 为显示名", i18n.meta.zh.title, "消息管家");
+  eq("i18n meta.en.title 为显示名", i18n.meta.en.title, "Message Butler");
   eq("i18n meta.zh.description 按定稿原文", i18n.meta.zh.description, "功能：撤回、删除、删至末尾、多选分享与导出，每条回答的用量计费、余额费用展示、对话完成声音提示等。");
   eq("i18n meta.en.description 与中文同义", i18n.meta.en.description, "Features: recall, delete, delete-to-end, multi-select share and export; per-reply usage billing, balance and cost display, and a completion sound.");
   const iconSrc = fs.readFileSync(fileURLToPath(new URL("../icon.svg", import.meta.url)), "utf8");
@@ -2013,14 +2013,22 @@ function pushTombstone(bag, plan, id, action) {
   eq("折叠：最后活跃时间", fold.lastActiveAt, baseAt - 40 * 60 * 1000);
   eq("折叠：空日志不崩", s.foldSessionStats(null).points.length, 0);
 
-  // 计费口径：只有 DeepSeek 官方路由计费；本地模型 token 照常统计但成本为 0。
+  // 计费口径：默认计费，只有确认为本地 / 内网才不计费。
+  const localEndpoints = { "ninfer-27b": "http://192.168.31.10:51200/v1" };
   eq("计费：DeepSeek 账户路由计费", s.isBillableRoute("deepseek-account", "deepseek-flash"), true);
   eq("计费：DeepSeek 官方路由计费", s.isBillableRoute("deepseek-official", "deepseek-v4-pro"), true);
-  eq("计费：本地模型不计费", s.isBillableRoute("ninfer-27b", "ninfer-27b"), false);
+  eq("计费：局域网路由不计费", s.isBillableRoute("ninfer-27b", "ninfer-27b", { endpoints: localEndpoints }), false);
   eq("计费：无 provider 但模型为 DeepSeek 时兜底计费", s.isBillableRoute("", "deepseek-flash"), true);
-  eq("计费：无 provider 且未知模型不计费", s.isBillableRoute("", "llama3"), false);
-  eq("计费：provider 与模型都缺失时不计费", s.isBillableRoute(undefined, undefined), false);
-  ok("计费：provider 优先于模型名", s.isBillableRoute("ninfer-27b", "deepseek-flash") === false);
+  eq("计费：无 provider 且未知模型默认计费", s.isBillableRoute("", "llama3"), true);
+  eq("计费：provider 与模型都缺失时默认计费", s.isBillableRoute(undefined, undefined), true);
+  ok("计费：provider 不是本地时 model 不改变计费", s.isBillableRoute("openrouter", "deepseek-flash") === true);
+  eq("计费：覆盖清单 always 覆盖本地", s.classifyRoute({ provider: "ninfer-27b", model: "ninfer-27b" },
+    { endpoints: localEndpoints, overrides: { "ninfer-27b": "always" } }).billable, true);
+  eq("计费：覆盖清单 local 覆盖第三方", s.classifyRoute({ provider: "openrouter", model: "gpt-4o" },
+    { endpoints: { openrouter: "https://openrouter.ai/api/v1" }, overrides: { openrouter: "local" } }).billable, false);
+  eq("计费：未知来源默认计费且标记未确认", s.classifyRoute({ provider: "mystery", model: "mystery" }).confirmed, false);
+  eq("计费：官方域名视为官方", s.classifyRoute({ provider: "proxy", model: "x" },
+    { endpoints: { proxy: "https://api.deepseek.com/v1" } }).official, true);
 
   const localEvents = [
     { type: "request/header", time: baseAt - 30 * 60 * 1000, data: { header: { config: { provider: "ninfer-27b", model: "ninfer-27b" } } } },
@@ -2030,7 +2038,7 @@ function pushTombstone(bag, plan, id, action) {
       data: { turn: 1, usage: { inputTokens: 1000, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 500 } }
     }
   ];
-  const localFold = s.foldSessionStats(localEvents);
+  const localFold = s.foldSessionStats(localEvents, { endpoints: localEndpoints });
   eq("计费：本地时间点标记不计费", localFold.points[0].billable, false);
   eq("计费：本地时间点成本为 0", s.statsPointCostMicros(localFold.points[0]), 0);
   eq("计费：本地 token 仍统计", localFold.tokens.input + localFold.tokens.output, 1500);
@@ -2050,6 +2058,47 @@ function pushTombstone(bag, plan, id, action) {
   eq("计费：时间线本地桶 billableTokens", localBuckets[1].billableTokens, 0);
   eq("计费：时间线本地桶成本为 0", localBuckets[1].costMicros, 0);
 
+  // 第三方未配置价格：token 照常统计，金额为 0，并标记 unpriced / unconfirmed。
+  const thirdFold = s.foldSessionStats([
+    { type: "request/header", time: baseAt - 30 * 60 * 1000, data: { header: { config: { provider: "openrouter", model: "gpt-4o" } } } },
+    {
+      type: "assistant/message",
+      time: baseAt - 20 * 60 * 1000,
+      data: { turn: 1, usage: { inputTokens: 1000, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 500 } }
+    }
+  ], { endpoints: { openrouter: "https://openrouter.ai/api/v1" } });
+  eq("计费：第三方未配置价格标记 priced=false", thirdFold.points[0].priced, false);
+  eq("计费：第三方未配置价格来源", thirdFold.points[0].priceSource, "unconfigured");
+  eq("计费：第三方未配置价格成本为 0", s.statsPointCostMicros(thirdFold.points[0]), 0);
+  const thirdRow = s.statsSessionRow({ id: "third-1" }, thirdFold, {});
+  eq("计费：第三方未配置计入 unpricedTokens", thirdRow.unpricedTokens, 1500);
+  eq("计费：第三方未配置 billableTokens 为 0", thirdRow.billableTokens, 0);
+  eq("计费：第三方未配置标记 hasUnpriced", thirdRow.hasUnpriced, true);
+  eq("计费：第三方未配置成本仍为 0", thirdRow.costMicros, 0);
+
+  // 第三方已配置价格：按配置价计价，且不适用 DeepSeek 峰谷折扣。
+  const thirdPriced = s.foldSessionStats([
+    { type: "request/header", time: baseAt - 30 * 60 * 1000, data: { header: { config: { provider: "openrouter", model: "gpt-4o" } } } },
+    {
+      type: "assistant/message",
+      time: baseAt - 20 * 60 * 1000,
+      data: { turn: 1, usage: { inputTokens: 1000, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 500 } }
+    }
+  ], {
+    endpoints: { openrouter: "https://openrouter.ai/api/v1" },
+    prices: { models: { "gpt-4o": { cacheHit: 1, cacheMiss: 10, output: 20 } } }
+  });
+  eq("计费：第三方自定义价来源", thirdPriced.points[0].priceSource, "custom");
+  eq("计费：第三方自定义价金额", s.statsPointCostMicros(thirdPriced.points[0]), 20000);
+  ok("计费：第三方价格按 model 精确匹配", s.priceEntryFor({ provider: "openrouter", model: "gpt-4o" },
+    { endpoints: { openrouter: "https://openrouter.ai/api/v1" }, prices: { models: { "gpt-4o": { cacheHit: 1, cacheMiss: 10, output: 20 } } } }).source === "custom");
+  eq("计费：第三方价格前缀匹配", s.priceEntryFor({ provider: "x", model: "gpt-4o-mini" },
+    { endpoints: { x: "https://api.example.com" }, prices: { prefixes: { "gpt-": { cacheHit: 1, cacheMiss: 1, output: 1 } } } }).matched, "prefix:gpt-");
+  eq("计费：第三方价格 provider 匹配", s.priceEntryFor({ provider: "openai", model: "o3" },
+    { endpoints: { openai: "https://api.openai.com" }, prices: { providers: { openai: { cacheHit: 1, cacheMiss: 2, output: 3 } } } }).matched, "provider");
+  eq("计费：第三方价格全局兜底来源", s.priceEntryFor({ provider: "openai", model: "o3" },
+    { endpoints: { openai: "https://api.openai.com" }, prices: { fallback: { cacheHit: 1, cacheMiss: 2, output: 3 } } }).source, "estimated");
+
   const mixedEvents = [
     { type: "request/header", time: baseAt - 40 * 1000, data: { header: { config: { provider: "deepseek-account", model: "deepseek-flash" } } } },
     {
@@ -2064,7 +2113,7 @@ function pushTombstone(bag, plan, id, action) {
       data: { turn: 1, usage: { inputTokens: 2000, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 1000 } }
     }
   ];
-  const mixedRow = s.statsSessionRow({ id: "mixed-1" }, s.foldSessionStats(mixedEvents), {});
+  const mixedRow = s.statsSessionRow({ id: "mixed-1" }, s.foldSessionStats(mixedEvents, { endpoints: localEndpoints }), {});
   ok("计费：混合会话只计 DeepSeek 部分", mixedRow.costMicros > 0);
   eq("计费：混合会话 billableTokens", mixedRow.billableTokens, 101000);
   eq("计费：混合会话 localTokens", mixedRow.localTokens, 3000);
@@ -2152,9 +2201,18 @@ function pushTombstone(bag, plan, id, action) {
   ok("宿主：预算路由", /path: STATS_BUDGET_ROUTE/.test(indexSrc));
   ok("宿主：复用官方 sessionQuery", /ctx\.get\("sessionQuery"\)/.test(indexSrc));
   ok("宿主：折叠复用共享纯函数", /foldSessionStats\(/.test(indexSrc) && /statsTimeline\(/.test(indexSrc));
-  ok("宿主：结算只对 DeepSeek 可计费分组计价",
-    /isBillableRoute\(group\.provider, group\.model\)/.test(indexSrc) &&
-    /turnCostOfGroups\(billableGroups/.test(indexSrc));
+  ok("宿主：结算按分类口径计价（默认计费 + 本地例外）",
+    /costOfGroups\(usage\.groups, period, classifyOptions\(\)\)/.test(indexSrc) &&
+    /classifyRoute\(/.test(indexSrc) && /priceEntryFor\(/.test(indexSrc));
+  ok("宿主：第三方计费不触发 DeepSeek 余额轮询",
+    /routing: "third-party"/.test(indexSrc) && /mapped === "other"/.test(indexSrc));
+  ok("宿主：provider→baseURL 三级探测（llm → configEditor → patch）",
+    /llm\.listProviders/.test(indexSrc) && /configEditor/.test(indexSrc) &&
+    /profileContext/.test(indexSrc) && /collectEndpointsFromPatch/.test(indexSrc));
+  ok("宿主：计费配置读写路由",
+    /BILLING_ROUTE = "\/dsh-message-actions\/billing"/.test(indexSrc) &&
+    /makeBillingHandler/.test(indexSrc) && /applyBilling/.test(indexSrc));
+  ok("宿主：价格表变更触发历史重算", /billingRevision/.test(indexSrc));
   ok("宿主：预算写入走同一状态文件", /applyBudget\(/.test(indexSrc) && /cost\.budgetCents\(\)/.test(indexSrc));
   ok("客户端：侧边栏费用行末尾入口", /dma-stats-entry/.test(clientSrc) && !/statsEntryVisible\(cfg\)/.test(clientSrc));
   ok("客户端：图标 + 悬停提示", /title: tt\("stats\.entryTitle"\)/.test(clientSrc));
@@ -2350,9 +2408,9 @@ function pushTombstone(bag, plan, id, action) {
   ok("客户端：会话表本地行成本显示「本地」并加灰色标记",
     /tt\("stats\.localCost"\)/.test(clientSrc) &&
     /dma-stats-pill-local/.test(clientSrc) && /tt\("stats\.localTag"\)/.test(clientSrc));
-  ok("客户端：统计表说明写明仅 DeepSeek 官方模型计费", /tt\("stats\.billingNote"\)/.test(clientSrc));
-  ok("文案：仅 DeepSeek 计费说明（英）",
-    String(i18n.en["stats.billingNote"]).indexOf("Only official DeepSeek models are billed") >= 0);
+  ok("客户端：统计表说明写明默认计费与本地例外", /tt\("stats\.billingNote"\)/.test(clientSrc));
+  ok("文案：默认计费说明（英）",
+    String(i18n.en["stats.billingNote"]).indexOf("Billed by default") >= 0);
   eq("文案：预算说明已缩短（中）", i18n.zh["stats.budgetHint"], "按全部会话估算成本；填 0 隐藏占比");
   ok("客户端：「修改预算」按钮为主要入口（与点金额共用）",
     /const openBudgetEdit = \(\) => \{/.test(clientSrc) &&
@@ -2444,7 +2502,9 @@ function pushTombstone(bag, plan, id, action) {
     ev("turn/end", { turn: 1 })
   ];
   const { events: bag, nodes } = session(events);
-  const summary = messagesSummaryOf(bag, nodes);
+  const summary = messagesSummaryOf(bag, nodes, null, {
+    endpoints: { "ninfer-27b": "http://127.0.0.1:11434" }
+  });
   const row = (seq) => summary.rows.find((item) => item.seq === seq);
 
   eq("单条金额：DeepSeek 高峰百万输入", row(3).costMicros, 2000000);
@@ -2561,7 +2621,10 @@ function pushTombstone(bag, plan, id, action) {
   ok("客户端：交给官方 drop 通道", /new DragEvent\("drop"/.test(clientSrc) && /document\.dispatchEvent\(event\)/.test(clientSrc));
   ok("客户端：构造 File 恢复附件", /new File\(\[blob\], name, \{ type: meta\.mediaType/.test(clientSrc));
   ok("客户端：单条金额用 4 位格式", /formatReplyCost\(row\.costMicros\)/.test(clientSrc));
-  ok("客户端：本地路由显示「本地」", /row\.billable === false \? tt\("stats\.localCost"\)/.test(clientSrc));
+  ok("客户端：本地路由显示「本地」", /row\.billable === false[\s\S]{0,80}tt\("stats\.localCost"\)/.test(clientSrc));
+  ok("客户端：未配置价格显示「未配置」", /row\.costPriced === false[\s\S]{0,80}tt\("stats\.unpricedCost"\)/.test(clientSrc));
+  ok("客户端：计费设置入口与来源诊断", /BILLING_ROUTE/.test(clientSrc) && /BillingSection/.test(clientSrc) &&
+    /stats\.billingEndpoints/.test(clientSrc));
   ok("客户端：单条金额并入统计行", /words \+ " " \+ tt\("stats\.unit"\),[\s\S]{0,40}replyCost/.test(clientSrc));
 
   eq("文案：单条金额说明中文", i18n.zh["stats.replyCostTitle"], "本条回答估算 {cost}；同一轮的合计见侧边栏「单次」");
@@ -2613,6 +2676,18 @@ function pushTombstone(bag, plan, id, action) {
     /\.dma-panel-head\{flex:none/.test(sharedSrc) &&
     /\.dma-panel-body\{flex:1 1 auto;min-height:0;overflow:auto/.test(sharedSrc) &&
     /\.dma-panel-foot\{flex:none/.test(sharedSrc));
+}
+
+// ---------------------------------------------------------------------------
+// 56. 附件响应头安全（media type 白名单）
+// ---------------------------------------------------------------------------
+
+{
+  eq("附件类型：白名单栅格原样返回", s.attachmentMediaType("image/jpeg", "image"), "image/jpeg");
+  eq("附件类型：SVG 降级", s.attachmentMediaType("image/svg+xml", "image"), "image/png");
+  eq("附件类型：text/html 降级", s.attachmentMediaType("text/html", "file"), "application/octet-stream");
+  eq("附件类型：CRLF 注入降级", s.attachmentMediaType("image/png\r\nX-Evil: 1", "image"), "image/png");
+  eq("附件类型：缺失值降级", s.attachmentMediaType(undefined, "file"), "application/octet-stream");
 }
 
 // ---------------------------------------------------------------------------

@@ -40,6 +40,15 @@ const ERROR_LABELS = {
     ATTACHMENT_NOT_FOUND: '附件不存在或已失效',
     ATTACHMENT_UNAVAILABLE: '附件服务不可用',
     ATTACHMENT_READ_FAILED: '附件读取失败',
+    SESSION_LIVE: '该会话正在使用中，请先切换或关闭后再操作',
+    WORKSPACE_NOT_FOUND: '目标工作区不存在',
+    WORKSPACE_MISSING: '目标工作区目录已不存在',
+    MOVE_UNAVAILABLE: '当前宿主不支持移动会话',
+    MOVE_FAILED: '移动会话失败，已回滚',
+    TRASH_UNAVAILABLE: '回收站不可用',
+    TRASH_NOT_FOUND: '回收站条目不存在',
+    TRASH_CONFLICT: '原位置已存在同名会话，无法恢复',
+    CONFIRM_REQUIRED: '需要二次确认',
     INTERNAL: '内部错误'
   },
   en: {
@@ -58,6 +67,15 @@ const ERROR_LABELS = {
     ATTACHMENT_NOT_FOUND: 'Attachment not found or no longer available',
     ATTACHMENT_UNAVAILABLE: 'Attachment service is unavailable',
     ATTACHMENT_READ_FAILED: 'Could not read the attachment',
+    SESSION_LIVE: 'This session is in use; switch to another session first',
+    WORKSPACE_NOT_FOUND: 'Target workspace does not exist',
+    WORKSPACE_MISSING: 'Target workspace folder no longer exists',
+    MOVE_UNAVAILABLE: 'This host does not support moving sessions',
+    MOVE_FAILED: 'Could not move the session; changes were rolled back',
+    TRASH_UNAVAILABLE: 'Trash is unavailable',
+    TRASH_NOT_FOUND: 'Trash entry not found',
+    TRASH_CONFLICT: 'A session already exists at the original location',
+    CONFIRM_REQUIRED: 'Confirmation is required',
     INTERNAL: 'Internal error'
   }
 };
@@ -672,20 +690,34 @@ function goneTurnsOf(events, nodes, lookup) {
 /**
  * 单条回答的估算成本：只针对该条 `assistant/message` 自己的 usage，
  * 不复用同一轮其它步骤的数据，避免同轮多步骤重复计价。
- * 本地 / 非 DeepSeek 路由返回 `{ micros: 0, billable: false }`；
- * 无 usage 或无法判定路由时返回 undefined（界面不显示金额）。
- * @returns {{ micros: number, billable: boolean } | undefined}
+ * 本地路由返回 `{ micros: 0, billable: false }`；第三方未配置价格返回
+ * `{ micros: 0, billable: true, priced: false }`；无 usage / 无路由返回 undefined。
+ * @returns {{ micros: number, billable: boolean, priced: boolean, source: string } | undefined}
  */
-function replyCostOf(event) {
+function replyCostOf(event, options) {
   if (!event || event.type !== 'assistant/message') return undefined;
   const usage = stepUsageOf(event);
   if (!usage) return undefined;
   const data = event.data || {};
   const route = routeOfUsage(data.usage) || routeOfMessage(data.message);
   if (!route) return undefined;
-  if (!isBillableRoute(route.provider, route.model)) return { micros: 0, billable: false };
+  const item = costOfGroup({ provider: route.provider, model: route.model, usage }, 'peak', options);
   const at = Number.isFinite(event.time) ? event.time : Date.now();
-  return { micros: turnCost(usage, route.model, periodInfo(at).period), billable: true };
+  const period = periodInfo(at).period;
+  const micros = item.priced
+    ? costMicrosOf(usage, { price: item.price, peakValley: item.peakValley }, period)
+    : 0;
+  return {
+    micros: micros === null ? 0 : micros,
+    billable: item.billable,
+    priced: item.priced,
+    source: item.source,
+    matched: item.matched,
+    confirmed: item.classification.confirmed,
+    kind: item.classification.kind,
+    baseUrl: item.classification.baseUrl,
+    host: item.classification.host
+  };
 }
 
 /**
@@ -700,13 +732,14 @@ function replyCostOf(event) {
  * @param events 按 seq 索引的事件数组
  * @param nodes  当前 surface.nodes
  * @param lookup createTurnLookup 的返回值（可缺省）
- * @param options { filter?: Set<number>, since?: number, previewLimit?: number }
+ * @param options { filter?: Set<number>, since?: number, previewLimit?: number, endpoints?: object, overrides?: object, prices?: object }
  * @returns {{ version: number, nodeCount: number, rows: Array, rounds: Array, goneTurns: number[], goneTools: string[], removedSeqs: number[] }}
  */
 function messagesSummaryOf(events, nodes, lookup, options) {
   const opts = options || {};
   const turns = lookup || createTurnLookup(events);
   const filter = opts.filter instanceof Set ? opts.filter : null;
+  const billingOptions = { endpoints: opts.endpoints, overrides: opts.overrides, prices: opts.prices };
   // 游标 v.s. seqs 列表：seqs 是「包含列表」，且长会话里已持有的 seq 数量会无限增长；
   // 游标只传一个整数，天然表达「只要新的」。
   const since = Number.isSafeInteger(opts.since) && opts.since >= 0 ? opts.since : null;
@@ -733,7 +766,7 @@ function messagesSummaryOf(events, nodes, lookup, options) {
       (data.source === undefined || data.source === null || data.source.kind === undefined || data.source.kind === 'user');
     const isText = isUserQuestion || event.type === 'assistant/message';
     const text = isText ? textOf(event) : '';
-    const replyCost = event.type === 'assistant/message' ? replyCostOf(event) : undefined;
+    const replyCost = event.type === 'assistant/message' ? replyCostOf(event, billingOptions) : undefined;
     const summary = {
       seq,
       type: event.type,
@@ -747,6 +780,10 @@ function messagesSummaryOf(events, nodes, lookup, options) {
       usage: usageSummaryOf(event),
       costMicros: replyCost ? replyCost.micros : null,
       billable: replyCost ? replyCost.billable : null,
+      costPriced: replyCost ? replyCost.priced : null,
+      costSource: replyCost ? replyCost.source : null,
+      routeConfirmed: replyCost ? replyCost.confirmed : null,
+      routeKind: replyCost ? replyCost.kind : null,
       callId: toolCallIdOf(event)
     };
     const beyondCursor = since === null || seq > since;
@@ -1148,9 +1185,73 @@ function priceFor(model, table) {
   return prices.default || PRICE_TABLE.default;
 }
 
+/**
+ * 解析该路由的价目与来源。
+ *
+ * - 官方路由（DeepSeek provider / 官方域名 / 无来源但模型名为 deepseek）→ 官方价；
+ * - 第三方：model 精确 → model 前缀（最长优先）→ provider → 全局兜底；
+ * - 都没有 → `{ price: null, source: 'unconfigured' }`，成本不计入日用。
+ *
+ * @param route { provider, model, baseUrl? }
+ * @param options { classification?, prices?, endpoints?, overrides? }
+ * @returns {{ price: object|null, source: 'official'|'custom'|'estimated'|'unconfigured', peakValley: boolean, matched: string|null }}
+ */
+function priceEntryFor(route, options) {
+  const o = options || {};
+  const classification = o.classification || classifyRoute(route, o);
+  const key = String(route && route.model ? route.model : '').trim().toLowerCase();
+  if (classification.official) {
+    const exact = key && key !== 'default' && Object.prototype.hasOwnProperty.call(PRICE_TABLE, key)
+      ? PRICE_TABLE[key]
+      : null;
+    return {
+      price: exact || PRICE_TABLE.default,
+      source: 'official',
+      peakValley: true,
+      matched: exact ? 'model' : 'official-default'
+    };
+  }
+  const prices = normalizePriceConfig(o.prices);
+  if (key && prices.models[key]) {
+    return { price: prices.models[key], source: 'custom', peakValley: false, matched: 'model' };
+  }
+  let prefix = '';
+  for (const candidate of Object.keys(prices.prefixes)) {
+    if (key.startsWith(candidate) && candidate.length > prefix.length) prefix = candidate;
+  }
+  if (prefix) {
+    return { price: prices.prefixes[prefix], source: 'custom', peakValley: false, matched: 'prefix:' + prefix };
+  }
+  const provider = providerKeyOf(route && route.provider);
+  if (provider && prices.providers[provider]) {
+    return { price: prices.providers[provider], source: 'custom', peakValley: false, matched: 'provider' };
+  }
+  if (prices.fallback) {
+    return { price: prices.fallback, source: 'estimated', peakValley: false, matched: 'fallback' };
+  }
+  return { price: null, source: 'unconfigured', peakValley: false, matched: null };
+}
+
 /** 计数型 token 值：非负安全整数才认。 */
 function tokenCount(value) {
   return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : 0;
+}
+
+/**
+ * 按已解析价目计算金额（微元）。`peakValley=false` 表示平价（第三方自定义价）。
+ * 价目缺失 → null（未配置）。
+ */
+function costMicrosOf(usage, entry, period) {
+  if (!entry || !entry.price) return null;
+  const p = entry.price;
+  const u = usage && typeof usage === 'object' ? usage : {};
+  const factor = entry.peakValley === false || period === 'peak' ? 1 : VALLEY_FACTOR;
+  const yuan =
+    tokenCount(u.inputTokens) * p.cacheMiss / 1e6 +
+    tokenCount(u.cacheReadTokens) * p.cacheHit / 1e6 +
+    tokenCount(u.outputTokens) * p.output / 1e6 +
+    tokenCount(u.reasoningTokens) * (Number.isFinite(p.reasoning) ? p.reasoning : 0) / 1e6;
+  return Math.round(yuan * factor * 1e6);
 }
 
 /**
@@ -1163,18 +1264,17 @@ function tokenCount(value) {
  * @returns {number} costMicros
  */
 function turnCost(usage, model, period, table) {
-  const u = usage && typeof usage === 'object' ? usage : {};
-  const p = priceFor(model, table);
-  const factor = period === 'peak' ? 1 : VALLEY_FACTOR;
-  const yuan =
-    tokenCount(u.inputTokens) * p.cacheMiss / 1e6 +
-    tokenCount(u.cacheReadTokens) * p.cacheHit / 1e6 +
-    tokenCount(u.outputTokens) * p.output / 1e6 +
-    tokenCount(u.reasoningTokens) * p.reasoning / 1e6;
-  return Math.round(yuan * factor * 1e6);
+  return costMicrosOf(usage, { price: priceFor(model, table), peakValley: true }, period) || 0;
 }
 
-/** 多个 (route, usage) 分组分别计价后求和（不同模型不会用错单价）。 */
+/** usage 的总 token 数（四类合计）。 */
+function usageTokenTotal(usage) {
+  const u = usage && typeof usage === 'object' ? usage : {};
+  return tokenCount(u.inputTokens) + tokenCount(u.cacheReadTokens) +
+    tokenCount(u.cacheWriteTokens) + tokenCount(u.outputTokens);
+}
+
+/** 旧接口：按官方价目表对多个分组求和（保留给 0.2.1 / 旧调用方与测试）。 */
 function turnCostOfGroups(groups, period, table) {
   let micros = 0;
   for (const group of groups || []) {
@@ -1182,6 +1282,74 @@ function turnCostOfGroups(groups, period, table) {
     micros += turnCost(group.usage || group.tokens, group.model, period, table);
   }
   return micros;
+}
+
+/**
+ * 单个 (route, usage) 分组的计费结果。
+ * @param group { provider, model, usage|tokens, baseUrl? }
+ * @param period "peak" | "offpeak"
+ * @param options { endpoints?, overrides?, prices? }
+ */
+function costOfGroup(group, period, options) {
+  const g = group || {};
+  const usage = g.usage || g.tokens;
+  const route = { provider: g.provider, model: g.model, baseUrl: g.baseUrl };
+  const classification = classifyRoute(route, options);
+  const tokens = usageTokenTotal(usage);
+  if (!classification.billable) {
+    return { micros: 0, tokens, billable: false, priced: false, source: 'local', matched: null, classification };
+  }
+  const entry = priceEntryFor(route, Object.assign({}, options, { classification }));
+  const micros = costMicrosOf(usage, entry, period);
+  return {
+    micros: micros === null ? 0 : micros,
+    tokens,
+    billable: true,
+    priced: micros !== null,
+    source: entry.source,
+    matched: entry.matched,
+    price: entry.price,
+    peakValley: entry.peakValley,
+    classification
+  };
+}
+
+/**
+ * 多个分组分别计价后求和，并给出计费口径明细。
+ * 未配置价格的分组：token 计入 `unpricedTokens`，金额不计入 `micros`。
+ */
+function costOfGroups(groups, period, options) {
+  const out = {
+    micros: 0,
+    billableTokens: 0,
+    localTokens: 0,
+    unpricedTokens: 0,
+    pricedTokens: 0,
+    hasUnpriced: false,
+    hasUnconfirmed: false,
+    sources: { official: 0, custom: 0, estimated: 0, unconfigured: 0, local: 0 }
+  };
+  for (const group of groups || []) {
+    if (!group) continue;
+    const item = costOfGroup(group, period, options);
+    if (!item.billable) {
+      out.localTokens += item.tokens;
+      out.sources.local += 1;
+      continue;
+    }
+    out.billableTokens += item.tokens;
+    if (!item.classification.confirmed) out.hasUnconfirmed = true;
+    if (!item.priced) {
+      out.unpricedTokens += item.tokens;
+      out.hasUnpriced = true;
+      out.sources.unconfigured += 1;
+      continue;
+    }
+    out.pricedTokens += item.tokens;
+    out.micros += item.micros;
+    if (Object.prototype.hasOwnProperty.call(out.sources, item.source)) out.sources[item.source] += 1;
+  }
+  return out;
 }
 
 /**
@@ -1266,10 +1434,12 @@ function routeOfUsage(usage) {
 }
 
 /**
- * provider → 计费口径：
+ * provider → 余额口径（只回答「是否消耗 DeepSeek 账户余额」，不回答「是否计费」）：
  * - `deepseek-account` → account（账户余额可观测）
  * - 其他 DeepSeek 官方路由（如 deepseek-official）→ api-key
- * - 非 DeepSeek 的 provider（本地模型、第三方网关）→ local（不消耗 DeepSeek 余额）
+ * - 其余 provider（本地模型、第三方网关）→ other
+ *
+ * 第三方计费不能触发 DeepSeek 余额轮询，因此这里不再把第三方归入 local。
  */
 function routingOfProvider(provider) {
   if (typeof provider !== 'string' || provider.length === 0) return null;
@@ -1277,7 +1447,7 @@ function routingOfProvider(provider) {
   if (!key) return null;
   if (key === 'deepseek-account') return 'account';
   if (key.startsWith('deepseek')) return 'api-key';
-  return 'local';
+  return 'other';
 }
 
 /** 模型名是否为 DeepSeek 官方模型（无 provider 时用于兜底判定）。 */
@@ -1285,22 +1455,247 @@ function isDeepseekModel(model) {
   return typeof model === 'string' && /^deepseek/i.test(model.trim());
 }
 
+// ---------------------------------------------------------------------------
+// 计费口径：本地 / 官方 / 第三方
+// ---------------------------------------------------------------------------
+
+/** provider 键归一化（去空白、转小写）。 */
+function providerKeyOf(provider) {
+  return typeof provider === 'string' ? provider.trim().toLowerCase() : '';
+}
+
 /**
- * 该次用量是否计入 DeepSeek 费用（统计表「估算成本」/「预算使用」/「日用」）。
+ * 从 baseURL 提取主机名（不含协议、端口、路径、userinfo）。
+ * 支持 `http://host:port/v1`、`host:port/v1`、`//host`、`[::1]:1234`。
+ * @returns {string} 小写主机名；无法解析时返回 ''
+ */
+function hostOfBaseUrl(baseUrl) {
+  if (typeof baseUrl !== 'string') return '';
+  let text = baseUrl.trim();
+  if (!text) return '';
+  const scheme = /^[a-z][a-z0-9+.-]*:\/\/([^/?#]+)/i.exec(text);
+  if (scheme) text = scheme[1];
+  else if (text.startsWith('//')) text = text.slice(2);
+  else text = text.split(/[/?#]/)[0];
+  const at = text.lastIndexOf('@');
+  if (at >= 0) text = text.slice(at + 1);
+  if (text.startsWith('[')) {
+    const end = text.indexOf(']');
+    if (end > 0) return text.slice(1, end).toLowerCase();
+  }
+  // IPv6 无方括号时直接返回（避免被端口分割破坏）
+  if ((text.match(/:/g) || []).length > 1) return text.toLowerCase();
+  return text.split(':')[0].replace(/\.$/, '').toLowerCase();
+}
+
+/**
+ * 主机是否属于本地 / 内网（默认不计费）。
+ * 规则：
+ * - 回环：localhost、*.localhost、127.0.0.0/8、::1、0.0.0.0
+ * - 私网：10/8、172.16/12、192.168/16、169.254/16
+ * - IPv6 私网：fc00::/7、fe80::/10
+ * - 局域网域名：*.local
+ * - 容器 / 本机别名：host.docker.internal 等
+ * - 单标签主机名（如 Docker 服务名 `ollama`）
+ * @returns {boolean|null} null 表示没有 baseURL、无法判定
+ */
+function isLocalHost(host) {
+  if (typeof host !== 'string' || host.length === 0) return null;
+  const h = host.trim().toLowerCase().replace(/^\[|\]$/g, '');
+  if (!h) return null;
+  if (h === 'localhost' || h === 'localhost.localdomain' || h === '::1' || h === '0.0.0.0') return true;
+  if (h.endsWith('.localhost') || h.endsWith('.local')) return true;
+  if (h === 'host.docker.internal' || h === 'host.containers.internal' || h === 'gateway.docker.internal') return true;
+  const ipv4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(h);
+  if (ipv4) {
+    const parts = ipv4.slice(1).map(Number);
+    if (parts.some((n) => n > 255)) return false;
+    const [a, b] = parts;
+    if (a === 127 || a === 10 || a === 0) return true;
+    if (a === 172 && b >= 16 && b <= 31) return true;
+    if (a === 192 && b === 168) return true;
+    if (a === 169 && b === 254) return true;
+    return false;
+  }
+  if (h.includes(':')) {
+    const first = h.split(':')[0];
+    if (/^f[cd][0-9a-f]{0,2}$/.test(first)) return true;
+    if (/^fe[89ab][0-9a-f]{0,2}$/.test(first)) return true;
+    return false;
+  }
+  // 单标签主机名（`ollama`、`litellm` 之类）通常是本机 / 容器内服务。
+  if (!h.includes('.')) return true;
+  return false;
+}
+
+/** 是否 DeepSeek 官方 API 主机。 */
+function isOfficialDeepseekHost(host) {
+  if (typeof host !== 'string' || !host) return false;
+  const h = host.toLowerCase();
+  return h === 'deepseek.com' || h.endsWith('.deepseek.com');
+}
+
+/**
+ * 归一化计费覆盖清单（provider → always | local）。
+ * 接受对象或文本：`provider=always` / `provider=local`，`#` 开头为注释。
+ */
+function normalizeBillingOverrides(raw) {
+  const out = {};
+  const put = (provider, value) => {
+    const key = providerKeyOf(provider);
+    if (!key) return;
+    const text = typeof value === 'string' ? value.trim().toLowerCase() : '';
+    if (text === 'always' || text === 'bill' || text === 'billed' || text === 'yes') out[key] = 'always';
+    else if (text === 'local' || text === 'never' || text === 'skip' || text === 'no') out[key] = 'local';
+  };
+  if (typeof raw === 'string') {
+    for (const line of raw.split(/\r?\n/)) {
+      const text = line.trim();
+      if (!text || text.startsWith('#')) continue;
+      const at = text.indexOf('=');
+      if (at <= 0) continue;
+      put(text.slice(0, at), text.slice(at + 1));
+    }
+    return out;
+  }
+  if (Array.isArray(raw)) {
+    for (const item of raw) {
+      if (!item || typeof item !== 'object') continue;
+      put(item.provider, item.mode);
+    }
+    return out;
+  }
+  if (raw && typeof raw === 'object') {
+    for (const [key, value] of Object.entries(raw)) put(key, value);
+  }
+  return out;
+}
+
+/** 单条价格：cacheHit / cacheMiss / output（¥/百万 token）与 reasoning。 */
+function normalizePriceValue(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const read = (value) => {
+    const n = typeof value === 'number' ? value : Number(value);
+    return Number.isFinite(n) && n >= 0 ? n : null;
+  };
+  const cacheHit = read(raw.cacheHit);
+  const cacheMiss = read(raw.cacheMiss);
+  const output = read(raw.output);
+  if (cacheHit === null || cacheMiss === null || output === null) return null;
+  const reasoning = read(raw.reasoning);
+  return { cacheHit, cacheMiss, output, reasoning: reasoning === null ? 0 : reasoning };
+}
+
+/**
+ * 归一化第三方价格表：
+ * `{ models: { 精确模型: 价格 }, prefixes: { 前缀: 价格 }, providers: { provider: 价格 }, fallback: 价格 }`
+ */
+function normalizePriceConfig(raw) {
+  const out = { models: {}, prefixes: {}, providers: {}, fallback: null };
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return out;
+  const fill = (target, source) => {
+    if (!source || typeof source !== 'object' || Array.isArray(source)) return;
+    for (const [key, value] of Object.entries(source)) {
+      const price = normalizePriceValue(value);
+      const name = String(key).trim().toLowerCase();
+      if (price && name) target[name] = price;
+    }
+  };
+  fill(out.models, raw.models);
+  fill(out.prefixes, raw.prefixes);
+  fill(out.providers, raw.providers);
+  out.fallback = normalizePriceValue(raw.fallback);
+  return out;
+}
+
+/**
+ * 路由分类：默认计费，只有「确认为本地」才不计费。
  *
- * - provider 已知：`deepseek-account` / `deepseek-*` 计费，其余（本地模型、第三方网关）不计费；
- * - provider 缺失：只有模型名明确是 `deepseek-*` 才计费，未知来源一律不计费（不臆测）。
+ * 判定顺序：
+ * 1. 覆盖清单（always / local）最高优先；
+ * 2. DeepSeek provider 名 → 官方；
+ * 3. baseURL 主机：本地 / 内网 → 本地；官方域名 → 官方；其他 → 第三方；
+ * 4. 无法取得 baseURL：模型名以 deepseek 开头按官方处理，其余按第三方计费但标记「来源未确认」。
  *
- * 本地 / 未知来源的 token 仍照常统计，只是成本记 0。
+ * @param route { provider, model, baseUrl? }
+ * @param options { endpoints?: {provider: baseUrl}, overrides?: object|string }
+ * @returns {{ kind: 'deepseek-account'|'deepseek-api-key'|'local'|'third-party', billable: boolean, local: boolean, confirmed: boolean, official: boolean, source: string, reason: string, baseUrl: string, host: string }}
+ */
+function classifyRoute(route, options) {
+  const o = options || {};
+  const provider = route && typeof route.provider === 'string' ? route.provider : '';
+  const model = route && typeof route.model === 'string' ? route.model : '';
+  const key = providerKeyOf(provider);
+  const overrides = normalizeBillingOverrides(o.overrides);
+  const explicit = key ? overrides[key] : undefined;
+  const endpoints = o.endpoints && typeof o.endpoints === 'object' ? o.endpoints : null;
+  const givenBaseUrl = route && typeof route.baseUrl === 'string' ? route.baseUrl.trim() : '';
+  const mappedBaseUrl = !givenBaseUrl && endpoints && key
+    ? (endpoints[key] || endpoints[provider] || '')
+    : '';
+  const baseUrl = givenBaseUrl || (typeof mappedBaseUrl === 'string' ? mappedBaseUrl : '');
+  const host = hostOfBaseUrl(baseUrl);
+  const officialModel = isDeepseekModel(model);
+
+  if (explicit === 'local') {
+    return { kind: 'local', billable: false, local: true, confirmed: true, official: false, source: 'override', reason: 'override-local', baseUrl, host };
+  }
+
+  const routing = routingOfProvider(provider);
+  if (routing === 'account') {
+    return { kind: 'deepseek-account', billable: true, local: false, confirmed: true, official: true, source: 'provider', reason: 'provider', baseUrl, host };
+  }
+  if (routing === 'api-key') {
+    return { kind: 'deepseek-api-key', billable: true, local: false, confirmed: true, official: true, source: 'provider', reason: 'provider', baseUrl, host };
+  }
+
+  if (explicit === 'always') {
+    return {
+      kind: officialModel || isOfficialDeepseekHost(host) ? 'deepseek-api-key' : 'third-party',
+      billable: true,
+      local: false,
+      confirmed: true,
+      official: officialModel || isOfficialDeepseekHost(host),
+      source: 'override',
+      reason: 'override-always',
+      baseUrl,
+      host
+    };
+  }
+
+  if (isOfficialDeepseekHost(host)) {
+    return { kind: 'deepseek-api-key', billable: true, local: false, confirmed: true, official: true, source: 'base-url', reason: 'official-host', baseUrl, host };
+  }
+  const local = isLocalHost(host);
+  if (local === true) {
+    return { kind: 'local', billable: false, local: true, confirmed: true, official: false, source: 'base-url', reason: 'local-host', baseUrl, host };
+  }
+  if (local === false) {
+    return { kind: 'third-party', billable: true, local: false, confirmed: true, official: false, source: 'base-url', reason: 'remote-host', baseUrl, host };
+  }
+  // baseURL 缺失：默认计费，并标记「来源未确认」。
+  return {
+    kind: officialModel ? 'deepseek-api-key' : 'third-party',
+    billable: true,
+    local: false,
+    confirmed: false,
+    official: officialModel,
+    source: 'default',
+    reason: 'unconfirmed',
+    baseUrl,
+    host
+  };
+}
+
+/**
+ * 该次用量是否计入费用（默认计费，只有确认为本地才不计费）。
  * @param provider 路由 provider（如 `deepseek-account` / `ninfer-27b`）
  * @param model 模型名（如 `deepseek-flash`）
+ * @param options { endpoints?, overrides? }
  * @returns {boolean}
  */
-function isBillableRoute(provider, model) {
-  const routing = routingOfProvider(provider);
-  if (routing === 'local') return false;
-  if (routing === 'account' || routing === 'api-key') return true;
-  return isDeepseekModel(model);
+function isBillableRoute(provider, model, options) {
+  return classifyRoute({ provider, model }, options).billable;
 }
 
 /**
@@ -1818,8 +2213,8 @@ function statsUsageBuckets(usage) {
  */
 function statsPointCostMicros(point) {
   if (!point) return 0;
-  // 本地 / 未知来源的 token 照常统计，但成本记 0（不套用 DeepSeek 价目）。
-  if (point.billable === false) return 0;
+  // 本地 / 未配置价格的 token 照常统计，但成本记 0。
+  if (point.billable === false || point.priced === false) return 0;
   const at = Number.isFinite(point.t) ? point.t : Date.now();
   const period = periodInfo(at).period;
   const usage = {
@@ -1829,6 +2224,10 @@ function statsPointCostMicros(point) {
     outputTokens: tokenCount(point.output),
     reasoningTokens: 0
   };
+  // 折叠时已解析好该点价目（不同模型 / 不同来源不会串价）。
+  if (point.price) {
+    return costMicrosOf(usage, { price: point.price, peakValley: point.peakValley !== false }, period) || 0;
+  }
   return turnCost(usage, point.model, period);
 }
 
@@ -1844,8 +2243,9 @@ function baseNameOfPath(value) {
  * 标题 / 首个问题 / 模型与最后活跃时间。与宿主的 `tokenUsage` 投影口径一致：
  * 每个 assistant/message 的 usage 只取一次。
  * @param events 会话事件数组（读取日志得到的原始事件）
+ * @param options { endpoints?, overrides?, prices? } 计费口径（缺省时所有未知来源按默认计费）
  */
-function foldSessionStats(events) {
+function foldSessionStats(events, options) {
   const list = Array.isArray(events) ? events : [];
   const tokens = emptyStatsTokens();
   const points = [];
@@ -1876,6 +2276,9 @@ function foldSessionStats(events) {
       const buckets = statsUsageBuckets(data.usage);
       if (buckets) {
         const pointModel = currentModel || model;
+        const route = { provider, model: pointModel };
+        const classification = classifyRoute(route, options);
+        const entry = priceEntryFor(route, Object.assign({}, options, { classification }));
         const point = {
           t: time,
           input: buckets.input,
@@ -1883,8 +2286,15 @@ function foldSessionStats(events) {
           cacheWrite: buckets.cacheWrite,
           output: buckets.output,
           model: pointModel,
-          // 只对 DeepSeek 官方路由计价；本地模型仍统计 token，但成本为 0。
-          billable: isBillableRoute(provider, pointModel)
+          provider,
+          // 本地：不计费；第三方未配置价格：token 照常统计、金额为 0。
+          billable: classification.billable,
+          priced: classification.billable && Boolean(entry.price),
+          priceSource: classification.billable ? entry.source : 'local',
+          peakValley: entry.peakValley !== false,
+          price: classification.billable ? (entry.price || null) : null,
+          confirmed: classification.confirmed,
+          routeKind: classification.kind
         };
         tokens.input += point.input;
         tokens.cacheRead += point.cacheRead;
@@ -1964,6 +2374,8 @@ function statsAggregate(points, starts, unit) {
     tokens: 0,
     billableTokens: 0,
     localTokens: 0,
+    unpricedTokens: 0,
+    unconfirmed: false,
     costMicros: 0
   }));
   const positionOf = new Map();
@@ -1982,7 +2394,9 @@ function statsAggregate(points, starts, unit) {
       tokenCount(point.cacheWrite) + tokenCount(point.output);
     bucket.tokens += pointTokens;
     if (point.billable === false) bucket.localTokens += pointTokens;
+    else if (point.priced === false) bucket.unpricedTokens += pointTokens;
     else bucket.billableTokens += pointTokens;
+    if (point.confirmed === false) bucket.unconfirmed = true;
     bucket.costMicros += statsPointCostMicros(point);
   }
   return buckets;
@@ -2013,12 +2427,18 @@ function statsSessionRow(header, fold, options) {
   let costMicros = 0;
   let billableTokens = 0;
   let localTokens = 0;
+  let unpricedTokens = 0;
+  let unconfirmed = false;
+  const priceSources = new Set();
   for (const point of Array.isArray(f.points) ? f.points : []) {
     if (!point) continue;
     const pointTokens = tokenCount(point.input) + tokenCount(point.cacheRead) +
       tokenCount(point.cacheWrite) + tokenCount(point.output);
     if (point.billable === false) localTokens += pointTokens;
+    else if (point.priced === false) unpricedTokens += pointTokens;
     else billableTokens += pointTokens;
+    if (point.confirmed === false) unconfirmed = true;
+    if (typeof point.priceSource === 'string') priceSources.add(point.priceSource);
     costMicros += statsPointCostMicros(point);
   }
   const id = typeof h.id === 'string' ? h.id : '';
@@ -2036,8 +2456,14 @@ function statsSessionRow(header, fold, options) {
     tokens: { ...tokens, total },
     billableTokens,
     localTokens,
-    /** 该会话是否有任何 DeepSeek 计费用量（用于会话表「本地 · 不计费」展示）。 */
+    unpricedTokens,
+    /** 该会话是否有任何可计价（已配置价格）的用量。 */
     billable: billableTokens > 0,
+    /** 是否存在未配置价格的用量（token 照常统计，但不计入金额）。 */
+    hasUnpriced: unpricedTokens > 0,
+    /** 是否存在无法确认来源的用量（baseURL 探测失败）。 */
+    unconfirmed,
+    priceSources: [...priceSources],
     costMicros,
     running: opt.running === true,
     live: opt.live === true,
@@ -2052,6 +2478,8 @@ function statsSummary(rows) {
   let costMicros = 0;
   let billableTokens = 0;
   let localTokens = 0;
+  let unpricedTokens = 0;
+  let unconfirmed = false;
   let running = 0;
   let turns = 0;
   let steps = 0;
@@ -2066,6 +2494,8 @@ function statsSummary(rows) {
     costMicros += Number.isFinite(row.costMicros) ? Math.max(0, Math.round(row.costMicros)) : 0;
     billableTokens += Number.isFinite(row.billableTokens) ? Math.max(0, row.billableTokens) : 0;
     localTokens += Number.isFinite(row.localTokens) ? Math.max(0, row.localTokens) : 0;
+    unpricedTokens += Number.isFinite(row.unpricedTokens) ? Math.max(0, row.unpricedTokens) : 0;
+    if (row.unconfirmed === true) unconfirmed = true;
     turns += Number.isSafeInteger(row.turns) ? row.turns : 0;
     steps += Number.isSafeInteger(row.steps) ? row.steps : 0;
     messages += Number.isSafeInteger(row.messages) ? row.messages : 0;
@@ -2075,6 +2505,9 @@ function statsSummary(rows) {
     tokens: { ...tokens, total: statsTokenTotal(tokens) },
     billableTokens,
     localTokens,
+    unpricedTokens,
+    hasUnpriced: unpricedTokens > 0,
+    unconfirmed,
     costMicros,
     sessions: list.length,
     running,
@@ -2172,6 +2605,41 @@ function escapeHtml(value) {
     .replaceAll('>', '&gt;')
     .replaceAll('"', '&quot;')
     .replaceAll("'", '&#39;');
+}
+
+// ---------------------------------------------------------------------------
+// 附件响应头
+// ---------------------------------------------------------------------------
+
+/** RFC 7230 token 形式的 media type；拒绝 CR/LF 与参数注入。 */
+const MEDIA_TYPE_RE = /^[A-Za-z0-9!#$&^_.+-]+\/[A-Za-z0-9!#$&^_.+-]+$/;
+
+/** 允许作为图片返回的栅格类型；SVG 可携带脚本，一律降级为下载。 */
+const IMAGE_MEDIA_TYPES = new Set([
+  'image/png',
+  'image/jpeg',
+  'image/jpg',
+  'image/gif',
+  'image/webp',
+  'image/avif',
+  'image/bmp',
+  'image/x-icon',
+  'image/vnd.microsoft.icon'
+]);
+
+/**
+ * 附件响应的 content-type：
+ * 图片只接受白名单内的栅格类型，其余一律按二进制下载，
+ * 避免会话日志里的 mediaType 被改成 `text/html` / `image/svg+xml`
+ * 后在页面上下文里执行脚本。
+ */
+function attachmentMediaType(value, kind) {
+  const raw = typeof value === 'string' ? value.split(';')[0].trim().toLowerCase() : '';
+  if (kind === 'image') {
+    if (MEDIA_TYPE_RE.test(raw) && IMAGE_MEDIA_TYPES.has(raw)) return raw;
+    return 'image/png';
+  }
+  return 'application/octet-stream';
 }
 
 // ---------------------------------------------------------------------------
@@ -2287,6 +2755,7 @@ module.exports = {
   createScheduler,
   createRequestGate,
   escapeHtml,
+  attachmentMediaType,
   MAX_BODY_BYTES,
   isLoopbackHost,
   isTrustedRequest,
@@ -2310,6 +2779,11 @@ module.exports = {
   periodInfo,
   periodChangeText,
   priceFor,
+  priceEntryFor,
+  costMicrosOf,
+  costOfGroup,
+  costOfGroups,
+  usageTokenTotal,
   turnCost,
   turnCostOfGroups,
   streamUsageOf,
@@ -2318,6 +2792,14 @@ module.exports = {
   routingOfProvider,
   isDeepseekModel,
   isBillableRoute,
+  providerKeyOf,
+  hostOfBaseUrl,
+  isLocalHost,
+  isOfficialDeepseekHost,
+  classifyRoute,
+  normalizeBillingOverrides,
+  normalizePriceValue,
+  normalizePriceConfig,
   costSwitches,
   completionSoundEnabled,
   SOUND_TONES,

@@ -39,9 +39,11 @@ const version = String(pkg.version || "").trim();
 if (version === "") throw new Error("build failed: package.json version is empty");
 
 // 客户端：内联 shared + i18n + 注入构建时间戳与版本号。
+// 用函数式替换：shared 源码里可能出现 `$&` 等替换模式字符，
+// 直接传字符串会被 String.replace 当成特殊指令（`$&` 会回填占位符本身）。
 const client = read("src/client.js")
-  .replace("/*__DMA_SHARED__*/ null", sharedIife)
-  .replace("/*__DMA_I18N__*/ null", i18nIife)
+  .replace("/*__DMA_SHARED__*/ null", () => sharedIife)
+  .replace("/*__DMA_I18N__*/ null", () => i18nIife)
   .replaceAll("__DMA_BUILD_TIME__", new Date().toISOString())
   .replaceAll("__DMA_VERSION__", version);
 

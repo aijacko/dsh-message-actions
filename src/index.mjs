@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import fs from "node:fs";
 import z from "@deepseek-ai/schemastery";
 import shared from "./shared.cjs";
 import store from "./store.cjs";
@@ -24,6 +25,7 @@ const {
   messageIdOf,
   messagesSummaryOf,
   isTrustedRequest,
+  attachmentMediaType,
   statusCodeOf,
   isBusyError,
   beijingDateKey,
@@ -32,9 +34,13 @@ const {
   routeOfMessage,
   routeOfUsage,
   routingOfProvider,
-  isBillableRoute,
+  classifyRoute,
+  priceEntryFor,
+  costOfGroups,
+  normalizeBillingOverrides,
+  normalizePriceConfig,
+  hostOfBaseUrl,
   costSwitches,
-  turnCostOfGroups,
   deriveTurnUsage,
   createTurnBuffer,
   appendTurnEvent,
@@ -214,13 +220,12 @@ function makeAttachmentHandler(ctx) {
 
     const name = (found.ref && found.ref.name) || (found.kind === "image" ? "image" : "file");
     const headers = {
-      "content-type": (found.ref && found.ref.mediaType) || (found.kind === "image" ? "image/png" : "application/octet-stream"),
+      "content-type": attachmentMediaType(found.ref && found.ref.mediaType, found.kind),
       "cache-control": "no-store",
       "x-content-type-options": "nosniff",
       "cross-origin-resource-policy": "same-origin",
       "content-disposition": "attachment; filename*=UTF-8''" + encodeURIComponent(name)
     };
-    if (Number.isSafeInteger(found.ref.bytes)) headers["content-length"] = found.ref.bytes;
 
     try {
       if (found.kind === "image") {
@@ -388,7 +393,7 @@ function makeActionHandler(ctx) {
   };
 }
 
-function makeMessagesHandler(ctx) {
+function makeMessagesHandler(ctx, cost) {
   return async function handleMessages(req, res) {
     if (req.method !== "GET") {
       drainRequest(req);
@@ -473,7 +478,10 @@ function makeMessagesHandler(ctx) {
     // 系统 / 开发者提示词与工具结果正文从不进入摘要（预览也只覆盖问 / 答）。
     sendJson(res, 200, {
       ok: true,
-      value: messagesSummaryOf(events, nodes, turns, { filter, since, previewLimit: 200 })
+      value: messagesSummaryOf(events, nodes, turns, Object.assign(
+        { filter, since, previewLimit: 200 },
+        cost && typeof cost.classifyOptions === "function" ? cost.classifyOptions() : {}
+      ))
     });
   };
 }
@@ -488,6 +496,9 @@ const COST_SETTLE_WAIT_MS = 10 * 1000;
 const COST_BALANCE_TIMEOUT_MS = 10 * 1000;
 const ROUTING_TIMEOUT_MS = 3 * 1000;
 const ROUTING_CACHE_MS = 5 * 1000;
+// provider → baseURL 探测：缓存 60s；探测失败只用旧缓存，不阻塞事件结算。
+const ENDPOINT_CACHE_MS = 60 * 1000;
+const ENDPOINT_TIMEOUT_MS = 2 * 1000;
 const DSH_VERSION_FALLBACK = "0.2.1";
 
 /** getBalance 的客户端元数据：时区固定北京时间，不随本机漂移。 */
@@ -563,6 +574,64 @@ async function hasApiKey(ctx) {
 }
 
 /**
+ * 递归收集配置里 `providers.<id>.baseURL`（configEditor 返回的
+ * `{ entry, inherited, override }[]`；也兼容其他嵌套形状）。
+ */
+function collectEndpointsFromConfig(node, keyHint, map, depth) {
+  if (!node || typeof node !== "object" || depth > 8) return;
+  if (Array.isArray(node)) {
+    for (const item of node) collectEndpointsFromConfig(item, keyHint, map, depth + 1);
+    return;
+  }
+  const baseUrl = node.baseURL || node.baseUrl;
+  if (typeof baseUrl === "string" && baseUrl.trim()) {
+    const id = keyHint || node.id || node.name || node.provider;
+    if (typeof id === "string" && id.trim()) map.set(id.trim().toLowerCase(), baseUrl.trim());
+  }
+  for (const [key, value] of Object.entries(node)) {
+    collectEndpointsFromConfig(value, key, map, depth + 1);
+  }
+}
+
+/** 从 profile patch YAML 里粗略提取 `providers.<id>.baseURL`（configEditor 不可用时的兜底）。 */
+function collectEndpointsFromPatch(text, map) {
+  const lines = String(text || "").split(/\r?\n/);
+  let inProviders = false;
+  let providersIndent = -1;
+  let current = null;
+  let providerIndent = -1;
+  for (const line of lines) {
+    if (!line.trim() || line.trim().startsWith("#")) continue;
+    const indent = line.match(/^\s*/)[0].length;
+    const content = line.trim();
+    if (/^providers:\s*$/.test(content)) {
+      inProviders = true;
+      providersIndent = indent;
+      current = null;
+      providerIndent = -1;
+      continue;
+    }
+    if (inProviders && indent <= providersIndent) {
+      inProviders = false;
+      current = null;
+      continue;
+    }
+    if (!inProviders) continue;
+    const keyMatch = /^['"]?([\w.@-]+)['"]?:\s*$/.exec(content);
+    if (keyMatch && indent > providersIndent) {
+      if (providerIndent === -1) providerIndent = indent;
+      if (indent === providerIndent) current = keyMatch[1];
+      continue;
+    }
+    const baseMatch = /^baseURL:\s*(.+?)\s*$/.exec(content);
+    if (baseMatch && current) {
+      const value = baseMatch[1].replace(/^["']|["']$/g, "");
+      if (value) map.set(current.toLowerCase(), value);
+    }
+  }
+}
+
+/**
  * 创建费用统计服务。内存状态为唯一读写源，写盘为整份原子替换。
  * @param ctx Cordis 宿主上下文
  * @param config 宿主 Config（volatile 对象）
@@ -617,8 +686,16 @@ function createCostService(ctx, config) {
   let inFlight = null;
   let lastFetchFailed = false;
   let lastMessageProvider;
+  let lastMessageModel;
   let lastHeaderProvider;
+  let lastHeaderModel;
   let routingCache = { at: 0, value: null };
+  // provider → baseURL：只缓存成功探测结果；失败时保留旧值并等待下次重试。
+  const endpointCache = { at: 0, lastAttempt: 0, map: new Map(), source: "none", pending: null };
+  // 价格表 / 覆盖清单变更时递增，统计折叠缓存据此失效并重算历史。
+  let billingRevision = 0;
+  // provider → baseURL 变化时递增，避免历史统计沿用旧的本地 / 第三方判定。
+  let endpointRevision = 0;
 
   const warn = (message) => {
     if (typeof ctx.logger?.warn === "function") ctx.logger.warn(`[dsh-message-actions] ${message}`);
@@ -635,6 +712,194 @@ function createCostService(ctx, config) {
     return persistCostState(statePath, state, readOnly, ctx.logger);
   }
 
+  /**
+   * 探测 provider → baseURL。三级来源（新版优先，逐级回退）：
+   * 1. `llm.listProviders()`（返回 baseUrl）；
+   * 2. `configEditor.configuration()`（providers.<id>.baseURL）；
+   * 3. profile patch YAML 文本（粗解析）。
+   * 探测失败不会清空旧缓存，也不会影响按钮注入。
+   */
+  async function refreshEndpoints(force) {
+    const now = Date.now();
+    if (!force && endpointCache.at > 0 && now - endpointCache.at < ENDPOINT_CACHE_MS) {
+      return endpointCache;
+    }
+    let map = new Map();
+    let source = "none";
+
+    try {
+      const llm = ctx.get("llm");
+      if (llm && typeof llm.listProviders === "function") {
+        const list = await withTimeout(Promise.resolve(llm.listProviders()), ENDPOINT_TIMEOUT_MS);
+        for (const provider of Array.isArray(list) ? list : []) {
+          if (!provider || typeof provider !== "object") continue;
+          const id = provider.id || provider.name || provider.provider;
+          const baseUrl = provider.baseUrl || provider.baseURL;
+          if (typeof id === "string" && typeof baseUrl === "string" && baseUrl.trim()) {
+            map.set(id.trim().toLowerCase(), baseUrl.trim());
+          }
+        }
+        if (map.size > 0) source = "llm";
+      }
+    } catch {
+      /* 旧宿主没有 llm 服务或接口不同：继续下一级 */
+    }
+
+    // 第二级：配置编辑器（补齐 llm 没给出的 provider，不覆盖 llm 的结果）。
+    {
+      try {
+        const editor = ctx.get("configEditor");
+        if (editor && typeof editor.configuration === "function") {
+          const rows = await withTimeout(Promise.resolve(editor.configuration()), ENDPOINT_TIMEOUT_MS);
+          const collected = new Map();
+          for (const row of Array.isArray(rows) ? rows : []) {
+            collectEndpointsFromConfig(row && row.inherited, "", collected, 0);
+            collectEndpointsFromConfig(row && row.override, "", collected, 0);
+          }
+          let added = 0;
+          for (const [key, value] of collected) {
+            if (!map.has(key)) {
+              map.set(key, value);
+              added += 1;
+            }
+          }
+          if (added > 0) source = source === "none" ? "config-editor" : "llm+config-editor";
+        }
+      } catch {
+        /* 配置服务不可用：继续兜底 */
+      }
+    }
+
+    // 第三级：profile patch 文本（最后兜底，同样只补缺失项）。
+    {
+      try {
+        const profile = ctx.get("profileContext");
+        const patchPath = profile && typeof profile.patchPath === "string" ? profile.patchPath : "";
+        if (patchPath) {
+          const text = await fs.promises.readFile(patchPath, "utf8");
+          const collected = new Map();
+          collectEndpointsFromPatch(text, collected);
+          let added = 0;
+          for (const [key, value] of collected) {
+            if (!map.has(key)) {
+              map.set(key, value);
+              added += 1;
+            }
+          }
+          if (added > 0) source = source === "none" ? "profile-patch" : source + "+profile-patch";
+        }
+      } catch {
+        /* 文件读取失败：保持旧缓存 */
+      }
+    }
+
+    endpointCache.lastAttempt = Date.now();
+    if (map.size === 0) {
+      // 上一轮什么都没探测到：不缓存空结果，下次调用立即重试。
+      endpointCache.at = 0;
+    } else {
+      const changed = map.size !== endpointCache.map.size ||
+        [...map.entries()].some(([key, value]) => endpointCache.map.get(key) !== value);
+      if (changed) endpointRevision += 1;
+      endpointCache.at = Date.now();
+      endpointCache.map = map;
+      endpointCache.source = source;
+    }
+    return endpointCache;
+  }
+
+  /** 非阻塞探测：同一时刻只跑一次；15s 内不重复敲宿主。 */
+  function scheduleEndpointRefresh() {
+    if (endpointCache.pending) return endpointCache.pending;
+    if (endpointCache.lastAttempt > 0 && Date.now() - endpointCache.lastAttempt < 15 * 1000) {
+      return Promise.resolve(endpointCache);
+    }
+    endpointCache.pending = refreshEndpoints(true)
+      .catch(() => {})
+      .finally(() => {
+        endpointCache.pending = null;
+      });
+    return endpointCache.pending;
+  }
+
+  /** 当前计费配置（覆盖清单 + 第三方价格表）。 */
+  function billingConfig() {
+    if (!state.billing || typeof state.billing !== "object") {
+      state.billing = { overrides: {}, prices: normalizePriceConfig(null), updatedAt: 0 };
+    }
+    return state.billing;
+  }
+
+  /** 传给 classifyRoute / priceEntryFor 的统一口径。 */
+  function classifyOptions() {
+    const billing = billingConfig();
+    return {
+      endpoints: Object.fromEntries(endpointCache.map),
+      overrides: normalizeBillingOverrides(billing.overrides),
+      prices: normalizePriceConfig(billing.prices)
+    };
+  }
+
+  /** 单条路由的分类 + 价目（供费用卡片 / 统计诊断使用）。 */
+  function classifyRouteInfo(provider, model) {
+    const options = classifyOptions();
+    const classification = classifyRoute({ provider, model }, options);
+    if (!classification.confirmed) scheduleEndpointRefresh();
+    const pricing = priceEntryFor({ provider, model }, Object.assign({}, options, { classification }));
+    return {
+      kind: classification.kind,
+      billable: classification.billable,
+      local: classification.local,
+      confirmed: classification.confirmed,
+      official: classification.official,
+      source: classification.source,
+      reason: classification.reason,
+      baseUrl: classification.baseUrl,
+      host: classification.host,
+      provider: provider || "",
+      model: model || "",
+      priceSource: pricing.source,
+      priceMatched: pricing.matched
+    };
+  }
+
+  /** 保存计费配置（覆盖清单 / 价格表），失败回滚。 */
+  function applyBilling(input) {
+    const previous = billingConfig();
+    const next = {
+      overrides: normalizeBillingOverrides(input && input.overrides !== undefined ? input.overrides : previous.overrides),
+      prices: normalizePriceConfig(input && input.prices !== undefined ? input.prices : previous.prices),
+      updatedAt: Date.now()
+    };
+    state.billing = next;
+    const saved = persist();
+    if (!saved.ok) {
+      state.billing = previous;
+      return saved;
+    }
+    billingRevision += 1;
+    return { ok: true, value: next };
+  }
+
+  /** 诊断信息：当前探测到的 provider → baseURL（不回传凭据）。 */
+  function endpointDiagnostics() {
+    const options = classifyOptions();
+    return [...endpointCache.map.entries()].map(([provider, baseUrl]) => {
+      const host = hostOfBaseUrl(baseUrl);
+      const classification = classifyRoute({ provider, model: "" }, options);
+      const pricing = priceEntryFor({ provider, model: "" }, Object.assign({}, options, { classification }));
+      return {
+        provider,
+        baseUrl,
+        host,
+        kind: classification.kind,
+        local: classification.local,
+        billable: classification.billable,
+        priceSource: pricing.source
+      };
+    });
+  }
+
   async function routingInfo() {
     const now = Date.now();
     if (routingCache.value && now - routingCache.at < ROUTING_CACHE_MS) return routingCache.value;
@@ -645,7 +910,9 @@ function createCostService(ctx, config) {
       routingCache = { at: Date.now(), value };
       return value;
     };
-    if (mapped) return finish({ routing: mapped, provider });
+    // 余额轮询只跟 DeepSeek 账户有关；第三方 / 本地明确不查余额。
+    if (mapped === "account" || mapped === "api-key") return finish({ routing: mapped, provider });
+    if (mapped === "other") return finish({ routing: "third-party", provider });
 
     let hasKey = false;
     try {
@@ -760,17 +1027,22 @@ function createCostService(ctx, config) {
   async function stateValue() {
     const now = Date.now();
     const routing = (await routingInfo()).routing;
+    const provider = lastMessageProvider || lastHeaderProvider;
+    const model = lastMessageModel || lastHeaderModel;
+    // 还没有任何 provider 时不做「第三方 / 来源未确认」判定，避免启动瞬间误报。
+    const route = provider ? classifyRouteInfo(provider, model) : null;
     let status;
-    if (routing === "signed-out") status = "signed-out";
+    if (routing === "third-party") status = route && route.local ? "local" : "third-party";
+    else if (routing === "signed-out") status = "signed-out";
     else if (routing === "api-key") status = "api-key";
     else if (routing === "unavailable") status = "unavailable";
-    else if (routing === "local") status = "local";
     else status = cache.updatedAt > 0 && !lastFetchFailed ? "ready" : "stale";
 
     const period = periodInfo(now);
     return {
       status,
       billing: routing,
+      route,
       balance: {
         rechargeCents: cache.rechargeCents,
         bonusCents: cache.bonusCents,
@@ -799,13 +1071,18 @@ function createCostService(ctx, config) {
       const route = routeOfUsage(data.usage) || routeOfMessage(data.message);
       if (route) {
         lastMessageProvider = route.provider;
+        lastMessageModel = route.model;
         routingCache = { at: 0, value: null };
+        if (!endpointCache.map.has(route.provider.trim().toLowerCase())) scheduleEndpointRefresh();
       }
     } else if (type === "request/header") {
-      const provider = data.header && data.header.config ? data.header.config.provider : undefined;
+      const config = data.header && data.header.config;
+      const provider = config ? config.provider : undefined;
       if (typeof provider === "string" && provider.length > 0) {
         lastHeaderProvider = provider;
+        if (config && typeof config.model === "string" && config.model) lastHeaderModel = config.model;
         routingCache = { at: 0, value: null };
+        if (!endpointCache.map.has(provider.trim().toLowerCase())) scheduleEndpointRefresh();
       }
     }
 
@@ -839,9 +1116,9 @@ function createCostService(ctx, config) {
     const at = Number.isFinite(usage.at) ? usage.at : buffer.at;
     const period = periodInfo(at).period;
     const endedAt = Number.isFinite(usage.endedAt) ? usage.endedAt : eventTime(event);
-    // 只对 DeepSeek 官方路由结算金额；本地模型的 token 仍然计数，但不进「日用」。
-    const billableGroups = usage.groups.filter((group) => group && isBillableRoute(group.provider, group.model));
-    const costMicros = turnCostOfGroups(billableGroups, period, PRICE_TABLE);
+    // 默认计费，只有确认为本地才免；第三方未配置价格时 token 仍计数、金额不进「日用」。
+    const billing = costOfGroups(usage.groups, period, classifyOptions());
+    const costMicros = billing.micros;
     const turn = Number.isSafeInteger(usage.turn) ? usage.turn : buffer.turn;
 
     // 结算即累加：当日用量与「单次」同一时刻更新，余额观测随后只补差额。
@@ -863,6 +1140,11 @@ function createCostService(ctx, config) {
       models: usage.models,
       tokens: usage.tokens,
       costMicros,
+      billableTokens: billing.billableTokens,
+      localTokens: billing.localTokens,
+      unpricedTokens: billing.unpricedTokens,
+      hasUnpriced: billing.hasUnpriced,
+      priceSources: billing.sources,
       turn
     };
     notifyTurnSettled();
@@ -885,7 +1167,15 @@ function createCostService(ctx, config) {
     onSessionEvent,
     dispose,
     state,
-    readOnly
+    readOnly,
+    refreshEndpoints,
+    classifyOptions,
+    classifyRouteInfo,
+    billingRevision: () => billingRevision,
+    endpointRevision: () => endpointRevision,
+    applyBilling,
+    endpointDiagnostics,
+    endpointSource: () => endpointCache.source
   };
 }
 
@@ -936,6 +1226,7 @@ function makeCostStateHandler(ctx, service) {
 
 const STATS_ROUTE = "/dsh-message-actions/stats";
 const STATS_BUDGET_ROUTE = "/dsh-message-actions/stats/budget";
+const BILLING_ROUTE = "/dsh-message-actions/billing";
 /** 同一会话日志的折叠结果缓存 4s，避免每次刷新都重读大文件。 */
 const STATS_FOLD_TTL_MS = 4000;
 /** 会话表最多返回 100 行，避免大型工作区一次传输过多数据。 */
@@ -984,9 +1275,15 @@ function createStatsService(ctx, cost, config) {
     if (!query) return null;
     const cached = folds.get(id);
     const now = Date.now();
-    if (cached !== undefined && now - cached.at < STATS_FOLD_TTL_MS) return cached.fold;
+    const billingRevision = cost.billingRevision();
+    const endpointRevision = cost.endpointRevision();
+    const sameBilling = cached !== undefined &&
+      cached.billingRevision === billingRevision && cached.endpointRevision === endpointRevision;
+    if (sameBilling && now - cached.at < STATS_FOLD_TTL_MS) {
+      return cached.fold;
+    }
     const revision = await revisionOf(id);
-    if (cached !== undefined && revision !== undefined && cached.revision === revision) {
+    if (sameBilling && revision !== undefined && cached.revision === revision) {
       cached.at = now;
       return cached.fold;
     }
@@ -997,12 +1294,16 @@ function createStatsService(ctx, cost, config) {
       warn(`could not read session "${id}": ${err instanceof Error ? err.message : String(err)}`);
       return cached !== undefined ? cached.fold : null;
     }
-    const fold = foldSessionStats(Array.isArray(snapshot && snapshot.events) ? snapshot.events : []);
+    // 价格表 / 覆盖清单一变，历史按新口径重算（billingRevision 参与缓存键）。
+    const fold = foldSessionStats(
+      Array.isArray(snapshot && snapshot.events) ? snapshot.events : [],
+      cost.classifyOptions()
+    );
     if (folds.size >= STATS_FOLD_CACHE_MAX && !folds.has(id)) {
       const oldest = folds.keys().next();
       if (!oldest.done) folds.delete(oldest.value);
     }
-    folds.set(id, { revision, at: now, fold });
+    folds.set(id, { revision, at: now, fold, billingRevision, endpointRevision });
     return fold;
   }
 
@@ -1025,6 +1326,8 @@ function createStatsService(ctx, cost, config) {
 
   async function buildPayload() {
     const now = Date.now();
+    // 先刷新 provider → baseURL（失败沿用旧缓存），再折叠历史，避免用空映射误判。
+    await cost.refreshEndpoints(false).catch(() => {});
     const query = sessionQueryOf(ctx);
     let records = [];
     if (query) {
@@ -1072,6 +1375,7 @@ function createStatsService(ctx, cost, config) {
     } catch {
       ledger = null;
     }
+    const billingOptions = cost.classifyOptions();
     return {
       available: query !== null,
       generatedAt: now,
@@ -1083,7 +1387,15 @@ function createStatsService(ctx, cost, config) {
       sessions: rows.slice(0, STATS_SESSION_ROWS),
       sessionsTotal: rows.length,
       truncated: rows.length > STATS_SESSION_ROWS,
-      ledger
+      ledger,
+      billing: {
+        revision: cost.billingRevision(),
+        endpointSource: cost.endpointSource(),
+        endpoints: cost.endpointDiagnostics(),
+        overrides: billingOptions.overrides,
+        prices: billingOptions.prices,
+        officialPrices: Object.keys(PRICE_TABLE).filter((key) => key !== "default")
+      }
     };
   }
 
@@ -1172,11 +1484,93 @@ function makeStatsBudgetHandler(ctx, cost) {
   };
 }
 
+/**
+ * `/dsh-message-actions/billing`：读取 / 保存计费覆盖清单与第三方价格表。
+ * GET  返回 `{ overrides, prices, endpoints, endpointSource, officialPrices }`
+ * POST 接受 `{ overrides?, prices? }`（对象或文本），保存后历史统计立即按新价重算。
+ */
+function makeBillingHandler(ctx, cost) {
+  return async function handleBilling(req, res) {
+    if (req.method !== "GET" && req.method !== "POST") {
+      drainRequest(req);
+      sendMethodNotAllowed(res, "GET, POST");
+      return;
+    }
+    if (!isTrusted(req, ctx.webServer)) {
+      drainRequest(req);
+      sendForbidden(res);
+      return;
+    }
+    if (req.method === "GET") {
+      try {
+        await cost.refreshEndpoints(false).catch(() => {});
+        const options = cost.classifyOptions();
+        sendJson(res, 200, {
+          ok: true,
+          value: {
+            overrides: options.overrides,
+            prices: options.prices,
+            endpoints: cost.endpointDiagnostics(),
+            endpointSource: cost.endpointSource(),
+            officialPrices: Object.keys(PRICE_TABLE).filter((key) => key !== "default"),
+            officialTable: PRICE_TABLE
+          }
+        });
+      } catch (err) {
+        if (typeof ctx.logger?.warn === "function") {
+          ctx.logger.warn(`[dsh-message-actions] billing read failed: ${err instanceof Error ? err.message : String(err)}`);
+        }
+        sendError(res, 500, "INTERNAL");
+      }
+      return;
+    }
+    const contentType = (req.headers["content-type"] || "").split(";")[0].trim().toLowerCase();
+    if (contentType !== "application/json") {
+      drainRequest(req);
+      sendBadRequest(res);
+      return;
+    }
+    const body = await readJsonBody(req, res);
+    if (body === null) return;
+    if (!body || typeof body !== "object" || Array.isArray(body)) {
+      sendBadRequest(res);
+      return;
+    }
+    try {
+      const saved = cost.applyBilling({ overrides: body.overrides, prices: body.prices });
+      if (!saved.ok) {
+        sendError(res, 500, saved.error);
+        return;
+      }
+      const options = cost.classifyOptions();
+      sendJson(res, 200, {
+        ok: true,
+        value: {
+          overrides: options.overrides,
+          prices: options.prices,
+          revision: cost.billingRevision()
+        }
+      });
+    } catch (err) {
+      if (typeof ctx.logger?.warn === "function") {
+        ctx.logger.warn(`[dsh-message-actions] billing save failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      sendError(res, 500, "INTERNAL");
+    }
+  };
+}
+
 // ---------------------------------------------------------------------------
 // 插件主体
 // ---------------------------------------------------------------------------
 
 function apply(ctx, config) {
+  // —— 费用统计 ——
+  const cost = createCostService(ctx, config);
+  const stats = createStatsService(ctx, cost, config);
+  // 启动即探测一次 provider → baseURL；失败静默，不影响任何路由注册。
+  cost.refreshEndpoints(false).catch(() => {});
+
   ctx.effect(
     () => ctx.webServer.register({
       kind: "exact",
@@ -1189,7 +1583,7 @@ function apply(ctx, config) {
     () => ctx.webServer.register({
       kind: "exact",
       path: "/dsh-message-actions/messages",
-      handler: makeMessagesHandler(ctx)
+      handler: makeMessagesHandler(ctx, cost)
     }),
     "dsh-message-actions: read route"
   );
@@ -1201,10 +1595,6 @@ function apply(ctx, config) {
     }),
     "dsh-message-actions: attachment route"
   );
-
-  // —— 费用统计 ——
-  const cost = createCostService(ctx, config);
-  const stats = createStatsService(ctx, cost, config);
 
   ctx.effect(
     () => ctx.webServer.register({
@@ -1230,6 +1620,14 @@ function apply(ctx, config) {
       handler: makeStatsBudgetHandler(ctx, cost)
     }),
     "dsh-message-actions: stats budget route"
+  );
+  ctx.effect(
+    () => ctx.webServer.register({
+      kind: "exact",
+      path: BILLING_ROUTE,
+      handler: makeBillingHandler(ctx, cost)
+    }),
+    "dsh-message-actions: billing route"
   );
 
   ctx.effect(() => {
