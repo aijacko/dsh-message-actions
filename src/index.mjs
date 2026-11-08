@@ -1401,6 +1401,24 @@ function createStatsService(ctx, cost, config) {
     };
   }
 
+  /**
+   * 会话列表用的轻量元数据：复用同一份折叠缓存与 revision 判断，
+   * 避免「打开会话管理」再解压一遍全部日志。
+   */
+  async function sessionMeta(record) {
+    const fold = await foldFor(record);
+    if (!fold) return null;
+    return {
+      model: typeof fold.model === "string" ? fold.model : "",
+      provider: typeof fold.provider === "string" ? fold.provider : "",
+      title: typeof fold.title === "string" ? fold.title : "",
+      messages: Number.isFinite(fold.messages) ? fold.messages : 0,
+      turns: Number.isFinite(fold.turns) ? fold.turns : 0,
+      tokens: fold.tokens && Number.isFinite(fold.tokens.total) ? fold.tokens.total : 0,
+      lastActiveAt: Number.isFinite(fold.lastActiveAt) ? fold.lastActiveAt : 0
+    };
+  }
+
   /** 同一时刻只跑一次折叠：刷新按钮与定时轮询撞车时复用同一个 Promise。 */
   let inflight = null;
   function payload() {
@@ -1415,7 +1433,7 @@ function createStatsService(ctx, cost, config) {
     return task;
   }
 
-  return { payload };
+  return { payload, sessionMeta };
 }
 
 function makeStatsHandler(ctx, service) {
@@ -1568,6 +1586,12 @@ function makeBillingHandler(ctx, cost) {
 
 const SESSIONS_ROUTE = "/dsh-message-actions/sessions";
 const MAX_SESSION_BATCH = 50;
+/** 删除类操作的确认口令：输入 OK（大小写不敏感、忽略首尾空格）。 */
+const SESSION_CONFIRM_CODE = "OK";
+
+function isSessionConfirm(value) {
+  return typeof value === "string" && value.trim().toUpperCase() === SESSION_CONFIRM_CODE;
+}
 
 /** 解析去重后的 id 数组；数量、类型或重复项不合法都返回 null。 */
 function readIdList(body, key) {
@@ -1596,8 +1620,19 @@ function makeSessionsHandler(ctx, sessions) {
       return;
     }
     if (req.method === "GET") {
+      let lean = false;
+      let hiddenOnly = false;
       try {
-        sendJson(res, 200, { ok: true, value: await sessions.payload() });
+        const query = new URL(req.url || SESSIONS_ROUTE, "http://localhost").searchParams;
+        lean = query.get("lean") === "1";
+        // 侧边栏隐藏行只需要 trashedIds / purgedIds，避免轮询时枚举全部日志。
+        hiddenOnly = query.get("hidden") === "1";
+      } catch {
+        lean = false;
+        hiddenOnly = false;
+      }
+      try {
+        sendJson(res, 200, { ok: true, value: await sessions.payload({ lean, hiddenOnly }) });
       } catch (err) {
         ctx.logger?.warn?.(`[dsh-message-actions] session list failed: ${err instanceof Error ? err.message : String(err)}`);
         sendError(res, 500, "INTERNAL");
@@ -1625,6 +1660,12 @@ function makeSessionsHandler(ctx, sessions) {
           sendBadRequest(res);
           return;
         }
+        // 单条删除直接进回收站（可恢复），不再要求输入口令；
+        // 批量删除才需要 OK，避免一次误删多条。
+        if (ids.length > 1 && !isSessionConfirm(body.confirm)) {
+          sendError(res, 400, "CONFIRM_REQUIRED");
+          return;
+        }
         sendJson(res, 200, { ok: true, value: { results: await sessions.removeToTrash(ids) } });
         return;
       }
@@ -1639,21 +1680,22 @@ function makeSessionsHandler(ctx, sessions) {
       }
       if (body.action === "purge") {
         if (body.all === true) {
-          // 清空回收站需要一个显式口令，避免误触或伪造请求直接清空。
-          if (body.confirm !== "PURGE_ALL") {
+          // 清空回收站需要显式口令（输入 OK），避免误触或伪造请求直接清空。
+          if (!isSessionConfirm(body.confirm)) {
             sendError(res, 400, "CONFIRM_REQUIRED");
             return;
           }
           sendJson(res, 200, { ok: true, value: await sessions.purge([], true) });
           return;
         }
-        if (body.confirm !== true) {
-          sendError(res, 400, "CONFIRM_REQUIRED");
-          return;
-        }
         const ids = readIdList(body, "trashIds");
         if (!ids || !ids.every(sessionsPure.isTrashId)) {
           sendBadRequest(res);
+          return;
+        }
+        // 批量彻底清理不可恢复，需要 OK；单条彻底清理沿用轻量确认按钮。
+        if (ids.length > 1 && !isSessionConfirm(body.confirm)) {
+          sendError(res, 400, "CONFIRM_REQUIRED");
           return;
         }
         sendJson(res, 200, { ok: true, value: await sessions.purge(ids, false) });
@@ -1665,6 +1707,24 @@ function makeSessionsHandler(ctx, sessions) {
           return;
         }
         sendJson(res, 200, { ok: true, value: await sessions.move(body.sessionId, body.workspaceId) });
+        return;
+      }
+      if (body.action === "moveBatch") {
+        const ids = readIdList(body, "sessionIds");
+        if (!ids || !ids.every(sessionsPure.isSessionId) || !sessionsPure.isWorkspaceId(body.workspaceId)) {
+          sendBadRequest(res);
+          return;
+        }
+        sendJson(res, 200, { ok: true, value: await sessions.moveMany(ids, body.workspaceId) });
+        return;
+      }
+      if (body.action === "archive") {
+        const ids = readIdList(body, "sessionIds");
+        if (!ids || !ids.every(sessionsPure.isSessionId)) {
+          sendBadRequest(res);
+          return;
+        }
+        sendJson(res, 200, { ok: true, value: await sessions.archive(ids) });
         return;
       }
       sendBadRequest(res);
@@ -1683,7 +1743,7 @@ function apply(ctx, config) {
   // —— 费用统计 ——
   const cost = createCostService(ctx, config);
   const stats = createStatsService(ctx, cost, config);
-  const sessions = createSessionManager(ctx);
+  const sessions = createSessionManager(ctx, { sessionMeta: (record) => stats.sessionMeta(record) });
   // 清理上次崩溃留下的暂存目录（只动一小时前的）。
   sessions.sweepStaging().catch(() => {});
   // 启动即探测一次 provider → baseURL；失败静默，不影响任何路由注册。

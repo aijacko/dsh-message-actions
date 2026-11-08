@@ -155,6 +155,28 @@ window.__ModuleLoader__.load({
       return React.createElement(component, { size: size });
     }
 
+    // 宿主会话菜单项图标：通过 contextMenu.icon 槽注册，key 与菜单项的 icon.key 对应。
+    // 宿主内置菜单项也走同一槽位，尺寸/风格保持一致。
+    const MENU_ICON_KEYS = {
+      move: "dsh-message-actions.move",
+      delete: "dsh-message-actions.delete"
+    };
+
+    const MENU_ICON_COMPONENTS = {
+      [MENU_ICON_KEYS.move]: "IconFolderOpenRegular",
+      [MENU_ICON_KEYS.delete]: "IconTrashOutlineRegular"
+    };
+
+    function registerContextMenuIcons(ctx) {
+      ctx.slots.inject("contextMenu.icon", function* () {
+        for (const [key, name] of Object.entries(MENU_ICON_COMPONENTS)) {
+          const Icon = PRIMITIVES && typeof PRIMITIVES === "object" ? PRIMITIVES[name] : null;
+          if (typeof Icon !== "function") continue;
+          yield ctx.slots.register({ name: "contextMenu.icon", key }, Icon);
+        }
+      });
+    }
+
     /** 把图标画进命令式创建的按钮；返回 false 表示应使用内置 SVG。 */
     function paintButtonIcon(btn, kind) {
       const element = officialIconElement(kind, 15);
@@ -283,6 +305,148 @@ window.__ModuleLoader__.load({
     const COST_POLL_MS = 5000;
 
     const costStore = createStore({ status: "idle", value: null, fetchedAt: 0, error: "" });
+    // 会话列表失效信号：任何删除 / 移动 / 归档 / 恢复成功后 +1，
+    // 让设置页与侧边栏缓存立刻重新拉取，而不是等宿主重启。
+    const sessionsStore = createStore({ revision: 0 });
+    function bumpSessionsRevision() {
+      sessionsStore.set({ revision: sessionsStore.getSnapshot().revision + 1 });
+    }
+
+    // -------------------------------------------------------------------------
+    // 宿主侧边栏：回收站行的隐藏 / 当场恢复
+    //
+    // 官方没有隐藏会话行的公开接口，也没有会话列表失效通知。软回收站让
+    // 日志留在原工作区，所以这里只对宿主侧边栏的会话行做样式级隐藏：
+    //   - 删除后立刻隐藏该行（不等宿主重新渲染）；
+    //   - 恢复后立刻取消隐藏，行当场回到原工作区分组，无需重启；
+    //   - 彻底清理后按墓碑隐藏（仅当磁盘日志确实不存在）。
+    // 轮询 + MutationObserver 只用于对齐外部变化，不会改写宿主的会话数据。
+    // -------------------------------------------------------------------------
+
+    const SIDEBAR_HIDDEN_ATTR = "data-dma-hidden";
+    const sidebarHidden = { trash: new Set(), purged: new Set(), at: 0 };
+    let sidebarHiddenFetch = null;
+    let sidebarHiddenTimer = 0;
+    let sidebarHiddenPaintTimer = 0;
+
+    function sessionIdFromRowKey(value) {
+      if (typeof value !== "string" || !value.startsWith("session:")) return "";
+      const rest = value.slice("session:".length);
+      return rest.split(/[/?#]/)[0] || "";
+    }
+
+    function paintSidebarHiddenRows() {
+      if (typeof document === "undefined") return;
+      const rows = document.querySelectorAll('[role="treeitem"][data-row-key^="session:"]');
+      for (const row of rows) {
+        const id = sessionIdFromRowKey(row.getAttribute("data-row-key"));
+        if (id === "") continue;
+        const hidden = sidebarHidden.trash.has(id) || sidebarHidden.purged.has(id);
+        if (hidden) {
+          if (!row.hasAttribute(SIDEBAR_HIDDEN_ATTR)) {
+            row.setAttribute(SIDEBAR_HIDDEN_ATTR, "1");
+            row.__dmaPrevDisplay = row.style.display;
+          }
+          // 每次都强制设为 none：React 重渲染可能重写 style。
+          row.style.display = "none";
+        } else if (row.hasAttribute(SIDEBAR_HIDDEN_ATTR)) {
+          row.removeAttribute(SIDEBAR_HIDDEN_ATTR);
+          row.style.display = row.__dmaPrevDisplay || "";
+          delete row.__dmaPrevDisplay;
+        }
+      }
+    }
+
+    function scheduleSidebarHiddenPaint() {
+      if (sidebarHiddenPaintTimer) return;
+      sidebarHiddenPaintTimer = setTimeout(() => {
+        sidebarHiddenPaintTimer = 0;
+        paintSidebarHiddenRows();
+      }, 80);
+    }
+
+    function markSidebarTrash(ids) {
+      for (const id of ids) {
+        if (typeof id === "string" && id !== "") sidebarHidden.trash.add(id);
+      }
+      scheduleSidebarHiddenPaint();
+    }
+
+    function unmarkSidebarTrash(ids) {
+      for (const id of ids) sidebarHidden.trash.delete(id);
+      scheduleSidebarHiddenPaint();
+    }
+
+    function markSidebarPurged(ids) {
+      for (const id of ids) {
+        if (typeof id !== "string" || id === "") continue;
+        sidebarHidden.trash.delete(id);
+        sidebarHidden.purged.add(id);
+      }
+      scheduleSidebarHiddenPaint();
+    }
+
+    async function refreshSidebarHidden(force) {
+      if (sidebarHiddenFetch) {
+        // 失效信号必须读到「操作之后」的索引：等当前请求结束后再拉一次，
+        // 否则可能用旧数据把刚删除/恢复的行又显示出来。
+        if (!force) return sidebarHiddenFetch;
+        return sidebarHiddenFetch.catch(() => null).then(() => refreshSidebarHidden(true));
+      }
+      if (!force && Date.now() - sidebarHidden.at < 6000) return null;
+      sidebarHiddenFetch = getJson("/dsh-message-actions/sessions?hidden=1")
+        .then((res) => {
+          const value = res && res.data && res.data.ok === true ? res.data.value : null;
+          if (!value) return null;
+          sidebarHidden.at = Date.now();
+          sidebarHidden.trash = new Set(Array.isArray(value.trashedIds) ? value.trashedIds : []);
+          sidebarHidden.purged = new Set(Array.isArray(value.purgedIds) ? value.purgedIds : []);
+          scheduleSidebarHiddenPaint();
+          return value;
+        })
+        .catch(() => null)
+        .finally(() => {
+          sidebarHiddenFetch = null;
+        });
+      return sidebarHiddenFetch;
+    }
+
+    function startSidebarTrashShim() {
+      if (typeof document === "undefined") return () => {};
+      let observer = null;
+      if (typeof MutationObserver === "function") {
+        observer = new MutationObserver(() => scheduleSidebarHiddenPaint());
+        observer.observe(document.body, {
+          childList: true,
+          subtree: true,
+          attributes: true,
+          attributeFilter: ["data-row-key", "class", "style"]
+        });
+      }
+      sidebarHiddenTimer = setInterval(() => {
+        refreshSidebarHidden(false);
+        scheduleSidebarHiddenPaint();
+      }, 6000);
+      const unsubscribe = sessionsStore.subscribe(() => {
+        refreshSidebarHidden(true);
+        scheduleSidebarHiddenPaint();
+      });
+      refreshSidebarHidden(true);
+      scheduleSidebarHiddenPaint();
+      return () => {
+        if (observer) observer.disconnect();
+        clearInterval(sidebarHiddenTimer);
+        sidebarHiddenTimer = 0;
+        unsubscribe();
+        if (typeof document !== "undefined") {
+          document.querySelectorAll("[" + SIDEBAR_HIDDEN_ATTR + "]").forEach((row) => {
+            row.removeAttribute(SIDEBAR_HIDDEN_ATTR);
+            row.style.display = row.__dmaPrevDisplay || "";
+            delete row.__dmaPrevDisplay;
+          });
+        }
+      };
+    }
     let costForm = null;
     let costPollTimer = null;
     let costPolling = false;
@@ -2738,397 +2902,763 @@ window.__ModuleLoader__.load({
     }
 
     // -------------------------------------------------------------------------
-    // 对话管理：删除到回收站 / 恢复 / 彻底清理 / 移动到工作区
+    // 会话管理（设置页内联）：列表 / 搜索筛选 / 回收站 / 多选与批量操作
     // -------------------------------------------------------------------------
 
     const SESSIONS_ROUTE = "/dsh-message-actions/sessions";
-    const SESSIONS_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" '
-      + 'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
-      + '<path d="M4 6.5h16v9.5H9.5L4 19z"/><path d="M8 10h8M8 12.8h5"/></svg>';
+    // 所有需要二次确认的删除操作统一输入 OK（大小写不敏感、忽略首尾空格）。
+    const SESSIONS_CONFIRM_CODE = "OK";
+    const SESSIONS_MENU_WIDTH = 158;
+    const SESSIONS_MENU_HEIGHT = 92;
+    const SESSIONS_BADGE_LIMIT = 3;
+    const SESSIONS_BULK_REASONS = 4;
 
-    let sessionsHost = null;
-    let sessionsOpener = null;
-    const sessionsStore = createStore({ open: false, seq: 0 });
+    function sessionConfirmMatches(value) {
+      return String(value == null ? "" : value).trim().toUpperCase() === SESSIONS_CONFIRM_CODE;
+    }
 
-    function openSessionsPanel(opener) {
-      if (typeof document === "undefined" || !document.body) return;
-      if (!ReactDOMClient || typeof ReactDOMClient.createRoot !== "function") return;
-      sessionsOpener = opener || (document.activeElement instanceof HTMLElement ? document.activeElement : null);
-      if (!sessionsHost) {
-        sessionsHost = document.createElement("div");
-        sessionsHost.className = "dma-sessions-root";
-        document.body.appendChild(sessionsHost);
-        ReactDOMClient.createRoot(sessionsHost).render(e(SessionsOverlay));
+    function pad2(value) {
+      return String(value).padStart(2, "0");
+    }
+
+    /** 本地时间：中文 yyyy/MM/dd HH:mm，英文 yyyy-MM-dd HH:mm。 */
+    function sessionClock(ts) {
+      const value = Number(ts);
+      if (!Number.isFinite(value) || value <= 0) return "";
+      const date = new Date(value);
+      const dateText = detectLang() === "en"
+        ? `${date.getFullYear()}-${pad2(date.getMonth() + 1)}-${pad2(date.getDate())}`
+        : `${date.getFullYear()}/${pad2(date.getMonth() + 1)}/${pad2(date.getDate())}`;
+      return `${dateText} ${pad2(date.getHours())}:${pad2(date.getMinutes())}`;
+    }
+
+    function sessionSizeText(bytes) {
+      const value = Number(bytes);
+      if (!Number.isFinite(value) || value <= 0) return "";
+      const units = ["B", "KB", "MB", "GB", "TB"];
+      let size = value;
+      let index = 0;
+      while (size >= 1024 && index < units.length - 1) {
+        size /= 1024;
+        index += 1;
       }
-      const snapshot = sessionsStore.getSnapshot();
-      sessionsStore.set({ open: true, seq: snapshot.seq + 1 });
+      const text = index === 0 ? String(Math.round(size)) : size.toFixed(size < 10 ? 1 : 0);
+      return text + " " + units[index];
     }
 
-    function closeSessionsPanel() {
-      const snapshot = sessionsStore.getSnapshot();
-      if (!snapshot.open) return;
-      sessionsStore.set({ open: false, seq: snapshot.seq + 1 });
-      const opener = sessionsOpener;
-      sessionsOpener = null;
-      if (opener && typeof opener.focus === "function" && opener.isConnected) {
-        try {
-          opener.focus({ preventScroll: true });
-        } catch {
-          /* ignore */
-        }
+    /** 服务端错误码 → 本地文案；未知码统一落到「操作失败」。 */
+    function sessionFailureText(err) {
+      const code = err && typeof err.message === "string" ? err.message : "";
+      const detail = err && err.detail && typeof err.detail === "object" ? err.detail : null;
+      const labels = ERROR_LABELS[detectLang()] || ERROR_LABELS.zh;
+      const base = code !== "" && labels && typeof labels[code] === "string"
+        ? labels[code]
+        : (/^[A-Z][A-Z0-9_]*$/.test(code) ? t("sessions.actionFailed") + "（" + code + "）" : t("sessions.actionFailed"));
+      if (!detail) return base;
+      // 移动失败时把真实错误码与原始 message 一并透出，便于定位而不是只看到「已回滚」。
+      const parts = [];
+      const detailCode = typeof detail.code === "string" && /^[A-Z][A-Z0-9_]*$/.test(detail.code) ? detail.code : "";
+      const detailMessage = typeof detail.message === "string" ? detail.message : "";
+      if (detailCode !== "") parts.push(detailCode);
+      if (detailMessage !== "" && detailMessage !== detailCode) parts.push(detailMessage);
+      if (parts.length === 0) return base;
+      return base + "（" + parts.join(" · ") + "）";
+    }
+
+    async function fetchSessionPayload(lean) {
+      const res = await getJson(SESSIONS_ROUTE + (lean === true ? "?lean=1" : ""));
+      const data = res.data;
+      if (res.status !== 200 || !data || data.ok !== true) {
+        const code = data && data.error && data.error.code ? data.error.code : "HTTP_" + res.status;
+        throw new Error(code);
       }
-    }
-
-    function SessionsOverlay() {
-      const snapshot = React.useSyncExternalStore(sessionsStore.subscribe, sessionsStore.getSnapshot, sessionsStore.getSnapshot);
-      if (!snapshot.open) return null;
-      return e(SessionsPanel, { key: snapshot.seq, onClose: closeSessionsPanel });
-    }
-
-    /** 兼容 ISO 字符串与毫秒时间戳。 */
-    function sessionTime(value) {
-      if (typeof value === "number" && Number.isFinite(value)) return value;
-      if (typeof value === "string" && value !== "") {
-        const parsed = Date.parse(value);
-        return Number.isFinite(parsed) ? parsed : 0;
-      }
-      return 0;
-    }
-
-    function sessionClock(value) {
-      const ts = sessionTime(value);
-      return ts > 0 ? statsClock(ts) : "—";
-    }
-
-    function sessionSize(bytes) {
-      const n = Number(bytes);
-      if (!Number.isFinite(n) || n <= 0) return "—";
-      if (n < 1024) return n + " B";
-      if (n < 1024 * 1024) return (Math.round((n / 1024) * 10) / 10) + " KB";
-      return (Math.round((n / (1024 * 1024)) * 10) / 10) + " MB";
-    }
-
-    /** 服务端错误码 → 当前语言的文案；未知码原样返回。 */
-    function sessionErrorText(code) {
-      if (!code) return t("sessions.actionFailed");
-      const dict = ERROR_LABELS[detectLang()] || ERROR_LABELS.zh;
-      return dict[code] || code;
-    }
-
-    function sessionFailure(results) {
-      for (const item of Array.isArray(results) ? results : []) {
-        if (item && item.ok === false) return sessionErrorText(item.error);
-      }
-      return "";
-    }
-
-    async function fetchSessions() {
-      const res = await getJson(SESSIONS_ROUTE);
-      const payload = res.data;
-      if (res.status !== 200 || !payload || payload.ok !== true || !payload.value) {
-        throw new Error(sessionErrorText(payload && payload.error) || ("HTTP " + res.status));
-      }
-      return payload.value;
+      return data.value || {};
     }
 
     async function postSessionAction(body) {
       const res = await postJson(SESSIONS_ROUTE, body);
-      const payload = res.data;
-      if (res.status !== 200 || !payload || payload.ok !== true) {
-        throw new Error(sessionErrorText(payload && payload.error) || ("HTTP " + res.status));
+      const data = res.data || {};
+      if (res.status !== 200 || data.ok !== true) {
+        const code = data.error && data.error.code ? data.error.code : "HTTP_" + res.status;
+        throw new Error(code);
       }
-      return payload.value;
+      return data.value || {};
     }
 
-    function SessionsPanel({ onClose }) {
-      const tt = t;
-      const [tab, setTab] = React.useState("list");
-      const [version, setVersion] = React.useState(0);
-      const [snapshot, setSnapshot] = React.useState({ status: "loading", data: null, error: "" });
-      const [query, setQuery] = React.useState("");
+    /**
+     * 设置页里的「会话管理」：直接展示列表与回收站，不再弹浮层。
+     * 逐条操作收在右侧「⋯」菜单里；勾选后可批量删除 / 移动 / 归档。
+     */
+    function SessionsPage({ t: tt }) {
+      const [snapshot, setSnapshot] = React.useState({ status: "loading", value: null, error: "" });
       const [busy, setBusy] = React.useState("");
+      const [tab, setTab] = React.useState("list");
+      const [query, setQuery] = React.useState("");
+      const [workspace, setWorkspace] = React.useState("all");
+      const [status, setStatus] = React.useState("all");
+      const [sort, setSort] = React.useState("updated");
+      const [menu, setMenu] = React.useState(null);
       const [dialog, setDialog] = React.useState(null);
-      const [target, setTarget] = React.useState("");
-      const [actionError, setActionError] = React.useState("");
-      const [hint, setHint] = React.useState("");
-      const panelRef = React.useRef(null);
+      const [purgeCode, setPurgeCode] = React.useState("");
+      const [notice, setNotice] = React.useState(null);
+      const [selected, setSelected] = React.useState([]);
+      const [selectedTrash, setSelectedTrash] = React.useState([]);
+      const [bulkTarget, setBulkTarget] = React.useState("");
+      const alive = React.useRef(true);
+      const loadSeq = React.useRef(0);
+      const menuRef = React.useRef(null);
 
-      React.useEffect(() => {
-        let cancelled = false;
-        setSnapshot((prev) => ({ status: prev.data ? "stale" : "loading", data: prev.data, error: "" }));
-        (async () => {
-          try {
-            const value = await fetchSessions();
-            if (!cancelled) setSnapshot({ status: "ready", data: value, error: "" });
-          } catch (err) {
-            if (!cancelled) {
-              setSnapshot((prev) => ({
-                status: "error",
-                data: prev.data,
-                error: err && err.message ? err.message : String(err)
-              }));
-            }
-          }
-        })();
-        return () => {
-          cancelled = true;
-        };
-      }, [version]);
+      React.useEffect(() => () => {
+        alive.current = false;
+      }, []);
 
-      React.useEffect(() => {
-        function onKey(event) {
-          if (event.key !== "Escape") return;
-          event.preventDefault();
-          event.stopPropagation();
-          if (dialog) {
-            setDialog(null);
-            setActionError("");
-          } else {
-            onClose();
-          }
+      const load = React.useCallback(async (quiet) => {
+        // 只接受最后一次请求的结果，避免删除前的慢响应覆盖删除后的新快照。
+        const seq = ++loadSeq.current;
+        if (!quiet) {
+          setSnapshot((prev) => ({
+            status: prev.value ? "ready" : "loading",
+            value: prev.value,
+            error: ""
+          }));
         }
-        window.addEventListener("keydown", onKey, true);
-        return () => window.removeEventListener("keydown", onKey, true);
-      }, [dialog, onClose]);
+        try {
+          const value = await fetchSessionPayload();
+          if (!alive.current || seq !== loadSeq.current) return;
+          setSnapshot({ status: "ready", value, error: "" });
+          // 回收站条目可能已被外部操作移除：清掉失效的勾选，避免批量操作命中不存在的项。
+          const validTrash = new Set(((value && value.trash && value.trash.entries) || []).map((entry) => entry.trashId));
+          setSelectedTrash((prev) => {
+            const next = prev.filter((id) => validTrash.has(id));
+            return next.length === prev.length ? prev : next;
+          });
+        } catch (err) {
+          if (!alive.current || seq !== loadSeq.current) return;
+          setSnapshot((prev) => ({
+            status: prev.value ? "ready" : "error",
+            value: prev.value,
+            error: err && err.message ? err.message : "HTTP_ERROR"
+          }));
+        }
+      }, []);
 
-      const data = snapshot.data;
-      const rows = data && Array.isArray(data.sessions) ? data.sessions : [];
-      const workspaces = data && Array.isArray(data.workspaces) ? data.workspaces : [];
-      const trash = data && data.trash && Array.isArray(data.trash.entries) ? data.trash.entries : [];
-      const trashCount = data && data.trash && Number.isFinite(data.trash.count) ? data.trash.count : trash.length;
-      const available = !data || data.available !== false;
-      const loading = snapshot.status === "loading";
-      const stale = snapshot.status === "stale";
+      // 外部（侧边栏菜单删除等）触发失效时，当前页面立即重新拉取。
+      React.useEffect(() => sessionsStore.subscribe(() => {
+        load(true);
+      }), [load]);
+
+      /** 删除成功后先从本地快照移除，页面立刻不再显示，再以服务端结果为准。 */
+      const dropRowsLocally = React.useCallback((ids) => {
+        const drop = new Set(ids);
+        setSnapshot((prev) => {
+          if (!prev.value) return prev;
+          const sessions = (prev.value.sessions || []).filter((row) => !drop.has(row.id));
+          return Object.assign({}, prev, {
+            value: Object.assign({}, prev.value, { sessions })
+          });
+        });
+        setSelected((prev) => prev.filter((id) => !drop.has(id)));
+      }, []);
+
+      /** 回收站恢复 / 彻底清理成功后本地移除条目，避免等下一次拉取。 */
+      const dropTrashLocally = React.useCallback((trashIds) => {
+        const drop = new Set(trashIds);
+        setSnapshot((prev) => {
+          if (!prev.value || !prev.value.trash) return prev;
+          const entries = (prev.value.trash.entries || []).filter((entry) => !drop.has(entry.trashId));
+          return Object.assign({}, prev, {
+            value: Object.assign({}, prev.value, {
+              trash: Object.assign({}, prev.value.trash, {
+                entries,
+                count: entries.length,
+                bytes: entries.reduce((sum, entry) => sum + (Number.isFinite(entry.sizeBytes) ? entry.sizeBytes : 0), 0)
+              })
+            })
+          });
+        });
+        setSelectedTrash((prev) => prev.filter((id) => !drop.has(id)));
+      }, []);
+
+      React.useEffect(() => {
+        load(false);
+      }, [load]);
+
+      // 结果提示自动消失，避免一直占位。
+      React.useEffect(() => {
+        if (!notice) return undefined;
+        const timer = setTimeout(() => setNotice(null), 4200);
+        return () => clearTimeout(timer);
+      }, [notice]);
+
+      // 点击菜单外 / Esc / 滚动时关闭「⋯」菜单。
+      React.useEffect(() => {
+        if (!menu) return undefined;
+        const onDown = (ev) => {
+          const el = menuRef.current;
+          if (el && ev.target instanceof Node && el.contains(ev.target)) return;
+          setMenu(null);
+        };
+        const onKey = (ev) => {
+          if (ev.key !== "Escape") return;
+          ev.stopPropagation();
+          setMenu(null);
+        };
+        document.addEventListener("mousedown", onDown, true);
+        document.addEventListener("keydown", onKey, true);
+        window.addEventListener("resize", onDown);
+        window.addEventListener("scroll", onDown, true);
+        return () => {
+          document.removeEventListener("mousedown", onDown, true);
+          document.removeEventListener("keydown", onKey, true);
+          window.removeEventListener("resize", onDown);
+          window.removeEventListener("scroll", onDown, true);
+        };
+      }, [menu]);
+
+      // 对话框：Esc 关闭。
+      React.useEffect(() => {
+        if (!dialog) return undefined;
+        const onKey = (ev) => {
+          if (ev.key !== "Escape") return;
+          ev.stopPropagation();
+          setDialog(null);
+        };
+        document.addEventListener("keydown", onKey, true);
+        return () => document.removeEventListener("keydown", onKey, true);
+      }, [dialog]);
+
+      const value = snapshot.value || {};
+      const available = value.available !== false;
+      const sessionRows = Array.isArray(value.sessions) ? value.sessions : [];
+      const workspaceRows = Array.isArray(value.workspaces) ? value.workspaces : [];
+      const trash = value.trash && typeof value.trash === "object"
+        ? value.trash
+        : { count: 0, bytes: 0, entries: [] };
+      const trashEntries = Array.isArray(trash.entries) ? trash.entries : [];
 
       const filtered = React.useMemo(() => {
-        const needle = query.trim().toLowerCase();
-        if (needle === "") return rows;
-        return rows.filter((row) => {
-          const haystack = [row.title, row.cwd, row.workspaceTitle].join("\n").toLowerCase();
-          return haystack.includes(needle);
+        const keyword = query.trim().toLowerCase();
+        const list = sessionRows.filter((row) => {
+          if (workspace !== "all" && (row.workspaceId || "") !== workspace) return false;
+          // 「活跃」= 未归档；「已归档」= 宿主的归档集。两者互补，计数之和等于总数。
+          if (status === "active" && row.archived === true) return false;
+          if (status === "archived" && row.archived !== true) return false;
+          if (keyword === "") return true;
+          const haystack = [row.title, row.cwd, row.workspaceTitle, row.model, row.id]
+            .filter((part) => typeof part === "string" && part !== "")
+            .join(" ")
+            .toLowerCase();
+          return haystack.includes(keyword);
         });
-      }, [rows, query]);
+        const timeOf = (row, key) => (Number.isFinite(row[key]) ? row[key] : 0);
+        list.sort((left, right) => {
+          if (sort === "created") {
+            const delta = timeOf(right, "createdAt") - timeOf(left, "createdAt");
+            if (delta !== 0) return delta;
+          } else if (sort === "title") {
+            const delta = String(left.title || "").localeCompare(String(right.title || ""), detectLang());
+            if (delta !== 0) return delta;
+          } else {
+            const delta = timeOf(right, "updatedAt") - timeOf(left, "updatedAt");
+            if (delta !== 0) return delta;
+          }
+          return String(left.id).localeCompare(String(right.id));
+        });
+        return list;
+      }, [sessionRows, query, workspace, status, sort]);
 
       const groups = React.useMemo(() => {
-        const byId = new Map();
-        for (const ws of workspaces) {
-          byId.set(ws.id, { id: ws.id, title: ws.title, path: ws.path, rows: [] });
-        }
-        const others = { id: "", title: "", path: "", rows: [] };
+        const map = new Map();
         for (const row of filtered) {
-          const group = row.workspaceId && byId.get(row.workspaceId) ? byId.get(row.workspaceId) : others;
+          const key = row.workspaceId || "";
+          if (!map.has(key)) {
+            map.set(key, {
+              id: key,
+              title: row.workspaceTitle || tt("sessions.otherWorkspace"),
+              path: row.cwd || "",
+              rows: []
+            });
+          }
+          const group = map.get(key);
           group.rows.push(row);
+          if (!group.path && row.cwd) group.path = row.cwd;
         }
-        const out = [];
-        for (const ws of workspaces) {
-          const group = byId.get(ws.id);
-          if (group && group.rows.length > 0) out.push(group);
-        }
-        if (others.rows.length > 0) out.push(others);
-        return out;
-      }, [filtered, workspaces]);
+        return [...map.values()];
+      }, [filtered, tt]);
 
-      function rowTitle(row) {
-        return row.title || tt("sessions.untitled");
+      const totals = { active: 0, archived: 0 };
+      for (const row of sessionRows) {
+        if (row.archived === true) totals.archived += 1;
+        else totals.active += 1;
       }
 
-      function reload() {
-        setVersion((value) => value + 1);
-      }
-
-      async function doDelete(row) {
-        setBusy(row.id);
-        setActionError("");
-        try {
-          const value = await postSessionAction({ action: "delete", sessionIds: [row.id] });
-          const error = sessionFailure(value && value.results);
-          if (error) throw new Error(error);
-          setDialog(null);
-          showToast(tt("sessions.doneDelete"));
-          reload();
-        } catch (err) {
-          setActionError(err && err.message ? err.message : tt("sessions.actionFailed"));
-        } finally {
-          setBusy("");
-        }
-      }
-
-      async function doMove(row, workspaceId) {
-        if (!workspaceId) {
-          setActionError(tt("sessions.noTargets"));
+      function openMenu(ev, row) {
+        if (ev && typeof ev.stopPropagation === "function") ev.stopPropagation();
+        if (menu && menu.row && menu.row.id === row.id) {
+          setMenu(null);
           return;
         }
+        const rect = ev.currentTarget.getBoundingClientRect();
+        const viewWidth = window.innerWidth || 0;
+        const viewHeight = window.innerHeight || 0;
+        const left = Math.max(8, Math.min(rect.right - SESSIONS_MENU_WIDTH, viewWidth - SESSIONS_MENU_WIDTH - 8));
+        let top = rect.bottom + 6;
+        if (top + SESSIONS_MENU_HEIGHT > viewHeight - 8) {
+          top = Math.max(8, rect.top - SESSIONS_MENU_HEIGHT - 6);
+        }
+        setMenu({ row, top, left });
+      }
+
+      function startDelete(row) {
+        setMenu(null);
+        // 只拒绝「正在生成」：仅被宿主打开（live）的会话可以删除。
+        if (row.running === true) {
+          setNotice({ ok: false, text: tt("sessions.runningHint") });
+          return;
+        }
+        setDialog({ kind: "delete", row });
+        setPurgeCode("");
+      }
+
+      function startMove(row) {
+        // 二级菜单：直接列出目标工作区，不再弹对话框。
+        // 只拒绝「正在生成」；仅在 UI 中打开（live）的会话允许移动。
+        if (row.running === true) {
+          setNotice({ ok: false, text: tt("sessions.runningHint") });
+          return;
+        }
+        setMenu((prev) => (prev && prev.row && prev.row.id === row.id ? { ...prev, view: "move" } : prev));
+      }
+
+      // —— 多选与批量操作 ——
+      const multiSelect = selected.length > 0;
+
+      function toggleSelected(id) {
+        setMenu(null);
+        setSelected((prev) => (prev.includes(id) ? prev.filter((value) => value !== id) : prev.concat(id)));
+      }
+
+      function selectAllFiltered() {
+        setMenu(null);
+        setSelected((prev) => {
+          const next = new Set(prev);
+          for (const row of filtered) next.add(row.id);
+          return [...next];
+        });
+      }
+
+      function clearSelected() {
+        setSelected([]);
+      }
+
+      function switchListTab(next) {
+        if (next === tab) return;
+        setTab(next);
+        setSelected([]);
+        setSelectedTrash([]);
+        setMenu(null);
+      }
+
+      function openBulkMove() {
+        if (selected.length === 0) return;
+        const first = workspaceRows[0];
+        setBulkTarget(first ? first.id : "");
+        setDialog({ kind: "bulkMove", ids: selected.slice() });
+      }
+
+      /**
+       * 批量操作：逐条结果由宿主返回；成功项立即生效，失败项保留选中便于重试。
+       * 汇总提示形如「成功 3 个，失败 1 个 · <标题>：<原因>」。
+       */
+      async function runBulk(action, ids, targetWorkspace) {
+        if (!ids || ids.length === 0) return;
+        setMenu(null);
+        setDialog(null);
+        setBusy("bulk");
+        let results = [];
+        let failure = null;
+        try {
+          let response;
+          if (action === "delete") {
+            response = await postSessionAction({ action: "delete", sessionIds: ids, confirm: SESSIONS_CONFIRM_CODE });
+            results = Array.isArray(response.results) ? response.results : [];
+          } else if (action === "archive") {
+            response = await postSessionAction({ action: "archive", sessionIds: ids });
+            results = Array.isArray(response.results) ? response.results : [];
+          } else {
+            response = await postSessionAction({ action: "moveBatch", sessionIds: ids, workspaceId: targetWorkspace });
+            results = Array.isArray(response.results) ? response.results : [];
+          }
+        } catch (err) {
+          failure = err;
+        }
+        setBusy("");
+        if (failure) {
+          setNotice({ ok: false, text: sessionFailureText(failure) });
+          await load(true);
+          return;
+        }
+        const okResults = results.filter((item) => item && item.ok === true);
+        const failedResults = results.filter((item) => item && item.ok !== true);
+        // 当前页面立即移除成功删除的条目（含被宿主内存 stub 的 live 会话），
+        // 再触发整体重拉，避免「未分组」残留到刷新或重启。
+        if (action === "delete" && okResults.length > 0) {
+          dropRowsLocally(okResults.map((item) => item.id));
+          markSidebarTrash(okResults.map((item) => item.id));
+        }
+        bumpSessionsRevision();
+        const titleOf = (id) => {
+          const row = sessionRows.find((item) => item.id === id);
+          return row ? (row.title || tt("sessions.untitled")) : id;
+        };
+        let text = tt("sessions.bulkResult", { ok: okResults.length, fail: failedResults.length });
+        if (failedResults.length > 0) {
+          const reasons = failedResults.slice(0, SESSIONS_BULK_REASONS).map((item) => {
+            const err = new Error(item.error || "ACTION_FAILED");
+            if (item.detail) err.detail = item.detail;
+            return titleOf(item.id) + "：" + sessionFailureText(err);
+          });
+          text += " · " + reasons.join("；");
+          if (failedResults.length > SESSIONS_BULK_REASONS) {
+            text += " " + tt("sessions.bulkMoreFailed", { n: failedResults.length - SESSIONS_BULK_REASONS });
+          }
+          setSelected(failedResults.map((item) => item.id));
+        } else {
+          setSelected([]);
+        }
+        setNotice({ ok: failedResults.length === 0, text });
+        await load(true);
+      }
+
+      function resultFailure(item, fallback) {
+        const err = new Error((item && item.error) || fallback);
+        if (item && item.detail) err.detail = item.detail;
+        return err;
+      }
+
+      function trashTitleOf(trashId) {
+        const entry = trashEntries.find((item) => item.trashId === trashId);
+        return entry ? (entry.title || tt("sessions.untitled")) : trashId;
+      }
+
+      function toggleTrashSelected(trashId) {
+        setSelectedTrash((prev) => (prev.includes(trashId)
+          ? prev.filter((id) => id !== trashId)
+          : prev.concat(trashId)));
+      }
+
+      function selectAllTrash() {
+        setSelectedTrash(trashEntries.map((entry) => entry.trashId));
+      }
+
+      function clearTrashSelection() {
+        setSelectedTrash([]);
+      }
+
+      async function runDelete(row) {
+        // 单条删除只进回收站（可恢复），不再要求输入 OK；批量删除才需要口令。
         setBusy(row.id);
-        setActionError("");
+        let message = "";
+        let ok = false;
         try {
-          const value = await postSessionAction({ action: "move", sessionId: row.id, workspaceId });
-          if (!value || value.ok !== true) throw new Error(sessionErrorText(value && value.error));
-          const ws = workspaces.find((item) => item.id === workspaceId);
-          const name = value.workspaceTitle || (ws ? ws.title || ws.path : "");
-          setDialog(null);
-          showToast(tt("sessions.doneMove", { workspace: name }));
-          if (value.restartRequired) setHint(tt("sessions.restartHint"));
-          reload();
+          const result = await postSessionAction({ action: "delete", sessionIds: [row.id] });
+          const first = Array.isArray(result.results) ? result.results[0] : null;
+          if (first && first.ok === false) throw resultFailure(first, "SESSION_DELETE_FAILED");
+          ok = true;
+          message = tt("sessions.doneDelete");
         } catch (err) {
-          setActionError(err && err.message ? err.message : tt("sessions.actionFailed"));
-        } finally {
-          setBusy("");
+          message = sessionFailureText(err);
         }
+        setBusy("");
+        setDialog(null);
+        setPurgeCode("");
+        setNotice({ ok, text: message });
+        if (ok) {
+          dropRowsLocally([row.id]);
+          markSidebarTrash([row.id]);
+          bumpSessionsRevision();
+        }
+        await load(true);
       }
 
-      async function doRestore(entry) {
-        setBusy(entry.trashId);
-        setActionError("");
+      async function runMove(row, target) {
+        setBusy(row.id);
+        let message = "";
+        let ok = false;
         try {
-          const value = await postSessionAction({ action: "restore", trashIds: [entry.trashId] });
-          const error = sessionFailure(value && value.results);
-          if (error) throw new Error(error);
-          const result = value && value.results ? value.results[0] : null;
-          if (result && result.restartRequired) setHint(tt("sessions.restartHint"));
-          showToast(tt("sessions.doneRestore"));
-          reload();
+          const result = await postSessionAction({ action: "move", sessionId: row.id, workspaceId: target });
+          if (result.ok === false) {
+            const err = new Error(result.error || "MOVE_FAILED");
+            if (result.detail) err.detail = result.detail;
+            throw err;
+          }
+          const name = workspaceRows.find((item) => item.id === target);
+          ok = true;
+          message = tt("sessions.doneMove", { workspace: name ? name.title : target });
+          if (result.restartRequired === true) message += " " + tt("sessions.restartHint");
         } catch (err) {
-          setActionError(err && err.message ? err.message : tt("sessions.actionFailed"));
-        } finally {
-          setBusy("");
+          message = sessionFailureText(err);
         }
+        setBusy("");
+        setDialog(null);
+        setNotice({ ok, text: message });
+        if (ok) bumpSessionsRevision();
+        await load(true);
       }
 
-      async function doPurge(entry) {
-        setBusy(entry.trashId);
-        setActionError("");
+      /**
+       * 回收站恢复：单条与批量共用。软回收站只删索引，宿主侧栏行当场恢复；
+       * 失败项保持选中，成功项立即从列表移除。
+       */
+      async function runTrashRestore(trashIds) {
+        if (!trashIds || trashIds.length === 0) return;
+        const bulk = trashIds.length > 1;
+        setBusy(bulk ? "trashBulk" : trashIds[0]);
+        setDialog(null);
+        let results = [];
+        let failure = null;
         try {
-          const value = await postSessionAction({ action: "purge", confirm: true, trashIds: [entry.trashId] });
-          const error = sessionFailure(value && value.results);
-          if (error) throw new Error(error);
-          setDialog(null);
-          showToast(tt("sessions.donePurge"));
-          reload();
+          const response = await postSessionAction({ action: "restore", trashIds });
+          results = Array.isArray(response.results) ? response.results : [];
         } catch (err) {
-          setActionError(err && err.message ? err.message : tt("sessions.actionFailed"));
-        } finally {
-          setBusy("");
+          failure = err;
         }
+        setBusy("");
+        if (failure) {
+          setNotice({ ok: false, text: sessionFailureText(failure) });
+          await load(true);
+          return;
+        }
+        const okResults = results.filter((item) => item && item.ok === true);
+        const failedResults = results.filter((item) => item && item.ok !== true);
+        if (okResults.length > 0) {
+          dropTrashLocally(okResults.map((item) => item.trashId));
+          unmarkSidebarTrash(okResults.map((item) => item.sessionId).filter(Boolean));
+        }
+        setSelectedTrash(failedResults.map((item) => item.trashId));
+        let text;
+        if (!bulk && okResults.length > 0) {
+          const first = okResults[0];
+          text = tt("sessions.doneRestore");
+          if (first && first.restartRequired === true) text += " " + tt("sessions.restartHint");
+        } else if (!bulk && failedResults.length > 0) {
+          text = sessionFailureText(resultFailure(failedResults[0], "RESTORE_FAILED"));
+        } else {
+          text = tt("sessions.bulkResult", { ok: okResults.length, fail: failedResults.length });
+          if (failedResults.length > 0) {
+            const reasons = failedResults.slice(0, SESSIONS_BULK_REASONS).map((item) =>
+              trashTitleOf(item.trashId) + "：" + sessionFailureText(resultFailure(item, "RESTORE_FAILED")));
+            text += " · " + reasons.join("；");
+            if (failedResults.length > SESSIONS_BULK_REASONS) {
+              text += " " + tt("sessions.bulkMoreFailed", { n: failedResults.length - SESSIONS_BULK_REASONS });
+            }
+          }
+        }
+        setNotice({ ok: failedResults.length === 0, text });
+        bumpSessionsRevision();
+        await load(true);
       }
 
-      async function doPurgeAll() {
-        setBusy("all");
-        setActionError("");
+      async function runRestore(entry) {
+        await runTrashRestore([entry.trashId]);
+      }
+
+      /**
+       * 彻底清理：单条只需确认按钮；批量（多条或清空回收站）需要输入 OK。
+       */
+      async function runPurge(trashIds) {
+        if (!trashIds || trashIds.length === 0) return;
+        const bulk = trashIds.length > 1;
+        if (bulk && !sessionConfirmMatches(purgeCode)) {
+          setNotice({ ok: false, text: tt("sessions.purgeCodeWrong") });
+          return;
+        }
+        setBusy(bulk ? "trashBulk" : trashIds[0]);
+        let message = "";
+        let ok = false;
+        let results = [];
         try {
-          const value = await postSessionAction({ action: "purge", all: true, confirm: "PURGE_ALL" });
-          const error = sessionFailure(value && value.results);
-          if (error) throw new Error(error);
-          setDialog(null);
-          showToast(tt("sessions.donePurge"));
-          reload();
+          const body = { action: "purge", trashIds };
+          if (bulk) body.confirm = SESSIONS_CONFIRM_CODE;
+          const response = await postSessionAction(body);
+          results = Array.isArray(response.results) ? response.results : [];
+          const failed = results.filter((item) => item && item.ok !== true);
+          if (failed.length === 0) {
+            ok = true;
+            message = tt("sessions.donePurge");
+          } else if (!bulk) {
+            message = sessionFailureText(resultFailure(failed[0], "PURGE_FAILED"));
+          }
         } catch (err) {
-          setActionError(err && err.message ? err.message : tt("sessions.actionFailed"));
-        } finally {
-          setBusy("");
+          message = sessionFailureText(err);
         }
+        setBusy("");
+        setDialog(null);
+        setPurgeCode("");
+        const okResults = results.filter((item) => item && item.ok === true);
+        const failedResults = results.filter((item) => item && item.ok !== true);
+        if (okResults.length > 0) {
+          dropTrashLocally(okResults.map((item) => item.trashId));
+          markSidebarPurged(okResults.map((item) => item.sessionId).filter(Boolean));
+        }
+        if (ok && !bulk) {
+          setSelectedTrash([]);
+        } else if (failedResults.length > 0) {
+          setSelectedTrash(failedResults.map((item) => item.trashId));
+          if (bulk) {
+            message = tt("sessions.bulkResult", { ok: okResults.length, fail: failedResults.length });
+            const reasons = failedResults.slice(0, SESSIONS_BULK_REASONS).map((item) =>
+              trashTitleOf(item.trashId) + "：" + sessionFailureText(resultFailure(item, "PURGE_FAILED")));
+            message += " · " + reasons.join("；");
+            if (failedResults.length > SESSIONS_BULK_REASONS) {
+              message += " " + tt("sessions.bulkMoreFailed", { n: failedResults.length - SESSIONS_BULK_REASONS });
+            }
+          }
+        }
+        setNotice({ ok: failedResults.length === 0, text: message });
+        bumpSessionsRevision();
+        await load(true);
       }
 
-      function openMove(row) {
-        const targets = workspaces.filter((ws) => ws.id !== row.workspaceId);
-        setTarget(targets.length > 0 ? targets[0].id : "");
-        setActionError("");
-        setDialog({ kind: "move", row });
-      }
-
-      function confirmDialog() {
-        if (!dialog) return;
-        if (dialog.kind === "delete") doDelete(dialog.row);
-        else if (dialog.kind === "purge") doPurge(dialog.entry);
-        else if (dialog.kind === "purgeAll") doPurgeAll();
+      async function runPurgeAll() {
+        if (!sessionConfirmMatches(purgeCode)) {
+          setNotice({ ok: false, text: tt("sessions.purgeCodeWrong") });
+          return;
+        }
+        setBusy("purgeAll");
+        let message = "";
+        let ok = false;
+        let results = [];
+        try {
+          const response = await postSessionAction({ action: "purge", all: true, confirm: SESSIONS_CONFIRM_CODE });
+          results = Array.isArray(response.results) ? response.results : [];
+          const failed = results.filter((item) => item && item.ok !== true);
+          ok = failed.length === 0;
+          message = tt("sessions.donePurge");
+        } catch (err) {
+          message = sessionFailureText(err);
+        }
+        setBusy("");
+        setDialog(null);
+        setPurgeCode("");
+        const okResults = results.filter((item) => item && item.ok === true);
+        const failedResults = results.filter((item) => item && item.ok !== true);
+        if (okResults.length > 0) {
+          dropTrashLocally(okResults.map((item) => item.trashId));
+          markSidebarPurged(okResults.map((item) => item.sessionId).filter(Boolean));
+        }
+        setSelectedTrash(failedResults.map((item) => item.trashId));
+        if (failedResults.length > 0) {
+          message = tt("sessions.bulkResult", { ok: okResults.length, fail: failedResults.length });
+          const reasons = failedResults.slice(0, SESSIONS_BULK_REASONS).map((item) =>
+            trashTitleOf(item.trashId) + "：" + sessionFailureText(resultFailure(item, "PURGE_FAILED")));
+          message += " · " + reasons.join("；");
+        }
+        setNotice({ ok, text: message });
+        bumpSessionsRevision();
+        await load(true);
       }
 
       function renderBadges(row) {
         const badges = [];
-        if (row.live) badges.push(e("span", { key: "live", className: "dma-session-badge dma-session-badge-live" }, tt("sessions.live")));
-        if (row.running) badges.push(e("span", { key: "running", className: "dma-session-badge dma-session-badge-run" }, tt("sessions.running")));
-        if (row.archived) badges.push(e("span", { key: "archived", className: "dma-session-badge" }, tt("sessions.archived")));
-        if (row.child) badges.push(e("span", { key: "child", className: "dma-session-badge" }, tt("sessions.child")));
-        return badges.length > 0 ? badges : null;
+        if (row.live === true) badges.push(e("span", { className: "dma-session-badge dma-session-badge-live", key: "live" }, tt("sessions.live")));
+        if (row.running === true) badges.push(e("span", { className: "dma-session-badge dma-session-badge-run", key: "run" }, tt("sessions.running")));
+        if (row.archived === true) badges.push(e("span", { className: "dma-session-badge", key: "arch" }, tt("sessions.archived")));
+        if (row.child === true) badges.push(e("span", { className: "dma-session-badge", key: "child" }, tt("sessions.child")));
+        return badges.slice(0, SESSIONS_BADGE_LIMIT);
       }
 
       function renderSessionRow(row) {
-        const locked = row.live || row.running;
-        const lockedTitle = locked ? tt("sessions.liveHint") : undefined;
-        return e("div", { key: row.id, className: "dma-session-row" },
+        const title = row.title || tt("sessions.untitled");
+        const checked = selected.includes(row.id);
+        const meta = [];
+        if (typeof row.model === "string" && row.model !== "") {
+          meta.push(e("span", { className: "dma-session-model", title: row.model, key: "model" }, row.model));
+        }
+        if (Number.isFinite(row.messages) && row.messages > 0) {
+          meta.push(e("span", { className: "dma-session-fact", key: "msgs" }, tt("sessions.messageCount", { count: row.messages })));
+        }
+        if (Number.isFinite(row.tokens) && row.tokens > 0) {
+          meta.push(e("span", { className: "dma-session-fact", key: "tokens" }, tt("sessions.tokenCount", { count: formatTokens(row.tokens) })));
+        }
+        const time = row.updatedAt || row.createdAt;
+        if (time) {
+          meta.push(e("span", { className: "dma-session-fact", key: "time" }, tt("sessions.updatedAt", { time: sessionClock(time) })));
+        }
+        if (typeof row.cwd === "string" && row.cwd !== "") {
+          meta.push(e("span", { className: "dma-session-path", title: row.cwd, key: "path" }, row.cwd));
+        }
+        return e("div", { className: "dma-session-row" + (checked ? " dma-session-row-selected" : ""), key: row.id },
+          e("label", { className: "dma-session-check", title: tt("sessions.selectRow", { title }) },
+            e("input", {
+              type: "checkbox",
+              checked,
+              "aria-label": tt("sessions.selectRow", { title }),
+              onChange: () => toggleSelected(row.id)
+            })
+          ),
           e("div", { className: "dma-session-main" },
             e("div", { className: "dma-session-title-line" },
-              e("span", { className: "dma-session-title", title: rowTitle(row) }, rowTitle(row)),
+              e("span", { className: "dma-session-title", title }, title),
               renderBadges(row)
             ),
-            e("div", { className: "dma-session-meta" },
-              e("span", null, sessionClock(row.createdAt)),
-              row.cwd ? e("span", { className: "dma-session-path", title: row.cwd }, row.cwd) : null
-            )
+            e("div", { className: "dma-session-meta" }, meta)
           ),
-          e("div", { className: "dma-session-actions" },
-            e("button", {
-              type: "button",
-              className: "dma-btn dma-session-act",
-              title: lockedTitle || (data && data.canMove === false ? tt("sessions.unavailable") : tt("sessions.move")),
-              disabled: locked || busy !== "" || !data || data.canMove === false || workspaces.length < 2,
-              onClick: () => openMove(row)
-            }, tt("sessions.move")),
-            e("button", {
-              type: "button",
-              className: "dma-btn dma-session-act dma-session-danger",
-              title: lockedTitle || tt("sessions.deleteHint"),
-              disabled: locked || busy !== "",
-              onClick: () => {
-                setActionError("");
-                setDialog({ kind: "delete", row });
-              }
-            }, tt("sessions.delete"))
-          )
-        );
-      }
-
-      function renderGroup(group) {
-        const title = group.id === "" ? tt("sessions.otherWorkspace") : (group.title || group.path || tt("sessions.otherWorkspace"));
-        return e("section", { key: group.id || "others", className: "dma-sessions-group" },
-          e("div", { className: "dma-sessions-group-head" },
-            e("span", { className: "dma-sessions-group-title", title }, title),
-            group.path ? e("span", { className: "dma-sessions-group-path", title: group.path }, group.path) : null,
-            e("span", { className: "dma-sessions-group-count" }, String(group.rows.length))
-          ),
-          group.rows.map(renderSessionRow)
+          multiSelect ? null : e("button", {
+            type: "button",
+            className: "dma-session-more",
+            "aria-label": tt("sessions.more"),
+            "aria-haspopup": "menu",
+            "aria-expanded": menu && menu.row && menu.row.id === row.id ? "true" : "false",
+            title: tt("sessions.more"),
+            onClick: (ev) => openMenu(ev, row)
+          }, "⋯")
         );
       }
 
       function renderTrashRow(entry) {
         const title = entry.title || tt("sessions.untitled");
-        const running = busy === entry.trashId;
-        return e("div", { key: entry.trashId, className: "dma-session-row" + (entry.missing ? " dma-session-row-missing" : "") },
+        const meta = [];
+        if (typeof entry.workspaceTitle === "string" && entry.workspaceTitle !== "") {
+          meta.push(e("span", { className: "dma-session-fact", key: "ws" }, entry.workspaceTitle));
+        }
+        if (Number.isFinite(entry.sizeBytes) && entry.sizeBytes > 0) {
+          meta.push(e("span", { className: "dma-session-fact", key: "size" }, sessionSizeText(entry.sizeBytes)));
+        }
+        meta.push(e("span", { className: "dma-session-fact", key: "del" }, tt("sessions.deletedAt", { time: sessionClock(entry.deletedAt) })));
+        if (entry.missing === true) {
+          meta.push(e("span", { className: "dma-session-badge dma-session-badge-warn", key: "missing" }, tt("sessions.missing")));
+        }
+        const working = busy === entry.trashId || busy === "trashBulk";
+        const checked = selectedTrash.includes(entry.trashId);
+        return e("div", { className: "dma-session-row" + (checked ? " dma-session-row-selected" : ""), key: entry.trashId },
+          e("label", { className: "dma-session-check", title: tt("sessions.selectRow", { title }) },
+            e("input", {
+              type: "checkbox",
+              checked,
+              "aria-label": tt("sessions.selectRow", { title }),
+              onChange: () => toggleTrashSelected(entry.trashId)
+            })
+          ),
           e("div", { className: "dma-session-main" },
             e("div", { className: "dma-session-title-line" },
-              e("span", { className: "dma-session-title", title }, title),
-              entry.missing ? e("span", { className: "dma-session-badge dma-session-badge-warn" }, tt("sessions.missing")) : null
+              e("span", { className: "dma-session-title", title }, title)
             ),
-            e("div", { className: "dma-session-meta" },
-              e("span", null, tt("sessions.deletedAt", { time: sessionClock(entry.deletedAt) })),
-              entry.workspaceTitle ? e("span", { className: "dma-session-path", title: entry.workspaceTitle }, entry.workspaceTitle) : null,
-              e("span", null, sessionSize(entry.sizeBytes))
-            )
+            e("div", { className: "dma-session-meta" }, meta)
           ),
           e("div", { className: "dma-session-actions" },
             e("button", {
               type: "button",
-              className: "dma-btn dma-session-act",
-              disabled: running || busy !== "" || entry.missing,
-              title: entry.missing ? tt("sessions.missing") : tt("sessions.restore"),
-              onClick: () => doRestore(entry)
+              className: "dma-session-act",
+              disabled: working || entry.missing === true,
+              onClick: () => runRestore(entry)
             }, tt("sessions.restore")),
             e("button", {
               type: "button",
-              className: "dma-btn dma-session-act dma-session-danger",
-              disabled: running || busy !== "",
-              title: tt("sessions.purgeHint"),
+              className: "dma-session-act dma-session-danger",
+              disabled: working,
               onClick: () => {
-                setActionError("");
+                setPurgeCode("");
                 setDialog({ kind: "purge", entry });
               }
             }, tt("sessions.purge"))
@@ -3136,236 +3666,864 @@ window.__ModuleLoader__.load({
         );
       }
 
+      function renderMenu() {
+        // 多选模式下隐藏单项「⋯」菜单，避免与批量操作误触。
+        if (!menu || !menu.row || multiSelect) return null;
+        const row = menu.row;
+        const position = { top: menu.top + "px", left: menu.left + "px" };
+        // 二级菜单：直接列出目标工作区（当前工作区置灰并标注）。
+        if (menu.view === "move") {
+          const targets = workspaceRows;
+          return e("div", {
+            className: "dma-session-menu",
+            ref: menuRef,
+            role: "menu",
+            style: position
+          },
+            e("p", { className: "dma-session-menu-title" }, tt("sessions.moveTo")),
+            targets.length === 0
+              ? e("p", { className: "dma-session-menu-note" }, tt("sessions.noTargets"))
+              : targets.map((item) => {
+                const isCurrent = item.id === (row.workspaceId || "");
+                return e("button", {
+                  key: item.id,
+                  type: "button",
+                  role: "menuitem",
+                  className: "dma-session-menu-item",
+                  disabled: isCurrent || busy === row.id,
+                  onClick: () => {
+                    setMenu(null);
+                    runMove(row, item.id);
+                  }
+                }, (item.title || item.path || item.id) + (isCurrent ? " · " + tt("sessions.currentWorkspace") : ""));
+              })
+          );
+        }
+        // 移动只拒绝「正在生成」；删除同理。
+        const moveDisabled = row.running === true;
+        const deleteDisabled = row.running === true;
+        return e("div", {
+          className: "dma-session-menu",
+          ref: menuRef,
+          role: "menu",
+          style: position
+        },
+          e("button", {
+            type: "button",
+            role: "menuitem",
+            className: "dma-session-menu-item",
+            disabled: moveDisabled,
+            onClick: () => startMove(row)
+          }, tt("sessions.actionMove")),
+          e("button", {
+            type: "button",
+            role: "menuitem",
+            className: "dma-session-menu-item dma-session-menu-danger",
+            disabled: deleteDisabled,
+            onClick: () => startDelete(row)
+          }, tt("sessions.actionDelete")),
+          moveDisabled ? e("p", { className: "dma-session-menu-note" }, tt("sessions.runningHint")) : null
+        );
+      }
+
       function renderDialog() {
         if (!dialog) return null;
         let title = "";
-        let desc = "";
-        let confirmLabel = "";
+        let body = null;
+        let confirmText = tt("confirm.ok");
+        let onConfirm = null;
+        let canConfirm = true;
         let danger = false;
-        let toolbar = null;
+        // 删除类操作统一要求输入 OK（去首尾空格、大小写不敏感）。
+        // Enter 等价于点「确认」；输入法组词中的回车不触发提交。
+        const confirmField = (labelKey) => e("div", { className: "dma-session-field" },
+          e("label", { className: "dma-session-field-label", htmlFor: "dma-session-confirm" }, tt(labelKey)),
+          e("input", {
+            id: "dma-session-confirm",
+            className: "dma-sessions-input",
+            value: purgeCode,
+            placeholder: SESSIONS_CONFIRM_CODE,
+            autoComplete: "off",
+            spellCheck: false,
+            autoFocus: true,
+            onFocus: (ev) => {
+              try {
+                ev.target.select();
+              } catch {
+                /* ignore */
+              }
+            },
+            onKeyDown: (ev) => {
+              if (ev.key !== "Enter" || ev.shiftKey) return;
+              const native = ev.nativeEvent || {};
+              if (native.isComposing === true || ev.keyCode === 229) return;
+              ev.preventDefault();
+              if (!sessionConfirmMatches(purgeCode)) {
+                setNotice({ ok: false, text: tt("sessions.purgeCodeWrong") });
+                return;
+              }
+              if (canConfirm && typeof onConfirm === "function") onConfirm();
+            },
+            onChange: (ev) => setPurgeCode(ev.target.value)
+          })
+        );
         if (dialog.kind === "delete") {
           title = tt("sessions.deleteTitle");
-          desc = tt("sessions.deleteDesc", { title: rowTitle(dialog.row) });
-          confirmLabel = tt("sessions.deleteConfirm");
-        } else if (dialog.kind === "move") {
-          const targets = workspaces.filter((ws) => ws.id !== dialog.row.workspaceId);
-          const value = target || (targets.length > 0 ? targets[0].id : "");
-          title = tt("sessions.moveTitle");
-          desc = tt("sessions.moveDesc", { title: rowTitle(dialog.row) });
-          confirmLabel = tt("sessions.moveConfirm");
-          toolbar = targets.length === 0
-            ? e("p", { className: "dma-session-warn" }, tt("sessions.noTargets"))
-            : e("div", { className: "dma-session-field" },
-              e("label", { className: "dma-session-field-label", htmlFor: "dma-session-target" }, tt("sessions.targetWorkspace")),
-              e("select", {
-                id: "dma-session-target",
-                className: "dma-session-select",
-                value,
-                onChange: (ev) => setTarget(ev.target.value)
-              }, targets.map((ws) => e("option", { key: ws.id, value: ws.id }, ws.title || ws.path)))
-            );
+          danger = true;
+          confirmText = tt("sessions.deleteConfirm");
+          // 单条删除只进回收站，可恢复；不再输入 OK，只保留一次轻量确认。
+          body = e("p", { className: "dma-session-dialog-desc" }, tt("sessions.deleteDesc", { title: dialog.row.title || tt("sessions.untitled") }));
+          onConfirm = () => runDelete(dialog.row);
+          canConfirm = busy !== dialog.row.id;
         } else if (dialog.kind === "purge") {
           title = tt("sessions.purgeTitle");
-          desc = tt("sessions.purgeDesc", { title: dialog.entry.title || tt("sessions.untitled") });
-          confirmLabel = tt("sessions.purgeConfirm");
           danger = true;
+          confirmText = tt("sessions.purgeConfirm");
+          // 单条彻底清理沿用轻量确认按钮，不要求输入口令。
+          body = e("p", { className: "dma-session-dialog-desc" }, tt("sessions.purgeDesc", { title: dialog.entry.title || tt("sessions.untitled") }));
+          onConfirm = () => runPurge([dialog.entry.trashId]);
+          canConfirm = busy !== dialog.entry.trashId;
         } else if (dialog.kind === "purgeAll") {
           title = tt("sessions.purgeAllTitle");
-          desc = tt("sessions.purgeAllDesc", { n: trashCount });
-          confirmLabel = tt("sessions.purgeAllConfirm");
           danger = true;
+          confirmText = tt("sessions.purgeAllConfirm");
+          body = e(React.Fragment, null,
+            e("p", { className: "dma-session-dialog-desc" }, tt("sessions.purgeAllDesc", { n: trashEntries.length })),
+            confirmField("sessions.purgeCodePrompt"),
+            e("p", { className: "dma-sessions-note" }, tt("sessions.purgeHint"))
+          );
+          onConfirm = () => runPurgeAll();
+          canConfirm = busy !== "purgeAll" && sessionConfirmMatches(purgeCode);
+        } else if (dialog.kind === "bulkPurge") {
+          title = tt("sessions.bulkPurgeTitle");
+          danger = true;
+          confirmText = tt("sessions.bulkPurgeConfirm");
+          body = e(React.Fragment, null,
+            e("p", { className: "dma-session-dialog-desc" }, tt("sessions.bulkPurgeDesc", { n: dialog.ids.length })),
+            confirmField("sessions.confirmPrompt"),
+            e("p", { className: "dma-sessions-note" }, tt("sessions.purgeHint"))
+          );
+          onConfirm = () => runPurge(dialog.ids);
+          canConfirm = busy !== "trashBulk" && sessionConfirmMatches(purgeCode);
+        } else if (dialog.kind === "bulkDelete") {
+          title = tt("sessions.bulkDeleteTitle");
+          danger = true;
+          confirmText = tt("sessions.bulkDeleteConfirm");
+          body = e(React.Fragment, null,
+            e("p", { className: "dma-session-dialog-desc" }, tt("sessions.bulkDeleteDesc", { n: dialog.ids.length })),
+            confirmField("sessions.confirmPrompt")
+          );
+          onConfirm = () => runBulk("delete", dialog.ids);
+          canConfirm = busy !== "bulk" && sessionConfirmMatches(purgeCode);
+        } else if (dialog.kind === "bulkMove") {
+          title = tt("sessions.bulkMoveTitle");
+          confirmText = tt("sessions.moveConfirm");
+          body = e(React.Fragment, null,
+            e("p", { className: "dma-session-dialog-desc" }, tt("sessions.bulkMoveDesc", { n: dialog.ids.length })),
+            e("div", { className: "dma-session-field" },
+              e("label", { className: "dma-session-field-label", htmlFor: "dma-bulk-target" }, tt("sessions.targetWorkspace")),
+              e("select", {
+                id: "dma-bulk-target",
+                className: "dma-session-select",
+                value: bulkTarget,
+                onChange: (ev) => setBulkTarget(ev.target.value)
+              }, workspaceRows.map((item) => e("option", { value: item.id, key: item.id }, item.title || item.path || item.id)))
+            ),
+            e("p", { className: "dma-sessions-note" }, tt("sessions.moveHint"))
+          );
+          onConfirm = () => runBulk("move", dialog.ids, bulkTarget);
+          canConfirm = bulkTarget !== "" && busy !== "bulk";
         }
-        const confirmDisabled = busy !== "" || (dialog.kind === "move" && workspaces.filter((ws) => ws.id !== dialog.row.workspaceId).length === 0);
-        return e("div", { className: "dma-session-dialog-layer" },
-          e("div", {
-            className: "dma-session-dialog-backdrop",
-            onClick: () => {
-              setDialog(null);
-              setActionError("");
-            }
-          }),
-          e("div", { className: "dma-session-dialog", role: "alertdialog", "aria-modal": "true", "aria-label": title },
+        const needsCode = dialog.kind === "purgeAll" || dialog.kind === "bulkDelete" || dialog.kind === "bulkPurge";
+        const working = busy === "purgeAll" || busy === "bulk" || busy === "trashBulk" ||
+          (dialog.row && busy === dialog.row.id) ||
+          (dialog.entry && busy === dialog.entry.trashId);
+        return e("div", {
+          className: "dma-session-dialog-layer",
+          onMouseDown: (ev) => {
+            if (ev.target === ev.currentTarget) setDialog(null);
+          }
+        },
+          e("div", { className: "dma-session-dialog", role: "dialog", "aria-modal": "true", "aria-label": title },
             e("h4", { className: "dma-session-dialog-title" }, title),
-            e("p", { className: "dma-session-dialog-desc" }, desc),
-            toolbar,
-            e("p", { className: danger ? "dma-session-warn" : "dma-session-okhint" },
-              danger
-                ? tt("sessions.purgeHint")
-                : dialog.kind === "move" ? tt("sessions.moveHint") : tt("sessions.deleteHint")),
-            actionError ? e("p", { className: "dma-stats-error" }, actionError) : null,
+            body,
             e("div", { className: "dma-session-dialog-actions" },
               e("button", {
                 type: "button",
-                className: "dma-btn",
-                disabled: busy !== "",
-                onClick: () => {
-                  setDialog(null);
-                  setActionError("");
-                }
-              }, tt("sessions.cancel")),
+                className: "dma-session-act",
+                onClick: () => setDialog(null)
+              }, tt("confirm.cancel")),
               e("button", {
                 type: "button",
-                className: "dma-btn " + (danger ? "dma-session-danger-solid" : "dma-primary"),
-                disabled: confirmDisabled,
-                onClick: () => {
-                  if (dialog.kind === "move") doMove(dialog.row, target);
-                  else confirmDialog();
-                }
-              }, busy !== "" ? tt("sessions.busy") : confirmLabel)
+                className: "dma-session-act " + (danger ? "dma-session-danger-solid" : "dma-session-act-primary"),
+                disabled: !canConfirm,
+                autoFocus: !needsCode,
+                onClick: () => { if (canConfirm && onConfirm) onConfirm(); }
+              }, working ? tt("sessions.busy") : confirmText)
             )
           )
         );
       }
 
-      return e("div", {
-        className: "dma-overlay dma-sessions-overlay",
-        onMouseDown: (ev) => {
-          if (ev.target === ev.currentTarget) onClose();
-        }
-      },
-        e("div", {
-          className: "dma-panel dma-sessions-panel",
-          role: "dialog",
-          "aria-modal": "true",
-          "aria-label": tt("sessions.title"),
-          ref: panelRef
-        },
-          e("div", { className: "dma-panel-head dma-stats-head" },
-            e("span", { className: "dma-stats-title" }, tt("sessions.title")),
-            e("span", { className: "dma-stats-live" },
-              e("i", { className: "dma-stats-dot" }),
-              loading || stale ? tt("sessions.loading") : tt("sessions.count", { n: rows.length })),
-            e("button", {
-              type: "button",
-              className: "dma-stats-icon",
-              title: tt("sessions.refresh"),
-              "aria-label": tt("sessions.refresh"),
-              disabled: loading || busy !== "",
-              onClick: reload
-            }, e("span", { className: "dma-stats-ico", dangerouslySetInnerHTML: { __html: REFRESH_ICON } })),
-            e("button", {
-              type: "button",
-              className: "dma-stats-icon",
-              title: tt("sessions.close"),
-              "aria-label": tt("sessions.close"),
-              onClick: onClose
-            }, "×")
+      const showTrash = tab === "trash";
+
+      const headPanel = e("div", { className: "dma-sessions-head" },
+        e("div", { className: "dma-sessions-head-text" },
+          e("div", { className: "dma-sessions-summary" },
+            e("span", null, tt("sessions.summarySessions", { n: sessionRows.length })),
+            e("span", { className: "dma-sessions-dot" }, "·"),
+            e("span", null, tt("sessions.summaryTrash", { n: trash.count })),
+            trash.bytes > 0 ? e("span", { className: "dma-sessions-dot" }, "·") : null,
+            trash.bytes > 0 ? e("span", null, sessionSizeText(trash.bytes)) : null
           ),
-          e("div", { className: "dma-panel-body dma-sessions-body" },
-            e("p", { className: "dma-stats-intro" }, tt("sessions.intro")),
-            !available ? e("p", { className: "dma-stats-error" }, tt("sessions.unavailable")) : null,
-            snapshot.status === "error" ? e("p", { className: "dma-stats-error" }, tt("sessions.loadFailed") + "：" + snapshot.error) : null,
-            hint ? e("p", { className: "dma-session-hint" }, hint) : null,
-            e("div", { className: "dma-sessions-tabs", role: "tablist" },
-              e("button", {
-                type: "button",
-                role: "tab",
-                "aria-selected": tab === "list" ? "true" : "false",
-                className: "dma-sessions-tab" + (tab === "list" ? " dma-sessions-tab-active" : ""),
-                onClick: () => setTab("list")
-              }, tt("sessions.tab.list") + " · " + rows.length),
-              e("button", {
-                type: "button",
-                role: "tab",
-                "aria-selected": tab === "trash" ? "true" : "false",
-                className: "dma-sessions-tab" + (tab === "trash" ? " dma-sessions-tab-active" : ""),
-                onClick: () => setTab("trash")
-              }, tt("sessions.tab.trash") + (trashCount > 0 ? " · " + trashCount : ""))
-            ),
-            tab === "list"
-              ? e("div", { className: "dma-sessions-list-wrap" },
-                e("div", { className: "dma-sessions-search" },
-                  e("input", {
-                    type: "search",
-                    className: "dma-sessions-search-input",
-                    value: query,
-                    placeholder: tt("sessions.searchPlaceholder"),
-                    "aria-label": tt("sessions.searchPlaceholder"),
-                    onChange: (ev) => setQuery(ev.target.value)
-                  })
-                ),
-                loading && rows.length === 0
-                  ? e("p", { className: "dma-stats-empty" }, tt("sessions.loading"))
-                  : groups.length === 0
-                    ? e("p", { className: "dma-stats-empty" }, query.trim() !== "" ? tt("sessions.noMatch") : tt("sessions.empty"))
-                    : groups.map(renderGroup)
-              )
-              : e("div", { className: "dma-sessions-list-wrap" },
-                e("p", { className: "dma-sessions-note" }, tt("sessions.trashNote")),
-                loading && trash.length === 0
-                  ? e("p", { className: "dma-stats-empty" }, tt("sessions.loading"))
-                  : trash.length === 0
-                    ? e("p", { className: "dma-stats-empty" }, tt("sessions.emptyTrash"))
-                    : trash.map(renderTrashRow),
-                trash.length > 0
-                  ? e("div", { className: "dma-sessions-foot" },
-                    e("button", {
-                      type: "button",
-                      className: "dma-btn dma-session-danger-outline",
-                      disabled: busy !== "",
-                      onClick: () => {
-                        setActionError("");
-                        setDialog({ kind: "purgeAll" });
-                      }
-                    }, tt("sessions.emptyAll"))
-                  )
-                  : null
-              ),
-            renderDialog()
-          )
-        )
-      );
-    }
-
-    function SessionsTab({ t: tt }) {
-      const [info, setInfo] = React.useState(null);
-      const [failed, setFailed] = React.useState(false);
-      React.useEffect(() => {
-        let cancelled = false;
-        fetchSessions().then((value) => {
-          if (!cancelled) setInfo(value);
-        }).catch(() => {
-          if (!cancelled) setFailed(true);
-        });
-        return () => {
-          cancelled = true;
-        };
-      }, []);
-      const count = info && info.trash && Number.isFinite(info.trash.count) ? info.trash.count : 0;
-      const available = info ? info.available !== false : !failed;
-      return e("div", { className: "dma-settings-panel" },
-        e("p", { className: "dma-cost-note" }, tt("sessions.settingsDesc")),
-        count > 0 ? e("p", { className: "dma-sessions-settings-trash" }, tt("sessions.settingsTrash", { n: count })) : null,
-        !available ? e("p", { className: "dma-stats-error" }, tt("sessions.unavailable")) : null,
+          e("p", { className: "dma-sessions-head-desc" }, tt("sessions.intro"))
+        ),
         e("button", {
           type: "button",
-          className: "dma-setting-primary dma-setting-btn",
-          disabled: !available,
-          onClick: (ev) => openSessionsPanel(ev.currentTarget)
-        }, tt("sessions.settingsOpen")),
-        e("div", { className: "dma-settings-version" }, "v" + VERSION)
+          className: "dma-session-act dma-sessions-refresh",
+          disabled: snapshot.status === "loading",
+          onClick: () => load(false)
+        }, snapshot.status === "loading" ? tt("sessions.loading") : tt("sessions.refresh"))
       );
-    }
 
-    /** 侧边栏底部的「对话管理」入口：宽栏显示图标 + 文字，窄栏与费用入口同形。 */
-    function SessionsEntry({ t: tt, wide }) {
-      const title = tt("sessions.entryTitle");
-      return e("div", { className: "dma-cost-item" },
+      const tabs = e("div", { className: "dma-sessions-tabs", role: "tablist" },
         e("button", {
           type: "button",
-          className: wide ? "dma-sessions-entry" : "dma-cost-rail",
-          title,
-          "aria-label": title,
-          onClick: (ev) => openSessionsPanel(ev.currentTarget)
+          role: "tab",
+          "aria-selected": showTrash ? "false" : "true",
+          className: "dma-sessions-tab" + (showTrash ? "" : " dma-sessions-tab-active"),
+          onClick: () => switchListTab("list")
+        }, tt("sessions.tab.list"), e("span", { className: "dma-sessions-tab-count" }, String(sessionRows.length))),
+        e("button", {
+          type: "button",
+          role: "tab",
+          "aria-selected": showTrash ? "true" : "false",
+          className: "dma-sessions-tab" + (showTrash ? " dma-sessions-tab-active" : ""),
+          onClick: () => switchListTab("trash")
+        }, tt("sessions.tab.trash"), e("span", { className: "dma-sessions-tab-count" }, String(trash.count)))
+      );
+
+      const toolbar = showTrash ? null : e("div", { className: "dma-sessions-toolbar" },
+        e("div", { className: "dma-sessions-search" },
+          e("span", { className: "dma-sessions-search-icon", "aria-hidden": "true" },
+            e("svg", { viewBox: "0 0 24 24", width: 14, height: 14, fill: "none", stroke: "currentColor", strokeWidth: 1.6 },
+              e("circle", { cx: 10.5, cy: 10.5, r: 6 }),
+              e("path", { d: "M15.2 15.2 19 19" })
+            )
+          ),
+          e("input", {
+            type: "search",
+            className: "dma-sessions-search-input",
+            value: query,
+            placeholder: tt("sessions.searchPlaceholder"),
+            "aria-label": tt("sessions.searchPlaceholder"),
+            onChange: (ev) => setQuery(ev.target.value)
+          })
+        ),
+        e("select", {
+          className: "dma-sessions-select",
+          value: workspace,
+          "aria-label": tt("sessions.filterWorkspace"),
+          onChange: (ev) => setWorkspace(ev.target.value)
         },
-          e("span", {
-            className: "dma-sessions-entry-icon",
-            "aria-hidden": "true",
-            dangerouslySetInnerHTML: { __html: SESSIONS_ICON }
-          }),
-          wide ? e("span", { className: "dma-sessions-entry-label" }, tt("sessions.entry")) : null
+          e("option", { value: "all" }, tt("sessions.workspaceAll")),
+          workspaceRows.map((item) => e("option", { value: item.id, key: item.id }, item.title))
+        ),
+        e("select", {
+          className: "dma-sessions-select",
+          value: status,
+          "aria-label": tt("sessions.filterStatus"),
+          onChange: (ev) => setStatus(ev.target.value)
+        },
+          e("option", { value: "all" }, tt("sessions.statusAll")),
+          e("option", { value: "active" }, tt("sessions.statusActive", { n: totals.active })),
+          e("option", { value: "archived" }, tt("sessions.statusArchived", { n: totals.archived }))
+        ),
+        e("select", {
+          className: "dma-sessions-select",
+          value: sort,
+          "aria-label": tt("sessions.sort"),
+          onChange: (ev) => setSort(ev.target.value)
+        },
+          e("option", { value: "updated" }, tt("sessions.sortUpdated")),
+          e("option", { value: "created" }, tt("sessions.sortCreated")),
+          e("option", { value: "title" }, tt("sessions.sortTitle"))
         )
       );
+
+      const trashWorking = busy === "trashBulk" || busy === "purgeAll" ||
+        trashEntries.some((entry) => busy === entry.trashId);
+      // 批量操作条：列表页支持全选 / 清空 + 批量移动、归档、删除；
+      // 回收站支持全选 / 清空 + 批量恢复、批量彻底清理。
+      const bulkBar = showTrash
+        ? (trashEntries.length === 0 ? null : e("div", { className: "dma-sessions-bulk" },
+            e("button", {
+              type: "button",
+              className: "dma-session-act",
+              disabled: trashEntries.length === 0 || trashWorking,
+              onClick: selectAllTrash
+            }, tt("sessions.selectAll")),
+            e("button", {
+              type: "button",
+              className: "dma-session-act",
+              disabled: selectedTrash.length === 0 || trashWorking,
+              onClick: clearTrashSelection
+            }, tt("sessions.clearSelection")),
+            e("span", { className: "dma-sessions-bulk-count" }, tt("sessions.selectedCount", { n: selectedTrash.length })),
+            e("div", { className: "dma-sessions-bulk-actions" },
+              e("button", {
+                type: "button",
+                className: "dma-session-act",
+                disabled: selectedTrash.length === 0 || trashWorking,
+                onClick: () => runTrashRestore(selectedTrash.slice())
+              }, tt("sessions.trashRestoreSelected")),
+              e("button", {
+                type: "button",
+                className: "dma-session-act dma-session-danger",
+                disabled: selectedTrash.length === 0 || trashWorking,
+                onClick: () => {
+                  setPurgeCode("");
+                  setDialog({ kind: "bulkPurge", ids: selectedTrash.slice() });
+                }
+              }, tt("sessions.trashPurgeSelected"))
+            )
+          ))
+        : e("div", { className: "dma-sessions-bulk" },
+        e("button", {
+          type: "button",
+          className: "dma-session-act",
+          disabled: filtered.length === 0 || busy === "bulk",
+          onClick: selectAllFiltered
+        }, tt("sessions.selectAll")),
+        e("button", {
+          type: "button",
+          className: "dma-session-act",
+          disabled: selected.length === 0 || busy === "bulk",
+          onClick: clearSelected
+        }, tt("sessions.clearSelection")),
+        e("span", { className: "dma-sessions-bulk-count" }, tt("sessions.selectedCount", { n: selected.length })),
+        e("div", { className: "dma-sessions-bulk-actions" },
+          e("button", {
+            type: "button",
+            className: "dma-session-act",
+            disabled: selected.length === 0 || busy === "bulk" || workspaceRows.length === 0,
+            onClick: openBulkMove
+          }, tt("sessions.bulkMove")),
+          e("button", {
+            type: "button",
+            className: "dma-session-act",
+            disabled: selected.length === 0 || busy === "bulk",
+            onClick: () => runBulk("archive", selected.slice())
+          }, tt("sessions.bulkArchive")),
+          e("button", {
+            type: "button",
+            className: "dma-session-act dma-session-danger",
+            disabled: selected.length === 0 || busy === "bulk",
+            onClick: () => {
+              setPurgeCode("");
+              setDialog({ kind: "bulkDelete", ids: selected.slice() });
+            }
+          }, tt("sessions.bulkDelete"))
+        )
+      );
+
+      let content = null;
+      if (snapshot.value === null) {
+        content = e("p", { className: "dma-sessions-empty" },
+          snapshot.status === "error" ? tt("sessions.loadFailed") : tt("sessions.loading"));
+      } else if (!available) {
+        content = e("p", { className: "dma-session-hint" }, tt("sessions.unavailable"));
+      } else if (showTrash) {
+        content = e("div", { className: "dma-sessions-body-block" },
+          trashEntries.length === 0
+            ? e("p", { className: "dma-sessions-empty" }, tt("sessions.emptyTrash"))
+            : e("div", { className: "dma-sessions-list" },
+              e("div", { className: "dma-sessions-group" },
+                trashEntries.map(renderTrashRow)
+              )
+            ),
+          e("p", { className: "dma-sessions-note" }, tt("sessions.trashNote")),
+          e("div", { className: "dma-sessions-foot" },
+            e("button", {
+              type: "button",
+              className: "dma-session-act dma-session-danger",
+              disabled: trashEntries.length === 0 || trashWorking,
+              onClick: () => { setPurgeCode(""); setDialog({ kind: "purgeAll" }); }
+            }, tt("sessions.emptyAll"))
+          )
+        );
+      } else if (sessionRows.length === 0) {
+        content = e("p", { className: "dma-sessions-empty" }, tt("sessions.empty"));
+      } else if (filtered.length === 0) {
+        content = e("div", { className: "dma-sessions-body-block" },
+          e("p", { className: "dma-sessions-empty" }, tt("sessions.noMatch")),
+          e("div", { className: "dma-sessions-foot" },
+            e("button", {
+              type: "button",
+              className: "dma-session-act",
+              onClick: () => { setQuery(""); setWorkspace("all"); setStatus("all"); }
+            }, tt("sessions.clearFilters"))
+          )
+        );
+      } else {
+        content = e("div", { className: "dma-sessions-list" },
+          groups.map((group) => e("div", { className: "dma-sessions-group", key: group.id || "none" },
+            e("div", { className: "dma-sessions-group-head" },
+              e("span", { className: "dma-sessions-group-title", title: group.title }, group.title),
+              e("span", { className: "dma-sessions-group-path", title: group.path }, group.path),
+              e("span", { className: "dma-sessions-group-count" }, String(group.rows.length))
+            ),
+            group.rows.map(renderSessionRow)
+          ))
+        );
+      }
+
+      return e("div", { className: "dma-sessions-page" },
+        headPanel,
+        e("div", { className: "dma-sessions-switcher" }, tabs, toolbar),
+        bulkBar,
+        notice
+          ? e("p", { className: "dma-sessions-notice" + (notice.ok ? "" : " dma-sessions-notice-error"), role: "status" }, notice.text)
+          : null,
+        content,
+        snapshot.error && snapshot.value !== null
+          ? e("p", { className: "dma-sessions-note dma-sessions-error" }, tt("sessions.loadFailed") + " · " + sessionFailureText(new Error(snapshot.error)))
+          : null,
+        renderMenu(),
+        renderDialog()
+      );
+    }
+
+    // -------------------------------------------------------------------------
+    // 会话菜单：优先宿主正规扩展点，DOM 增强仅作旧宿主兜底
+    //
+    // 宿主（dsh-client-ui-workspace）用 ctx.contextMenus.register({ target: "session" })
+    // 注册「置顶 / 重命名 / 分叉 / 复制 ID / 归档」。我们注册同 target 的两项即可
+    // 出现在同一个 ⋯ 菜单里，定位、边界翻转、键盘、点外/Esc/滚动收起全部复用宿主实现。
+    // 只有宿主未提供 contextMenus 服务时才退回 DOM 追加（复用宿主菜单 class）。
+    // -------------------------------------------------------------------------
+
+    const SIDEBAR_AUG_BTN = "data-dma-sidebar-aug";
+    const SIDEBAR_AUG_WRAP = "data-dma-sidebar-aug-wrap";
+    const SIDEBAR_AUG_MAX_DEPTH = 300;
+
+    function reactFiberOf(node) {
+      if (!node || typeof node !== "object") return null;
+      for (const key of Object.keys(node)) {
+        if (key.startsWith("__reactFiber") || key.startsWith("__reactInternalInstance")) return node[key];
+      }
+      return null;
+    }
+
+    /** 从菜单节点沿 React fiber 上溯，取会话行对象（宿主把它放在 props.node）。 */
+    function sessionNodeOf(element) {
+      let fiber = reactFiberOf(element);
+      let depth = 0;
+      while (fiber && depth < SIDEBAR_AUG_MAX_DEPTH) {
+        const props = fiber.memoizedProps;
+        if (props && props.node && typeof props.node.id === "string" && props.node.id !== "") {
+          return props.node;
+        }
+        fiber = fiber.return;
+        depth += 1;
+      }
+      return null;
+    }
+
+    /** 关闭宿主原生菜单：宿主监听 document 上的按下事件。 */
+    function closeHostMenu() {
+      try { document.dispatchEvent(new MouseEvent("mousedown", { bubbles: true })); } catch { /* ignore */ }
+      try { document.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true })); } catch { /* ignore */ }
+    }
+
+    const SIDEBAR_ICON_MOVE = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M3.5 7.5h5l2 2h10"/><path d="M3.5 7.5v9a1 1 0 0 0 1 1h13"/><path d="M12 11.5v4"/><path d="m10.2 13.7 1.8 1.8 1.8-1.8"/></svg>';
+    const SIDEBAR_ICON_DELETE = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M4.5 7h15"/><path d="M10 10.5v7"/><path d="M14 10.5v7"/><path d="M6.5 7l.8 12a1 1 0 0 0 1 .95h7.4a1 1 0 0 0 1-.95L17.5 7"/><path d="M9.5 7V4.5h5V7"/></svg>';
+
+    /** 通用小对话框（与设置页共用 .dma-session-dialog 样式）。 */
+    function openSidebarDialog(options) {
+      const layer = document.createElement("div");
+      layer.className = "dma-session-dialog-layer";
+      const dialog = document.createElement("div");
+      dialog.className = "dma-session-dialog";
+      dialog.setAttribute("role", "dialog");
+      dialog.setAttribute("aria-modal", "true");
+      const heading = document.createElement("h4");
+      heading.className = "dma-session-dialog-title";
+      heading.textContent = options.title;
+      const desc = document.createElement("p");
+      desc.className = "dma-session-dialog-desc";
+      desc.textContent = options.desc;
+      const actions = document.createElement("div");
+      actions.className = "dma-session-dialog-actions";
+      const cancel = document.createElement("button");
+      cancel.type = "button";
+      cancel.className = "dma-session-act";
+      cancel.textContent = t("confirm.cancel");
+      const ok = document.createElement("button");
+      ok.type = "button";
+      ok.className = "dma-session-act " + (options.danger ? "dma-session-danger-solid" : "dma-session-act-primary");
+      ok.textContent = options.confirmText;
+      actions.appendChild(cancel);
+      actions.appendChild(ok);
+      dialog.appendChild(heading);
+      dialog.appendChild(desc);
+      if (options.body) dialog.appendChild(options.body);
+      dialog.appendChild(actions);
+      layer.appendChild(dialog);
+      document.body.appendChild(layer);
+
+      const onKey = (ev) => {
+        if (ev.key !== "Escape") return;
+        ev.stopPropagation();
+        close();
+      };
+      const close = () => {
+        layer.remove();
+        document.removeEventListener("keydown", onKey, true);
+      };
+      layer.addEventListener("mousedown", (ev) => {
+        if (ev.target === layer) close();
+      });
+      cancel.addEventListener("click", close);
+      document.addEventListener("keydown", onKey, true);
+      ok.addEventListener("click", () => {
+        if (ok.disabled) return;
+        ok.disabled = true;
+        cancel.disabled = true;
+        const original = ok.textContent;
+        ok.textContent = t("sessions.busy");
+        Promise.resolve()
+          .then(() => options.onConfirm())
+          .then(() => close())
+          .catch((err) => {
+            close();
+            showToast(sessionFailureText(err));
+          })
+          .finally(() => {
+            if (layer.isConnected) {
+              ok.textContent = original;
+              ok.disabled = false;
+              cancel.disabled = false;
+            }
+          });
+      });
+      setTimeout(() => {
+        try {
+          ok.focus();
+        } catch { /* ignore */ }
+      }, 0);
+    }
+
+    async function openSidebarMove(sessionId, title) {
+      const payload = await fetchSessionPayload(true);
+      if (payload.available === false) throw new Error("MOVE_UNAVAILABLE");
+      const workspaces = Array.isArray(payload.workspaces) ? payload.workspaces : [];
+      const rows = Array.isArray(payload.sessions) ? payload.sessions : [];
+      const current = rows.find((row) => row && row.id === sessionId);
+      const targets = workspaces.filter((item) => item.id !== (current ? current.workspaceId || "" : ""));
+      if (payload.canMove !== true || targets.length === 0) throw new Error("MOVE_UNAVAILABLE");
+      const field = document.createElement("div");
+      field.className = "dma-session-field";
+      const label = document.createElement("label");
+      label.className = "dma-session-field-label";
+      label.textContent = t("sessions.targetWorkspace");
+      const select = document.createElement("select");
+      select.className = "dma-session-select";
+      for (const item of targets) {
+        const option = document.createElement("option");
+        option.value = item.id;
+        option.textContent = item.title || item.path || item.id;
+        select.appendChild(option);
+      }
+      field.appendChild(label);
+      field.appendChild(select);
+      openSidebarDialog({
+        title: t("sessions.moveTitle"),
+        desc: t("sessions.moveDesc", { title }),
+        confirmText: t("sessions.moveConfirm"),
+        danger: false,
+        body: field,
+        onConfirm: async () => {
+          const result = await postSessionAction({ action: "move", sessionId, workspaceId: select.value });
+          if (result.ok === false) {
+            const err = new Error(result.error || "MOVE_FAILED");
+            if (result.detail) err.detail = result.detail;
+            throw err;
+          }
+          const target = targets.find((item) => item.id === select.value);
+          let message = t("sessions.doneMove", { workspace: target ? target.title : select.value });
+          if (result.restartRequired === true) message += " " + t("sessions.restartHint");
+          bumpSessionsRevision();
+          showToast(message);
+        }
+      });
+    }
+
+    function openSidebarDelete(sessionId, title) {
+      // 单条删除只进回收站（可恢复），无需输入 OK。
+      openSidebarDialog({
+        title: t("sessions.deleteTitle"),
+        desc: t("sessions.deleteDesc", { title }),
+        confirmText: t("sessions.deleteConfirm"),
+        danger: true,
+        onConfirm: async () => {
+          const result = await postSessionAction({ action: "delete", sessionIds: [sessionId] });
+          const first = Array.isArray(result.results) ? result.results[0] : null;
+          if (first && first.ok === false) throw new Error(first.error || "DELETE_FAILED");
+          markSidebarTrash([sessionId]);
+          bumpSessionsRevision();
+          showToast(t("sessions.doneDelete"));
+        }
+      });
+    }
+
+    /**
+     * 注册宿主会话菜单项（正规扩展点）。
+     * target.value 与宿主内置项一致：{ sessionId, displayTitle }。
+     * 服务未就绪时短暂重试，仍拿不到才退回 DOM 兜底；返回清理函数。
+     */
+    function registerSessionMenuItems(ctx) {
+      const targetOf = (target) => {
+        const sessionId = target && typeof target.sessionId === "string" ? target.sessionId : "";
+        if (sessionId === "") return null;
+        const title = target && typeof target.displayTitle === "string" && target.displayTitle !== ""
+          ? target.displayTitle
+          : t("sessions.untitled");
+        return { sessionId, title };
+      };
+
+      // 二级菜单需要工作区列表：缓存 8s，首次请求约几十毫秒，
+      // 远低于宿主 contextMenus 的 1s 解析预算（超时会弹宿主自己的「操作失败」）。
+      let sideMenuCache = null;
+      let sideMenuFetch = null;
+      const sideMenuPayload = async () => {
+        const now = Date.now();
+        if (sideMenuCache && now - sideMenuCache.at < 8000) return sideMenuCache.payload;
+        if (!sideMenuFetch) {
+          sideMenuFetch = fetchSessionPayload(true)
+            .then((payload) => {
+              sideMenuCache = { at: Date.now(), payload };
+              return payload;
+            })
+            .catch(() => null)
+            .finally(() => {
+              sideMenuFetch = null;
+            });
+        }
+        try {
+          const payload = await sideMenuFetch;
+          if (payload) return payload;
+        } catch {
+          /* ignore */
+        }
+        return sideMenuCache ? sideMenuCache.payload : null;
+      };
+
+      const moveToWorkspace = async (hit, workspace) => {
+        try {
+          const result = await postSessionAction({
+            action: "move",
+            sessionId: hit.sessionId,
+            workspaceId: workspace.id
+          });
+          if (!result || result.ok !== true) throw new Error((result && result.error) || "MOVE_FAILED");
+          sideMenuCache = null;
+          let message = t("sessions.doneMove", { workspace: workspace.title || workspace.path || workspace.id });
+          if (result.restartRequired === true) message += " " + t("sessions.restartHint");
+          showToast(message);
+        } catch (err) {
+          // 必须吞掉：宿主会为 run 的拒绝再弹一次「操作失败」。
+          showToast(sessionFailureText(err));
+        }
+      };
+
+      const inputs = [
+        {
+          id: "dsh-message-actions.move",
+          target: "session",
+          order: 650,
+          observe: () => [],
+          resolve: async (target) => {
+            const hit = targetOf(target);
+            if (!hit) return [];
+            const payload = await sideMenuPayload();
+            const workspaces = payload && Array.isArray(payload.workspaces) ? payload.workspaces : [];
+            if (!payload || payload.available === false || payload.canMove !== true || workspaces.length === 0) {
+              return [{ id: "move", label: t("sessions.actionMove"), icon: { key: MENU_ICON_KEYS.move }, disabled: true }];
+            }
+            const rows = Array.isArray(payload.sessions) ? payload.sessions : [];
+            const row = rows.find((item) => item && item.id === hit.sessionId);
+            const currentId = row && typeof row.workspaceId === "string" ? row.workspaceId : "";
+            const children = workspaces.map((workspace) => {
+              const isCurrent = workspace.id === currentId;
+              return {
+                id: "workspace-" + workspace.id,
+                label: (workspace.title || workspace.path || workspace.id)
+                  + (isCurrent ? " · " + t("sessions.currentWorkspace") : ""),
+                disabled: isCurrent,
+                ...(isCurrent ? {} : { run: () => moveToWorkspace(hit, workspace) })
+              };
+            });
+            return [{ id: "move", label: t("sessions.actionMove"), icon: { key: MENU_ICON_KEYS.move }, children }];
+          }
+        },
+        {
+          id: "dsh-message-actions.delete",
+          target: "session",
+          order: 700,
+          observe: () => [],
+          resolve: (target) => {
+            const hit = targetOf(target);
+            if (!hit) return [];
+            return [{
+              id: "delete",
+              label: t("sessions.actionDelete"),
+              icon: { key: MENU_ICON_KEYS.delete },
+              danger: true,
+              run: () => {
+                openSidebarDelete(hit.sessionId, hit.title);
+              }
+            }];
+          }
+        }
+      ];
+
+      const stops = [];
+      let timer = 0;
+      let fallbackStop = null;
+      let disposed = false;
+
+      const service = () => {
+        try {
+          return typeof ctx.get === "function" ? ctx.get("contextMenus") : null;
+        } catch {
+          return null;
+        }
+      };
+
+      const tryRegister = () => {
+        const menus = service();
+        if (!menus || typeof menus.register !== "function") return false;
+        for (const input of inputs) {
+          try {
+            stops.push(ctx.effect(() => menus.register(input), "dsh-message-actions: " + input.id));
+          } catch {
+            /* 单项注册失败不阻断其余能力 */
+          }
+        }
+        return stops.length > 0;
+      };
+
+      if (!tryRegister()) {
+        // 宿主服务可能晚于本插件就绪：250ms × 6 次后再兜底。
+        let tries = 0;
+        const retry = () => {
+          timer = 0;
+          if (disposed) return;
+          if (tryRegister()) return;
+          tries += 1;
+          if (tries >= 6) {
+            fallbackStop = startSidebarMenuAugment();
+            return;
+          }
+          timer = setTimeout(retry, 250);
+        };
+        timer = setTimeout(retry, 250);
+      }
+
+      return () => {
+        disposed = true;
+        if (timer) clearTimeout(timer);
+        if (fallbackStop) fallbackStop();
+        for (const stop of stops) {
+          try { stop(); } catch { /* ignore */ }
+        }
+      };
+    }
+
+    /** 在宿主菜单里追加「移动对话 / 删除对话」，复用宿主的菜单 class。 */
+    function appendSidebarMenuItems(menuEl, node) {
+      if (menuEl.querySelector("[" + SIDEBAR_AUG_BTN + "]")) return;
+      const proto = menuEl.querySelector('[role="menuitem"]');
+      if (!proto || !proto.parentElement) return;
+      const protoWrap = proto.parentElement;
+      const viewport = menuEl.querySelector('[role="presentation"]') || menuEl.firstElementChild;
+      if (!viewport) return;
+      const title = typeof node.title === "string" && node.title !== "" ? node.title : t("sessions.untitled");
+
+      const make = (label, svg, danger, action) => {
+        const wrap = protoWrap.cloneNode(false);
+        wrap.setAttribute(SIDEBAR_AUG_WRAP, "");
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.setAttribute("role", "menuitem");
+        btn.className = proto.className;
+        btn.setAttribute(SIDEBAR_AUG_BTN, action);
+        if (danger) btn.style.color = "var(--dsw-alias-state-error-primary, #e5484d)";
+        const icon = document.createElement("span");
+        icon.style.cssText = "display:inline-flex;flex:none;width:16px;height:16px;align-items:center;justify-content:center;color:" + (danger ? "var(--dsw-alias-state-error-primary, #e5484d)" : "var(--dsw-alias-label-tertiary, #8a919e)");
+        icon.innerHTML = svg;
+        const text = document.createElement("span");
+        text.style.cssText = "flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap";
+        text.textContent = label;
+        btn.appendChild(icon);
+        btn.appendChild(text);
+        wrap.appendChild(btn);
+        return btn;
+      };
+
+      const moveBtn = make(t("sessions.actionMove"), SIDEBAR_ICON_MOVE, false, "move");
+      const deleteBtn = make(t("sessions.actionDelete"), SIDEBAR_ICON_DELETE, true, "delete");
+      moveBtn.addEventListener("click", (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        closeHostMenu();
+        openSidebarMove(node.id, title).catch((err) => showToast(sessionFailureText(err)));
+      });
+      deleteBtn.addEventListener("click", (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        closeHostMenu();
+        openSidebarDelete(node.id, title);
+      });
+      viewport.appendChild(moveBtn.parentElement);
+      viewport.appendChild(deleteBtn.parentElement);
+      // 菜单在自己测量高度后由宿主定位；追加两行后让它按新高度重新收敛。
+      try { window.dispatchEvent(new Event("resize")); } catch { /* ignore */ }
+    }
+
+    function startSidebarMenuAugment() {
+      if (typeof document === "undefined" || !document.body) return () => {};
+      let scheduled = false;
+      let timer = 0;
+      const run = () => {
+        scheduled = false;
+        let menus;
+        try {
+          menus = document.querySelectorAll('body > [role="menu"]');
+        } catch {
+          return;
+        }
+        for (const menuEl of menus) {
+          let node = null;
+          try { node = sessionNodeOf(menuEl); } catch { node = null; }
+          if (!node) continue;
+          try { appendSidebarMenuItems(menuEl, node); } catch { /* best effort */ }
+        }
+      };
+      const schedule = () => {
+        if (scheduled) return;
+        scheduled = true;
+        timer = setTimeout(run, 40);
+      };
+      const observer = new MutationObserver(schedule);
+      observer.observe(document.body, { childList: true, subtree: true });
+      schedule();
+      return () => {
+        observer.disconnect();
+        if (timer) clearTimeout(timer);
+        document.querySelectorAll("[" + SIDEBAR_AUG_WRAP + "]").forEach((node) => node.remove());
+      };
     }
 
     let settingsTab = "actions";
@@ -3421,8 +4579,8 @@ window.__ModuleLoader__.load({
       return e("div", { className: "dma-settings" },
         e("div", { className: "dma-tabs", role: "tablist" },
           tabButton("actions", "cost.tab.actions"),
-          tabButton("billing", "cost.tab.billing"),
-          tabButton("sessions", "cost.tab.sessions")
+          tabButton("sessions", "cost.tab.sessions"),
+          tabButton("billing", "cost.tab.billing")
         ),
         tab === "actions"
           ? e("div", { className: "dma-settings-panel" },
@@ -3462,9 +4620,9 @@ window.__ModuleLoader__.load({
             // 第一个标签页底部：只读版本号，不抢设置项视觉焦点。
             e("div", { className: "dma-settings-version" }, "v" + VERSION)
           )
-          : tab === "billing"
-            ? e(BillingTab, { t: tt, form, value, save })
-            : e(SessionsTab, { t: tt }),
+          : tab === "sessions"
+            ? e(SessionsPage, { t: tt })
+            : e(BillingTab, { t: tt, form, value, save }),
         error ? e("div", { className: "dma-setting-error" }, error) : null
       );
     }
@@ -3950,69 +5108,97 @@ window.__ModuleLoader__.load({
 .dma-stats-money-value-row .dma-stats-money-mini{flex:none;white-space:nowrap}
 .dma-stats-error{margin:0;font-size:12px;line-height:1.5;color:var(--dsw-alias-state-error-primary,#e5484d)}
 .dma-setting-btn{flex:none;margin-top:2px;align-self:flex-start}
-.dma-sessions-panel{position:relative;width:min(760px,calc(100vw - 40px));max-height:86vh}
-.dma-sessions-body{gap:10px;padding:14px 18px 16px}
-.dma-sessions-tabs{display:inline-flex;gap:4px;align-self:flex-start;padding:3px;border-radius:9px;background:var(--dsw-alias-bg-layer-2,#f2f3f5)}
-.dma-sessions-tab{border:0;border-radius:7px;padding:5px 12px;background:transparent;color:var(--dsw-alias-label-secondary,#5b6472);font-size:12.5px;line-height:1.4;cursor:pointer;white-space:nowrap}
+.dma-sessions-page{display:flex;flex-direction:column;gap:11px;min-width:0}
+.dma-sessions-head{display:flex;align-items:flex-start;gap:10px;min-width:0}
+.dma-sessions-head-text{flex:1 1 auto;min-width:0;display:flex;flex-direction:column;gap:3px}
+.dma-sessions-summary{display:flex;flex-wrap:wrap;align-items:center;gap:5px;font-size:12px;font-weight:600;line-height:1.4;color:var(--dsw-alias-label-primary,#1f2329)}
+.dma-sessions-dot{font-weight:400;color:var(--dsw-alias-label-tertiary,#8a919e)}
+.dma-sessions-head-desc{margin:0;font-size:11px;line-height:1.55;color:var(--dsw-alias-label-tertiary,#8a919e)}
+.dma-sessions-refresh{flex:none}
+.dma-sessions-switcher{display:flex;flex-direction:column;gap:8px;min-width:0}
+.dma-sessions-tabs{display:inline-flex;gap:3px;align-self:flex-start;padding:3px;border-radius:9px;background:var(--dsw-alias-bg-layer-2,#f2f3f5)}
+.dma-sessions-tab{display:inline-flex;align-items:center;gap:6px;border:0;border-radius:7px;padding:5px 11px;background:transparent;color:var(--dsw-alias-label-secondary,#5b6472);font-size:12px;line-height:1.4;cursor:pointer;white-space:nowrap}
 .dma-sessions-tab-active{background:var(--dsw-alias-bg-layer-1,#fff);color:var(--dsw-alias-label-primary,#1f2329);font-weight:600;box-shadow:0 1px 3px rgba(0,0,0,.08)}
 .dma-sessions-tab:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary,#4c8dff);outline-offset:2px}
-.dma-sessions-list-wrap{display:flex;flex-direction:column;gap:12px;min-height:120px;min-width:0}
-.dma-sessions-search-input{box-sizing:border-box;width:100%;height:30px;padding:0 10px;border:.5px solid var(--dsw-alias-border-l3,#c9ced6);border-radius:7px;background:var(--dsw-alias-bg-layer-1,#fff);color:var(--dsw-alias-label-primary,#1f2329);font-size:12.5px;outline:0}
+.dma-sessions-tab-count{min-width:17px;padding:0 5px;border-radius:8px;background:var(--dsw-alias-bg-layer-2,#f2f3f5);font-size:10px;font-weight:500;line-height:15px;text-align:center;color:var(--dsw-alias-label-tertiary,#8a919e)}
+.dma-sessions-tab-active .dma-sessions-tab-count{background:var(--dsw-alias-bg-layer-2,#f2f3f5);color:var(--dsw-alias-label-secondary,#5b6472)}
+.dma-sessions-toolbar{display:flex;flex-wrap:wrap;gap:6px;min-width:0}
+.dma-sessions-bulk{display:flex;flex-wrap:wrap;align-items:center;gap:6px;min-width:0;padding:5px 6px;border:.5px solid var(--dsw-alias-border-l2,rgba(0,0,0,.08));border-radius:8px;background:var(--dsw-alias-bg-layer-2,#f2f3f5)}
+.dma-sessions-bulk-count{font-size:11px;line-height:1.4;color:var(--dsw-alias-label-secondary,#5b6472);white-space:nowrap}
+.dma-sessions-bulk-actions{display:flex;flex-wrap:wrap;gap:4px;margin-left:auto}
+.dma-sessions-search{position:relative;flex:1 1 190px;min-width:120px}
+.dma-sessions-search-icon{position:absolute;left:9px;top:50%;transform:translateY(-50%);display:inline-flex;pointer-events:none;color:var(--dsw-alias-label-tertiary,#8a919e)}
+.dma-sessions-search-input{box-sizing:border-box;width:100%;height:29px;padding:0 9px 0 28px;border:.5px solid var(--dsw-alias-border-l3,#c9ced6);border-radius:7px;background:var(--dsw-alias-bg-layer-1,#fff);color:var(--dsw-alias-label-primary,#1f2329);font-size:12px;outline:0}
 .dma-sessions-search-input::placeholder{color:var(--dsw-alias-label-tertiary,#8a919e)}
 .dma-sessions-search-input:focus{border-color:var(--dsw-alias-state-business-primary,#4c8dff)}
+.dma-sessions-select{box-sizing:border-box;flex:0 1 auto;max-width:170px;height:29px;padding:0 6px;border:.5px solid var(--dsw-alias-border-l3,#c9ced6);border-radius:7px;background:var(--dsw-alias-bg-layer-1,#fff);color:var(--dsw-alias-label-secondary,#5b6472);font-size:11.5px;outline:0;cursor:pointer}
+.dma-sessions-select:focus{border-color:var(--dsw-alias-state-business-primary,#4c8dff)}
+.dma-sessions-body-block{display:flex;flex-direction:column;gap:9px;min-width:0}
+.dma-sessions-list{display:flex;flex-direction:column;gap:10px;min-width:0}
 .dma-sessions-group{display:flex;flex-direction:column;min-width:0;border:.5px solid var(--dsw-alias-border-l2,rgba(0,0,0,.08));border-radius:9px;overflow:hidden;background:var(--dsw-alias-bg-layer-1,#fff)}
-.dma-sessions-group-head{display:flex;align-items:center;gap:8px;min-width:0;padding:7px 10px;background:var(--dsw-alias-bg-layer-2,#f2f3f5)}
-.dma-sessions-group-title{flex:0 1 auto;max-width:46%;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;font-size:12px;font-weight:600;color:var(--dsw-alias-label-primary,#1f2329)}
-.dma-sessions-group-path{flex:1 1 auto;min-width:0;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;font-size:10.5px;color:var(--dsw-alias-label-tertiary,#8a919e)}
-.dma-sessions-group-count{flex:none;min-width:20px;padding:0 6px;border-radius:9px;background:var(--dsw-alias-bg-layer-1,#fff);font-size:10.5px;line-height:16px;text-align:center;color:var(--dsw-alias-label-secondary,#5b6472)}
-.dma-session-row{display:flex;align-items:center;gap:10px;min-width:0;padding:8px 10px;border-top:.5px solid var(--dsw-alias-border-l2,rgba(0,0,0,.08))}
-.dma-session-row-missing{opacity:.72}
-.dma-session-main{flex:1 1 auto;min-width:0;display:flex;flex-direction:column;gap:2px}
-.dma-session-title-line{display:flex;align-items:center;gap:6px;min-width:0}
-.dma-session-title{flex:0 1 auto;min-width:0;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;font-size:13px;font-weight:500;line-height:1.35;color:var(--dsw-alias-label-primary,#1f2329)}
-.dma-session-meta{display:flex;align-items:center;gap:8px;min-width:0;font-size:10.5px;line-height:1.35;color:var(--dsw-alias-label-tertiary,#8a919e)}
-.dma-session-path{flex:1 1 auto;min-width:0;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;opacity:.85}
+.dma-sessions-group-head{display:flex;align-items:center;gap:8px;min-width:0;padding:6px 10px;background:var(--dsw-alias-bg-layer-2,#f2f3f5)}
+.dma-sessions-group-title{flex:0 1 auto;max-width:42%;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;font-size:11.5px;font-weight:600;color:var(--dsw-alias-label-primary,#1f2329)}
+.dma-sessions-group-path{flex:1 1 auto;min-width:0;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;font-size:10px;color:var(--dsw-alias-label-tertiary,#8a919e)}
+.dma-sessions-group-count{flex:none;min-width:18px;padding:0 5px;border-radius:9px;background:var(--dsw-alias-bg-layer-1,#fff);font-size:10px;line-height:15px;text-align:center;color:var(--dsw-alias-label-secondary,#5b6472)}
+.dma-session-row{display:flex;align-items:center;gap:8px;min-width:0;padding:7px 8px 7px 10px;border-top:.5px solid var(--dsw-alias-border-l2,rgba(0,0,0,.08))}
+.dma-session-row:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(0,0,0,.03))}
+.dma-session-row-selected{background:rgba(76,141,255,.08)}
+.dma-session-check{flex:none;display:inline-flex;align-items:center;justify-content:center;width:16px;height:16px;margin:0;cursor:pointer}
+.dma-session-check input{width:13px;height:13px;margin:0;cursor:pointer;accent-color:var(--dsw-alias-state-business-primary,#4c8dff)}
+.dma-session-main{flex:1 1 auto;min-width:0;display:flex;flex-direction:column;gap:3px}
+.dma-session-title-line{display:flex;align-items:center;gap:5px;min-width:0}
+.dma-session-title{flex:0 1 auto;min-width:0;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;font-size:12.5px;font-weight:500;line-height:1.35;color:var(--dsw-alias-label-primary,#1f2329)}
+.dma-session-meta{display:flex;flex-wrap:wrap;align-items:center;gap:6px;min-width:0;font-size:10px;line-height:1.4;color:var(--dsw-alias-label-tertiary,#8a919e)}
+.dma-session-model{flex:none;max-width:132px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;padding:0 5px;border-radius:4px;background:var(--dsw-alias-bg-layer-2,#f2f3f5);color:var(--dsw-alias-label-secondary,#5b6472);font-size:10px;line-height:15px}
+.dma-session-fact{flex:none;white-space:nowrap}
+.dma-session-path{flex:1 1 90px;min-width:0;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;opacity:.85}
 .dma-session-actions{flex:none;display:flex;align-items:center;gap:4px}
-.dma-session-act{height:26px;padding:0 9px;border:.5px solid var(--dsw-alias-border-l3,#c9ced6);border-radius:6px;background:transparent;color:var(--dsw-alias-label-secondary,#5b6472);font-size:11.5px;line-height:1;cursor:pointer;white-space:nowrap}
+.dma-session-more{flex:none;width:24px;height:24px;padding:0;border:0;border-radius:6px;background:transparent;color:var(--dsw-alias-label-tertiary,#8a919e);font-size:15px;line-height:1;cursor:pointer}
+.dma-session-more:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(0,0,0,.06));color:var(--dsw-alias-label-primary,#1f2329)}
+.dma-session-more[aria-expanded="true"]{background:var(--dsw-alias-bg-layer-2,#f2f3f5);color:var(--dsw-alias-label-primary,#1f2329)}
+.dma-session-more:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary,#4c8dff);outline-offset:1px}
+.dma-session-menu{position:fixed;z-index:2147483200;display:flex;flex-direction:column;gap:1px;width:158px;padding:4px;border:.5px solid var(--dsw-alias-border-l2,rgba(0,0,0,.08));border-radius:9px;background:var(--dsw-alias-bg-layer-1,#fff);box-shadow:0 10px 26px rgba(0,0,0,.18)}
+.dma-session-menu-item{display:block;width:100%;padding:7px 9px;border:0;border-radius:6px;background:transparent;color:var(--dsw-alias-label-primary,#1f2329);font-size:12px;line-height:1.3;text-align:left;cursor:pointer}
+.dma-session-menu-item:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover,rgba(0,0,0,.06))}
+.dma-session-menu-item:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary,#4c8dff);outline-offset:-1px}
+.dma-session-menu-item:disabled{opacity:.42;cursor:default}
+.dma-session-menu-danger{color:var(--dsw-alias-state-error-primary,#e5484d)}
+.dma-session-menu-note{margin:3px 6px 4px;font-size:10px;line-height:1.45;color:var(--dsw-alias-label-tertiary,#8a919e)}
+.dma-session-menu-title{margin:2px 6px 4px;font-size:10px;line-height:1.45;color:var(--dsw-alias-label-tertiary,#8a919e)}
+.dma-session-act{height:25px;padding:0 9px;border:.5px solid var(--dsw-alias-border-l3,#c9ced6);border-radius:6px;background:transparent;color:var(--dsw-alias-label-secondary,#5b6472);font-size:11px;line-height:1;cursor:pointer;white-space:nowrap}
 .dma-session-act:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover,rgba(0,0,0,.05));color:var(--dsw-alias-label-primary,#1f2329)}
 .dma-session-act:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary,#4c8dff);outline-offset:2px}
 .dma-session-act:disabled{opacity:.4;cursor:default}
+.dma-session-act-primary{border-color:transparent;background:var(--dsw-alias-state-business-primary,#4c8dff);color:#fff}
+.dma-session-act-primary:hover:not(:disabled){background:var(--dsw-alias-state-business-primary,#4c8dff);color:#fff;filter:brightness(.95)}
 .dma-session-danger{color:var(--dsw-alias-state-error-primary,#e5484d)}
 .dma-session-danger-solid{border-color:transparent;background:var(--dsw-alias-state-error-primary,#e5484d);color:#fff}
-.dma-session-danger-solid:hover:not(:disabled){filter:brightness(.95)}
-.dma-session-danger-outline{height:28px;padding:0 11px;border:.5px solid var(--dsw-alias-state-error-primary,#e5484d);border-radius:7px;background:transparent;color:var(--dsw-alias-state-error-primary,#e5484d);font-size:11.5px;cursor:pointer}
-.dma-session-danger-outline:hover:not(:disabled){background:var(--dsw-alias-state-error-primary,#e5484d);color:#fff}
-.dma-session-danger-outline:disabled{opacity:.45;cursor:default}
-.dma-session-badge{flex:none;padding:0 5px;border-radius:4px;background:var(--dsw-alias-bg-layer-2,#f2f3f5);font-size:10px;line-height:16px;color:var(--dsw-alias-label-tertiary,#8a919e);white-space:nowrap}
+.dma-session-danger-solid:hover:not(:disabled){background:var(--dsw-alias-state-error-primary,#e5484d);color:#fff;filter:brightness(.95)}
+.dma-session-badge{flex:none;padding:0 5px;border-radius:4px;background:var(--dsw-alias-bg-layer-2,#f2f3f5);font-size:9.5px;line-height:15px;color:var(--dsw-alias-label-tertiary,#8a919e);white-space:nowrap}
 .dma-session-badge-live{background:var(--dsw-alias-bg-layer-1,#fff);color:var(--dsw-alias-state-business-primary,#4c8dff);box-shadow:inset 0 0 0 .5px var(--dsw-alias-state-business-primary,#4c8dff)}
 .dma-session-badge-run{background:var(--dsw-alias-bg-layer-1,#fff);color:var(--dsw-alias-state-success-primary,#22a06b);box-shadow:inset 0 0 0 .5px var(--dsw-alias-state-success-primary,#22a06b)}
 .dma-session-badge-warn{background:var(--dsw-alias-bg-layer-1,#fff);color:var(--dsw-alias-state-warning-primary,#c2610b);box-shadow:inset 0 0 0 .5px var(--dsw-alias-state-warning-primary,#c2610b)}
-.dma-session-dialog-layer{position:absolute;inset:0;z-index:3;display:flex;align-items:center;justify-content:center;padding:18px}
-.dma-session-dialog-backdrop{position:absolute;inset:0;background:rgba(0,0,0,.34);border-radius:inherit}
-.dma-session-dialog{position:relative;display:flex;flex-direction:column;gap:9px;width:min(400px,100%);padding:16px;border-radius:11px;background:var(--dsw-alias-bg-layer-1,#fff);box-shadow:0 14px 36px rgba(0,0,0,.22)}
+.dma-session-dialog-layer{position:fixed;inset:0;z-index:2147483210;display:flex;align-items:center;justify-content:center;padding:18px;background:rgba(0,0,0,.34)}
+.dma-session-dialog{display:flex;flex-direction:column;gap:9px;width:min(400px,100%);padding:16px;border-radius:11px;background:var(--dsw-alias-bg-layer-1,#fff);box-shadow:0 14px 36px rgba(0,0,0,.24)}
 .dma-session-dialog-title{margin:0;font-size:14px;font-weight:600;color:var(--dsw-alias-label-primary,#1f2329)}
-.dma-session-dialog-desc{margin:0;font-size:12.5px;line-height:1.6;color:var(--dsw-alias-label-secondary,#5b6472);overflow-wrap:anywhere}
+.dma-session-dialog-desc{margin:0;font-size:12px;line-height:1.6;color:var(--dsw-alias-label-secondary,#5b6472);overflow-wrap:anywhere}
 .dma-session-dialog-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:2px}
-.dma-session-warn{margin:0;font-size:11px;line-height:1.5;color:var(--dsw-alias-state-error-primary,#e5484d)}
-.dma-session-okhint{margin:0;font-size:11px;line-height:1.5;color:var(--dsw-alias-label-tertiary,#8a919e)}
 .dma-session-field{display:flex;flex-direction:column;gap:4px;min-width:0}
 .dma-session-field-label{font-size:11px;color:var(--dsw-alias-label-tertiary,#8a919e)}
-.dma-session-select{box-sizing:border-box;width:100%;height:30px;padding:0 8px;border:.5px solid var(--dsw-alias-border-l3,#c9ced6);border-radius:7px;background:var(--dsw-alias-bg-layer-2,#f2f3f5);color:var(--dsw-alias-label-primary,#1f2329);font-size:12.5px}
-.dma-sessions-note{margin:0;font-size:11px;line-height:1.6;color:var(--dsw-alias-label-tertiary,#8a919e)}
-.dma-sessions-foot{display:flex;justify-content:flex-end;margin-top:2px;padding-top:10px;border-top:.5px solid var(--dsw-alias-border-l2,rgba(0,0,0,.08))}
-.dma-sessions-settings-trash{margin:6px 0 0;font-size:12px;color:var(--dsw-alias-label-secondary,#5b6472)}
-.dma-sessions-entry{display:flex;align-items:center;gap:7px;width:100%;min-width:0;height:30px;padding:0 8px;border:0;border-radius:7px;background:transparent;color:var(--dsw-alias-label-secondary,#5b6472);font-size:12.5px;line-height:1.3;cursor:pointer;text-align:left}
-.dma-sessions-entry:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(0,0,0,.05));color:var(--dsw-alias-label-primary,#1f2329)}
-.dma-sessions-entry:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary,#4c8dff);outline-offset:2px}
-.dma-sessions-entry-icon{flex:none;display:inline-flex;width:16px;height:16px}
-.dma-sessions-entry-icon svg{display:block;width:16px;height:16px}
-.dma-sessions-entry-label{overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
-.dma-session-hint{margin:0;padding:6px 9px;border-radius:7px;background:var(--dsw-alias-bg-layer-2,#f2f3f5);font-size:11.5px;line-height:1.55;color:var(--dsw-alias-label-secondary,#5b6472)}
+.dma-session-select{box-sizing:border-box;width:100%;height:29px;padding:0 8px;border:.5px solid var(--dsw-alias-border-l3,#c9ced6);border-radius:7px;background:var(--dsw-alias-bg-layer-2,#f2f3f5);color:var(--dsw-alias-label-primary,#1f2329);font-size:12px}
+.dma-sessions-input{box-sizing:border-box;width:100%;height:29px;padding:0 9px;border:.5px solid var(--dsw-alias-border-l3,#c9ced6);border-radius:7px;background:var(--dsw-alias-bg-layer-2,#f2f3f5);color:var(--dsw-alias-label-primary,#1f2329);font-size:12px;letter-spacing:.4px;outline:0}
+.dma-sessions-input:focus{border-color:var(--dsw-alias-state-business-primary,#4c8dff)}
+.dma-sessions-note{margin:0;font-size:10.5px;line-height:1.6;color:var(--dsw-alias-label-tertiary,#8a919e)}
+.dma-sessions-error{color:var(--dsw-alias-state-error-primary,#e5484d)}
+.dma-sessions-foot{display:flex;justify-content:flex-end;margin-top:1px;padding-top:9px;border-top:.5px solid var(--dsw-alias-border-l2,rgba(0,0,0,.08))}
+.dma-sessions-empty{margin:0;padding:18px 10px;border:.5px dashed var(--dsw-alias-border-l3,#c9ced6);border-radius:9px;text-align:center;font-size:11.5px;line-height:1.5;color:var(--dsw-alias-label-tertiary,#8a919e)}
+.dma-session-hint{margin:0;padding:7px 9px;border-radius:7px;background:var(--dsw-alias-bg-layer-2,#f2f3f5);font-size:11px;line-height:1.55;color:var(--dsw-alias-label-secondary,#5b6472)}
+.dma-sessions-notice{margin:0;padding:6px 9px;border-radius:7px;background:rgba(34,160,107,.12);font-size:11px;line-height:1.5;color:var(--dsw-alias-state-success-primary,#22a06b)}
+.dma-sessions-notice-error{background:rgba(229,72,77,.12);color:var(--dsw-alias-state-error-primary,#e5484d)}
 @media (max-width:560px){
-.dma-sessions-panel{width:calc(100vw - 20px);max-height:92vh}
-.dma-sessions-body{padding:12px}
-.dma-session-row{flex-wrap:wrap}
-.dma-session-actions{width:100%;justify-content:flex-end}
+.dma-sessions-toolbar{gap:5px}
+.dma-sessions-search{flex-basis:100%}
+.dma-sessions-select{flex:1 1 auto;max-width:none}
 .dma-sessions-group-path{display:none}
 }
 @keyframes dma-spin{to{transform:rotate(360deg)}}
@@ -4251,27 +5437,25 @@ window.__ModuleLoader__.load({
         }, CostCard)
       );
 
-      // 侧边栏底部对话管理入口（与费用卡片同一区域、同一套视觉）
-      ctx.slots.inject("sidebar.footer.action", () =>
-        ctx.slots.register({
-          name: "sidebar.footer.action",
-          id: "dsh-message-actions-sessions",
-          order: 21,
-          locale: NS
-        }, SessionsEntry)
-      );
-
       // 费用状态轮询（5s；usageStats 关闭 / 页面隐藏时暂停）
       startCostPolling(settingsForm);
 
       // DOM 观察：问行按钮注入 + 导航刻度隐藏/压缩
       const stopDom = startDomObserver(ctx);
       const stopRail = startRailObserver();
+      // 宿主会话 ⋯ 菜单：注册「移动会话 / 删除会话」（正规 contextMenus 扩展点）
+      const stopSessionMenus = registerSessionMenuItems(ctx);
+      // 菜单项图标走宿主 contextMenu.icon 槽，与内置项同尺寸同风格。
+      registerContextMenuIcons(ctx);
       const stopLive = watchLiveUpdates(ctx, settingsForm);
+      // 回收站行的侧边栏隐藏 / 当场恢复（样式级，不改宿主数据）。
+      const stopHiddenRows = startSidebarTrashShim();
       ctx.effect(() => () => {
         stopDom();
         stopRail();
+        stopSessionMenus();
         stopLive();
+        stopHiddenRows();
         stopCostPolling();
         if (typeof document !== "undefined") {
           document.querySelectorAll("[data-dma-actions]").forEach((node) => disposeActionsRow(node));
