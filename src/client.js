@@ -154,12 +154,10 @@ window.__ModuleLoader__.load({
     // 宿主会话菜单项图标：通过 contextMenu.icon 槽注册，key 与菜单项的 icon.key 对应。
     // 宿主内置菜单项也走同一槽位，尺寸/风格保持一致。
     const MENU_ICON_KEYS = {
-      move: "dsh-message-actions.move",
       delete: "dsh-message-actions.delete"
     };
 
     const MENU_ICON_COMPONENTS = {
-      [MENU_ICON_KEYS.move]: "IconFolderOpenRegular",
       [MENU_ICON_KEYS.delete]: "IconTrashOutlineRegular"
     };
 
@@ -2996,8 +2994,8 @@ window.__ModuleLoader__.load({
       return base + "（" + parts.join(" · ") + "）";
     }
 
-    async function fetchSessionPayload(lean) {
-      const res = await getJson(SESSIONS_ROUTE + (lean === true ? "?lean=1" : ""));
+    async function fetchSessionPayload() {
+      const res = await getJson(SESSIONS_ROUTE);
       const data = res.data;
       if (res.status !== 200 || !data || data.ok !== true) {
         const code = data && data.error && data.error.code ? data.error.code : "HTTP_" + res.status;
@@ -3018,9 +3016,10 @@ window.__ModuleLoader__.load({
 
     /**
      * 设置页里的「会话管理」：直接展示列表与回收站，不再弹浮层。
-     * 逐条操作收在右侧「⋯」菜单里；勾选后可批量删除 / 移动 / 归档。
+     * 逐条操作收在右侧「⋯」菜单里；勾选后可批量删除 / 归档。
      */
-    function SessionsPage({ t: tt }) {
+    function SessionsPage({ t: tt, canDelete = true }) {
+      const deleteEnabled = canDelete !== false;
       const [snapshot, setSnapshot] = React.useState({ status: "loading", value: null, error: "" });
       const [busy, setBusy] = React.useState("");
       const [tab, setTab] = React.useState("list");
@@ -3034,7 +3033,6 @@ window.__ModuleLoader__.load({
       const [notice, setNotice] = React.useState(null);
       const [selected, setSelected] = React.useState([]);
       const [selectedTrash, setSelectedTrash] = React.useState([]);
-      const [bulkTarget, setBulkTarget] = React.useState("");
       const alive = React.useRef(true);
       const loadSeq = React.useRef(0);
       const menuRef = React.useRef(null);
@@ -3243,6 +3241,7 @@ window.__ModuleLoader__.load({
       }
 
       function startDelete(row) {
+        if (!deleteEnabled) return;
         setMenu(null);
         // 只拒绝「正在生成」：仅被宿主打开（live）的会话可以删除。
         if (row.running === true) {
@@ -3251,16 +3250,6 @@ window.__ModuleLoader__.load({
         }
         setDialog({ kind: "delete", row });
         setPurgeCode("");
-      }
-
-      function startMove(row) {
-        // 二级菜单：直接列出目标工作区，不再弹对话框。
-        // 只拒绝「正在生成」；仅在 UI 中打开（live）的会话允许移动。
-        if (row.running === true) {
-          setNotice({ ok: false, text: tt("sessions.runningHint") });
-          return;
-        }
-        setMenu((prev) => (prev && prev.row && prev.row.id === row.id ? { ...prev, view: "move" } : prev));
       }
 
       // —— 多选与批量操作 ——
@@ -3292,18 +3281,11 @@ window.__ModuleLoader__.load({
         setMenu(null);
       }
 
-      function openBulkMove() {
-        if (selected.length === 0) return;
-        const first = workspaceRows[0];
-        setBulkTarget(first ? first.id : "");
-        setDialog({ kind: "bulkMove", ids: selected.slice() });
-      }
-
       /**
        * 批量操作：逐条结果由宿主返回；成功项立即生效，失败项保留选中便于重试。
        * 汇总提示形如「成功 3 个，失败 1 个 · <标题>：<原因>」。
        */
-      async function runBulk(action, ids, targetWorkspace) {
+      async function runBulk(action, ids) {
         if (!ids || ids.length === 0) return;
         if (!writeLock.current.begin()) return;
         try {
@@ -3315,13 +3297,10 @@ window.__ModuleLoader__.load({
         try {
           let response;
           if (action === "delete") {
-            response = await postSessionAction({ action: "delete", sessionIds: ids, confirm: SESSIONS_CONFIRM_CODE });
-            results = Array.isArray(response.results) ? response.results : [];
-          } else if (action === "archive") {
-            response = await postSessionAction({ action: "archive", sessionIds: ids });
+            response = await postSessionAction({ action: "delete", sessionIds: ids });
             results = Array.isArray(response.results) ? response.results : [];
           } else {
-            response = await postSessionAction({ action: "moveBatch", sessionIds: ids, workspaceId: targetWorkspace });
+            response = await postSessionAction({ action: "archive", sessionIds: ids });
             results = Array.isArray(response.results) ? response.results : [];
           }
         } catch (err) {
@@ -3394,7 +3373,8 @@ window.__ModuleLoader__.load({
       }
 
       async function runDelete(row) {
-        // 单条删除只进回收站（可恢复），不再要求输入 OK；批量删除才需要口令。
+        // 删除到回收站是可恢复操作，单条与批量都直接执行，不需要输入口令。
+        if (!deleteEnabled) return;
         if (!writeLock.current.begin()) return;
         try {
         setBusy(row.id);
@@ -3418,36 +3398,6 @@ window.__ModuleLoader__.load({
           markSidebarTrash([row.id]);
           bumpSessionsRevision();
         }
-        await load(true);
-        } finally {
-          writeLock.current.end();
-        }
-      }
-
-      async function runMove(row, target) {
-        if (!writeLock.current.begin()) return;
-        try {
-        setBusy(row.id);
-        let message = "";
-        let ok = false;
-        try {
-          const result = await postSessionAction({ action: "move", sessionId: row.id, workspaceId: target });
-          if (result.ok === false) {
-            const err = new Error(result.error || "MOVE_FAILED");
-            if (result.detail) err.detail = result.detail;
-            throw err;
-          }
-          const name = workspaceRows.find((item) => item.id === target);
-          ok = true;
-          message = tt("sessions.doneMove", { workspace: name ? name.title : target });
-          if (result.restartRequired === true) message += " " + tt("sessions.restartHint");
-        } catch (err) {
-          message = sessionFailureText(err);
-        }
-        setBusy("");
-        setDialog(null);
-        setNotice({ ok, text: message });
-        if (ok) bumpSessionsRevision();
         await load(true);
         } finally {
           writeLock.current.end();
@@ -3520,6 +3470,7 @@ window.__ModuleLoader__.load({
        * 彻底清理：单条只需确认按钮；批量（多条或清空回收站）需要输入 OK。
        */
       async function runPurge(trashIds) {
+        if (!deleteEnabled) return;
         if (!trashIds || trashIds.length === 0) return;
         const bulk = trashIds.length > 1;
         if (bulk && !sessionConfirmMatches(purgeCode)) {
@@ -3579,6 +3530,7 @@ window.__ModuleLoader__.load({
       }
 
       async function runPurgeAll() {
+        if (!deleteEnabled) return;
         if (!sessionConfirmMatches(purgeCode)) {
           setNotice({ ok: false, text: tt("sessions.purgeCodeWrong") });
           return;
@@ -3667,7 +3619,7 @@ window.__ModuleLoader__.load({
             ),
             e("div", { className: "dma-session-meta" }, meta)
           ),
-          multiSelect ? null : e("button", {
+          multiSelect || !deleteEnabled ? null : e("button", {
             type: "button",
             className: "dma-session-more",
             "aria-label": tt("sessions.more"),
@@ -3716,7 +3668,7 @@ window.__ModuleLoader__.load({
               disabled: working || entry.missing === true,
               onClick: () => runRestore(entry)
             }, tt("sessions.restore")),
-            e("button", {
+            deleteEnabled ? e("button", {
               type: "button",
               className: "dma-session-act dma-session-danger",
               disabled: working,
@@ -3724,46 +3676,18 @@ window.__ModuleLoader__.load({
                 setPurgeCode("");
                 setDialog({ kind: "purge", entry });
               }
-            }, tt("sessions.purge"))
+            }, tt("sessions.purge")) : null
           )
         );
       }
 
       function renderMenu() {
-        // 多选模式下隐藏单项「⋯」菜单，避免与批量操作误触。
-        if (!menu || !menu.row || multiSelect) return null;
+        // 多选模式下隐藏单项「⋯」菜单，避免与批量操作误触；
+        // 「删除会话」开关关闭后菜单里没有任何条目，同样不渲染。
+        if (!menu || !menu.row || multiSelect || !deleteEnabled) return null;
         const row = menu.row;
         const position = { top: menu.top + "px", left: menu.left + "px" };
-        // 二级菜单：直接列出目标工作区（当前工作区置灰并标注）。
-        if (menu.view === "move") {
-          const targets = workspaceRows;
-          return e("div", {
-            className: "dma-session-menu",
-            ref: menuRef,
-            role: "menu",
-            style: position
-          },
-            e("p", { className: "dma-session-menu-title" }, tt("sessions.moveTo")),
-            targets.length === 0
-              ? e("p", { className: "dma-session-menu-note" }, tt("sessions.noTargets"))
-              : targets.map((item) => {
-                const isCurrent = item.id === (row.workspaceId || "");
-                return e("button", {
-                  key: item.id,
-                  type: "button",
-                  role: "menuitem",
-                  className: "dma-session-menu-item",
-                  disabled: isCurrent || busy === row.id,
-                  onClick: () => {
-                    setMenu(null);
-                    runMove(row, item.id);
-                  }
-                }, (item.title || item.path || item.id) + (isCurrent ? " · " + tt("sessions.currentWorkspace") : ""));
-              })
-          );
-        }
-        // 移动只拒绝「正在生成」；删除同理。
-        const moveDisabled = row.running === true;
+        // 只拒绝「正在生成」。
         const deleteDisabled = row.running === true;
         return e("div", {
           className: "dma-session-menu",
@@ -3774,18 +3698,11 @@ window.__ModuleLoader__.load({
           e("button", {
             type: "button",
             role: "menuitem",
-            className: "dma-session-menu-item",
-            disabled: moveDisabled,
-            onClick: () => startMove(row)
-          }, tt("sessions.actionMove")),
-          e("button", {
-            type: "button",
-            role: "menuitem",
             className: "dma-session-menu-item dma-session-menu-danger",
             disabled: deleteDisabled,
             onClick: () => startDelete(row)
           }, tt("sessions.actionDelete")),
-          moveDisabled ? e("p", { className: "dma-session-menu-note" }, tt("sessions.runningHint")) : null
+          deleteDisabled ? e("p", { className: "dma-session-menu-note" }, tt("sessions.runningHint")) : null
         );
       }
 
@@ -3872,32 +3789,12 @@ window.__ModuleLoader__.load({
           title = tt("sessions.bulkDeleteTitle");
           danger = true;
           confirmText = tt("sessions.bulkDeleteConfirm");
-          body = e(React.Fragment, null,
-            e("p", { className: "dma-session-dialog-desc" }, tt("sessions.bulkDeleteDesc", { n: dialog.ids.length })),
-            confirmField("sessions.confirmPrompt")
-          );
+          // 批量删除到回收站同样可恢复，直接执行，不需要输入口令。
+          body = e("p", { className: "dma-session-dialog-desc" }, tt("sessions.bulkDeleteDesc", { n: dialog.ids.length }));
           onConfirm = () => runBulk("delete", dialog.ids);
-          canConfirm = busy !== "bulk" && sessionConfirmMatches(purgeCode);
-        } else if (dialog.kind === "bulkMove") {
-          title = tt("sessions.bulkMoveTitle");
-          confirmText = tt("sessions.moveConfirm");
-          body = e(React.Fragment, null,
-            e("p", { className: "dma-session-dialog-desc" }, tt("sessions.bulkMoveDesc", { n: dialog.ids.length })),
-            e("div", { className: "dma-session-field" },
-              e("label", { className: "dma-session-field-label", htmlFor: "dma-bulk-target" }, tt("sessions.targetWorkspace")),
-              e("select", {
-                id: "dma-bulk-target",
-                className: "dma-session-select",
-                value: bulkTarget,
-                onChange: (ev) => setBulkTarget(ev.target.value)
-              }, workspaceRows.map((item) => e("option", { value: item.id, key: item.id }, item.title || item.path || item.id)))
-            ),
-            e("p", { className: "dma-sessions-note" }, tt("sessions.moveHint"))
-          );
-          onConfirm = () => runBulk("move", dialog.ids, bulkTarget);
-          canConfirm = bulkTarget !== "" && busy !== "bulk";
+          canConfirm = busy !== "bulk";
         }
-        const needsCode = dialog.kind === "purgeAll" || dialog.kind === "bulkDelete" || dialog.kind === "bulkPurge";
+        const needsCode = dialog.kind === "purgeAll" || dialog.kind === "bulkPurge";
         const working = busy === "purgeAll" || busy === "bulk" || busy === "trashBulk" ||
           (dialog.row && busy === dialog.row.id) ||
           (dialog.entry && busy === dialog.entry.trashId);
@@ -4016,7 +3913,7 @@ window.__ModuleLoader__.load({
 
       const trashWorking = busy === "trashBulk" || busy === "purgeAll" ||
         trashEntries.some((entry) => busy === entry.trashId);
-      // 批量操作条：列表页支持全选 / 清空 + 批量移动、归档、删除；
+      // 批量操作条：列表页支持全选 / 清空 + 批量归档、删除到回收站；
       // 回收站支持全选 / 清空 + 批量恢复、批量彻底清理。
       const bulkBar = showTrash
         ? (trashEntries.length === 0 ? null : e("div", { className: "dma-sessions-bulk" },
@@ -4040,7 +3937,7 @@ window.__ModuleLoader__.load({
                 disabled: selectedTrash.length === 0 || trashWorking,
                 onClick: () => runTrashRestore(selectedTrash.slice())
               }, tt("sessions.trashRestoreSelected")),
-              e("button", {
+              deleteEnabled ? e("button", {
                 type: "button",
                 className: "dma-session-act dma-session-danger",
                 disabled: selectedTrash.length === 0 || trashWorking,
@@ -4048,7 +3945,7 @@ window.__ModuleLoader__.load({
                   setPurgeCode("");
                   setDialog({ kind: "bulkPurge", ids: selectedTrash.slice() });
                 }
-              }, tt("sessions.trashPurgeSelected"))
+              }, tt("sessions.trashPurgeSelected")) : null
             )
           ))
         : e("div", { className: "dma-sessions-bulk" },
@@ -4069,16 +3966,10 @@ window.__ModuleLoader__.load({
           e("button", {
             type: "button",
             className: "dma-session-act",
-            disabled: selected.length === 0 || busy === "bulk" || workspaceRows.length === 0,
-            onClick: openBulkMove
-          }, tt("sessions.bulkMove")),
-          e("button", {
-            type: "button",
-            className: "dma-session-act",
             disabled: selected.length === 0 || busy === "bulk",
             onClick: () => runBulk("archive", selected.slice())
           }, tt("sessions.bulkArchive")),
-          e("button", {
+          deleteEnabled ? e("button", {
             type: "button",
             className: "dma-session-act dma-session-danger",
             disabled: selected.length === 0 || busy === "bulk",
@@ -4086,7 +3977,7 @@ window.__ModuleLoader__.load({
               setPurgeCode("");
               setDialog({ kind: "bulkDelete", ids: selected.slice() });
             }
-          }, tt("sessions.bulkDelete"))
+          }, tt("sessions.bulkDelete")) : null
         )
       );
 
@@ -4106,14 +3997,14 @@ window.__ModuleLoader__.load({
               )
             ),
           e("p", { className: "dma-sessions-note" }, tt("sessions.trashNote")),
-          e("div", { className: "dma-sessions-foot" },
+          deleteEnabled ? e("div", { className: "dma-sessions-foot" },
             e("button", {
               type: "button",
               className: "dma-session-act dma-session-danger",
               disabled: trashEntries.length === 0 || trashWorking,
               onClick: () => { setPurgeCode(""); setDialog({ kind: "purgeAll" }); }
             }, tt("sessions.emptyAll"))
-          )
+          ) : null
         );
       } else if (sessionRows.length === 0) {
         content = e("p", { className: "dma-sessions-empty" }, tt("sessions.empty"));
@@ -4170,6 +4061,21 @@ window.__ModuleLoader__.load({
     const SIDEBAR_AUG_WRAP = "data-dma-sidebar-aug-wrap";
     const SIDEBAR_AUG_MAX_DEPTH = 300;
 
+    // 设置页表单快照：侧栏菜单需要知道「删除会话」开关是否开启。
+    let settingsFormRef = null;
+
+    function sessionsDeleteEnabled() {
+      try {
+        const snap = settingsFormRef && typeof settingsFormRef.getSnapshot === "function"
+          ? settingsFormRef.getSnapshot()
+          : null;
+        const value = snap && snap.status === "ready" && typeof snap.value === "object" ? snap.value : null;
+        return !(value && value.sessionsDelete === false);
+      } catch {
+        return true;
+      }
+    }
+
     function reactFiberOf(node) {
       if (!node || typeof node !== "object") return null;
       for (const key of Object.keys(node)) {
@@ -4199,7 +4105,6 @@ window.__ModuleLoader__.load({
       try { document.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true })); } catch { /* ignore */ }
     }
 
-    const SIDEBAR_ICON_MOVE = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M3.5 7.5h5l2 2h10"/><path d="M3.5 7.5v9a1 1 0 0 0 1 1h13"/><path d="M12 11.5v4"/><path d="m10.2 13.7 1.8 1.8 1.8-1.8"/></svg>';
     const SIDEBAR_ICON_DELETE = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M4.5 7h15"/><path d="M10 10.5v7"/><path d="M14 10.5v7"/><path d="M6.5 7l.8 12a1 1 0 0 0 1 .95h7.4a1 1 0 0 0 1-.95L17.5 7"/><path d="M9.5 7V4.5h5V7"/></svg>';
 
     /** 通用小对话框（与设置页共用 .dma-session-dialog 样式）。 */
@@ -4277,52 +4182,8 @@ window.__ModuleLoader__.load({
       }, 0);
     }
 
-    async function openSidebarMove(sessionId, title) {
-      const payload = await fetchSessionPayload(true);
-      if (payload.available === false) throw new Error("MOVE_UNAVAILABLE");
-      const workspaces = Array.isArray(payload.workspaces) ? payload.workspaces : [];
-      const rows = Array.isArray(payload.sessions) ? payload.sessions : [];
-      const current = rows.find((row) => row && row.id === sessionId);
-      const targets = workspaces.filter((item) => item.id !== (current ? current.workspaceId || "" : ""));
-      if (payload.canMove !== true || targets.length === 0) throw new Error("MOVE_UNAVAILABLE");
-      const field = document.createElement("div");
-      field.className = "dma-session-field";
-      const label = document.createElement("label");
-      label.className = "dma-session-field-label";
-      label.textContent = t("sessions.targetWorkspace");
-      const select = document.createElement("select");
-      select.className = "dma-session-select";
-      for (const item of targets) {
-        const option = document.createElement("option");
-        option.value = item.id;
-        option.textContent = item.title || item.path || item.id;
-        select.appendChild(option);
-      }
-      field.appendChild(label);
-      field.appendChild(select);
-      openSidebarDialog({
-        title: t("sessions.moveTitle"),
-        desc: t("sessions.moveDesc", { title }),
-        confirmText: t("sessions.moveConfirm"),
-        danger: false,
-        body: field,
-        onConfirm: async () => {
-          const result = await postSessionAction({ action: "move", sessionId, workspaceId: select.value });
-          if (result.ok === false) {
-            const err = new Error(result.error || "MOVE_FAILED");
-            if (result.detail) err.detail = result.detail;
-            throw err;
-          }
-          const target = targets.find((item) => item.id === select.value);
-          let message = t("sessions.doneMove", { workspace: target ? target.title : select.value });
-          if (result.restartRequired === true) message += " " + t("sessions.restartHint");
-          bumpSessionsRevision();
-          showToast(message);
-        }
-      });
-    }
-
     function openSidebarDelete(sessionId, title) {
+      if (!sessionsDeleteEnabled()) return;
       // 单条删除只进回收站（可恢复），无需输入 OK。
       openSidebarDialog({
         title: t("sessions.deleteTitle"),
@@ -4355,81 +4216,7 @@ window.__ModuleLoader__.load({
         return { sessionId, title };
       };
 
-      // 二级菜单需要工作区列表：缓存 8s，首次请求约几十毫秒，
-      // 远低于宿主 contextMenus 的 1s 解析预算（超时会弹宿主自己的「操作失败」）。
-      let sideMenuCache = null;
-      let sideMenuFetch = null;
-      const sideMenuPayload = async () => {
-        const now = Date.now();
-        if (sideMenuCache && now - sideMenuCache.at < 8000) return sideMenuCache.payload;
-        if (!sideMenuFetch) {
-          sideMenuFetch = fetchSessionPayload(true)
-            .then((payload) => {
-              sideMenuCache = { at: Date.now(), payload };
-              return payload;
-            })
-            .catch(() => null)
-            .finally(() => {
-              sideMenuFetch = null;
-            });
-        }
-        try {
-          const payload = await sideMenuFetch;
-          if (payload) return payload;
-        } catch {
-          /* ignore */
-        }
-        return sideMenuCache ? sideMenuCache.payload : null;
-      };
-
-      const moveToWorkspace = async (hit, workspace) => {
-        try {
-          const result = await postSessionAction({
-            action: "move",
-            sessionId: hit.sessionId,
-            workspaceId: workspace.id
-          });
-          if (!result || result.ok !== true) throw new Error((result && result.error) || "MOVE_FAILED");
-          sideMenuCache = null;
-          let message = t("sessions.doneMove", { workspace: workspace.title || workspace.path || workspace.id });
-          if (result.restartRequired === true) message += " " + t("sessions.restartHint");
-          showToast(message);
-        } catch (err) {
-          // 必须吞掉：宿主会为 run 的拒绝再弹一次「操作失败」。
-          showToast(sessionFailureText(err));
-        }
-      };
-
       const inputs = [
-        {
-          id: "dsh-message-actions.move",
-          target: "session",
-          order: 650,
-          observe: () => [],
-          resolve: async (target) => {
-            const hit = targetOf(target);
-            if (!hit) return [];
-            const payload = await sideMenuPayload();
-            const workspaces = payload && Array.isArray(payload.workspaces) ? payload.workspaces : [];
-            if (!payload || payload.available === false || payload.canMove !== true || workspaces.length === 0) {
-              return [{ id: "move", label: t("sessions.actionMove"), icon: { key: MENU_ICON_KEYS.move }, disabled: true }];
-            }
-            const rows = Array.isArray(payload.sessions) ? payload.sessions : [];
-            const row = rows.find((item) => item && item.id === hit.sessionId);
-            const currentId = row && typeof row.workspaceId === "string" ? row.workspaceId : "";
-            const children = workspaces.map((workspace) => {
-              const isCurrent = workspace.id === currentId;
-              return {
-                id: "workspace-" + workspace.id,
-                label: (workspace.title || workspace.path || workspace.id)
-                  + (isCurrent ? " · " + t("sessions.currentWorkspace") : ""),
-                disabled: isCurrent,
-                ...(isCurrent ? {} : { run: () => moveToWorkspace(hit, workspace) })
-              };
-            });
-            return [{ id: "move", label: t("sessions.actionMove"), icon: { key: MENU_ICON_KEYS.move }, children }];
-          }
-        },
         {
           id: "dsh-message-actions.delete",
           target: "session",
@@ -4437,7 +4224,7 @@ window.__ModuleLoader__.load({
           observe: () => [],
           resolve: (target) => {
             const hit = targetOf(target);
-            if (!hit) return [];
+            if (!hit || !sessionsDeleteEnabled()) return [];
             return [{
               id: "delete",
               label: t("sessions.actionDelete"),
@@ -4504,8 +4291,9 @@ window.__ModuleLoader__.load({
       };
     }
 
-    /** 在宿主菜单里追加「移动对话 / 删除对话」，复用宿主的菜单 class。 */
+    /** 在宿主菜单里追加「删除会话」（仅当设置里的删除开关开启）。 */
     function appendSidebarMenuItems(menuEl, node) {
+      if (!sessionsDeleteEnabled()) return;
       if (menuEl.querySelector("[" + SIDEBAR_AUG_BTN + "]")) return;
       const proto = menuEl.querySelector('[role="menuitem"]');
       if (!proto || !proto.parentElement) return;
@@ -4535,23 +4323,15 @@ window.__ModuleLoader__.load({
         return btn;
       };
 
-      const moveBtn = make(t("sessions.actionMove"), SIDEBAR_ICON_MOVE, false, "move");
       const deleteBtn = make(t("sessions.actionDelete"), SIDEBAR_ICON_DELETE, true, "delete");
-      moveBtn.addEventListener("click", (ev) => {
-        ev.preventDefault();
-        ev.stopPropagation();
-        closeHostMenu();
-        openSidebarMove(node.id, title).catch((err) => showToast(sessionFailureText(err)));
-      });
       deleteBtn.addEventListener("click", (ev) => {
         ev.preventDefault();
         ev.stopPropagation();
         closeHostMenu();
         openSidebarDelete(node.id, title);
       });
-      viewport.appendChild(moveBtn.parentElement);
       viewport.appendChild(deleteBtn.parentElement);
-      // 菜单在自己测量高度后由宿主定位；追加两行后让它按新高度重新收敛。
+      // 菜单在自己测量高度后由宿主定位；追加一行后让它按新高度重新收敛。
       try { window.dispatchEvent(new Event("resize")); } catch { /* ignore */ }
     }
 
@@ -4684,7 +4464,17 @@ window.__ModuleLoader__.load({
             e("div", { className: "dma-settings-version" }, "v" + VERSION)
           )
           : tab === "sessions"
-            ? e(SessionsPage, { t: tt })
+            ? e("div", null,
+              e(SettingRow, {
+                key: "sessionsDelete",
+                t: tt,
+                labelKey: "sessions.settingsDelete",
+                descKey: "sessions.settingsDeleteDesc",
+                on: value ? value.sessionsDelete !== false : true,
+                onToggle: () => save("sessionsDelete", !(value ? value.sessionsDelete !== false : true))
+              }),
+              e(SessionsPage, { t: tt, canDelete: value ? value.sessionsDelete !== false : true })
+            )
             : e(BillingTab, { t: tt, form, value, save }),
         error ? e("div", { className: "dma-setting-error" }, error) : null
       );
@@ -5227,7 +5017,6 @@ window.__ModuleLoader__.load({
 .dma-session-menu-item:disabled{opacity:.42;cursor:default}
 .dma-session-menu-danger{color:var(--dsw-alias-state-error-primary,#e5484d)}
 .dma-session-menu-note{margin:3px 6px 4px;font-size:10px;line-height:1.45;color:var(--dsw-alias-label-tertiary,#8a919e)}
-.dma-session-menu-title{margin:2px 6px 4px;font-size:10px;line-height:1.45;color:var(--dsw-alias-label-tertiary,#8a919e)}
 .dma-session-act{height:25px;padding:0 9px;border:.5px solid var(--dsw-alias-border-l3,#c9ced6);border-radius:6px;background:transparent;color:var(--dsw-alias-label-secondary,#5b6472);font-size:11px;line-height:1;cursor:pointer;white-space:nowrap}
 .dma-session-act:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover,rgba(0,0,0,.05));color:var(--dsw-alias-label-primary,#1f2329)}
 .dma-session-act:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary,#4c8dff);outline-offset:2px}
@@ -5248,7 +5037,6 @@ window.__ModuleLoader__.load({
 .dma-session-dialog-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:2px}
 .dma-session-field{display:flex;flex-direction:column;gap:4px;min-width:0}
 .dma-session-field-label{font-size:11px;color:var(--dsw-alias-label-tertiary,#8a919e)}
-.dma-session-select{box-sizing:border-box;width:100%;height:29px;padding:0 8px;border:.5px solid var(--dsw-alias-border-l3,#c9ced6);border-radius:7px;background:var(--dsw-alias-bg-layer-2,#f2f3f5);color:var(--dsw-alias-label-primary,#1f2329);font-size:12px}
 .dma-sessions-input{box-sizing:border-box;width:100%;height:29px;padding:0 9px;border:.5px solid var(--dsw-alias-border-l3,#c9ced6);border-radius:7px;background:var(--dsw-alias-bg-layer-2,#f2f3f5);color:var(--dsw-alias-label-primary,#1f2329);font-size:12px;letter-spacing:.4px;outline:0}
 .dma-sessions-input:focus{border-color:var(--dsw-alias-state-business-primary,#4c8dff)}
 .dma-sessions-note{margin:0;font-size:10.5px;line-height:1.6;color:var(--dsw-alias-label-tertiary,#8a919e)}
@@ -5448,6 +5236,7 @@ body[data-ds-dark-theme] .dma-session-dialog{box-shadow:0 16px 40px rgba(0,0,0,.
       ctx.effect(() => ctx.locale.register(NS, { zh, en }), "dsh-message-actions: locale");
 
       const settingsForm = ctx.configForms.get("dsh-message-actions");
+      settingsFormRef = settingsForm;
 
       // 答行统计
       ctx.slots.inject("conversation.chat.assistant-actions", () =>
@@ -5528,7 +5317,7 @@ body[data-ds-dark-theme] .dma-session-dialog{box-shadow:0 16px 40px rgba(0,0,0,.
       // DOM 观察：问行按钮注入 + 导航刻度隐藏/压缩
       const stopDom = startDomObserver(ctx);
       const stopRail = startRailObserver();
-      // 宿主会话 ⋯ 菜单：注册「移动会话 / 删除会话」（正规 contextMenus 扩展点）
+      // 宿主会话 ⋯ 菜单：注册「删除会话」（正规 contextMenus 扩展点）
       const stopSessionMenus = registerSessionMenuItems(ctx);
       // 菜单项图标走宿主 contextMenu.icon 槽，与内置项同尺寸同风格。
       registerContextMenuIcons(ctx);

@@ -1,11 +1,12 @@
-// 会话删除 / 移动的真实文件系统端到端测试。
+// 会话管理（删除到回收站 / 恢复 / 彻底清理 / 归档）的真实文件系统端到端测试。
 //
 // 用临时目录复制/合成会话目录，磁盘操作全部真实（mkdir、rename、rm），
 // 仅把宿主的六个服务做成最小桩：sessionPersistence / sessionQuery /
 // workspaceRegistry / agents / sessions / logger。
 //
 // 覆盖：冷会话删除、UI 中打开（live，写句柄被宿主占用）的会话删除、
-// 运行中拒删、恢复、彻底清理、跨工作区移动、同工作区移动、目标不存在回滚。
+// 运行中拒删、恢复、彻底清理、批量删除/恢复/清理、归档与取消归档、
+// 「删除会话」开关（路由层 403）以及批量删除无 OK / 批量清理需 OK。
 
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -13,8 +14,25 @@ import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import zlib from "node:zlib";
+import { Readable } from "node:stream";
+import { register } from "node:module";
 import { createSessionManager } from "../src/session-manager.mjs";
 import sessionsPure from "../src/sessions.cjs";
+
+// 测试机没有安装宿主的 @deepseek-ai/schemastery，只用一个最小桩让
+// src/index.mjs 可被真实导入（真实路由需要它做 Config 声明）。
+const SCHEMASTERY_STUB = "function field(){const api={default:()=>api,min:()=>api,max:()=>api,volatile:()=>api};return api;}"
+  + "export default {object:(value)=>value,boolean:field,number:field,string:field};";
+const SCHEMASTERY_URL = "data:text/javascript," + encodeURIComponent(SCHEMASTERY_STUB);
+register("data:text/javascript," + encodeURIComponent(
+  "export async function resolve(specifier, context, next) {"
+    + "if (specifier === '@deepseek-ai/schemastery') {"
+    + "return { url: " + JSON.stringify(SCHEMASTERY_URL) + ", shortCircuit: true };"
+    + "}"
+    + "return next(specifier, context);"
+    + "}"
+));
+const { makeSessionsHandler } = await import("../src/index.mjs");
 
 const { sessionDirOf } = sessionsPure;
 const LOG_NAME = "session.v4.jsonl.zstd";
@@ -94,6 +112,41 @@ function encodeLog(text, compressed) {
 
 function tempRoot() {
   return path.join(os.tmpdir(), `dma-e2e-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`);
+}
+
+/**
+ * 直接用真实会话路由处理器驱动一次请求（真实 req 流 + 假 res 收集响应）。
+ * 用于验证「删除会话」开关的宿主侧拦截，而不是只测管理器内部函数。
+ */
+function callRoute(handler, method, payload) {
+  return new Promise((resolve) => {
+    const raw = payload === undefined ? "" : JSON.stringify(payload);
+    const req = Readable.from(raw === "" ? [] : [Buffer.from(raw, "utf8")]);
+    req.method = method;
+    req.url = "/dsh-message-actions/sessions";
+    req.headers = {
+      host: "127.0.0.1:1",
+      origin: "http://127.0.0.1:1",
+      "sec-fetch-site": "same-origin",
+      "content-type": "application/json",
+      "content-length": String(Buffer.byteLength(raw))
+    };
+    const res = {
+      headersSent: false,
+      writeHead(status, headers) {
+        this.status = status;
+        this.headers = headers;
+        this.headersSent = true;
+      },
+      end(body) {
+        resolve({ status: this.status, body: JSON.parse(body), headers: this.headers });
+      },
+      destroy() {
+        resolve({ status: 0, body: null, headers: null });
+      }
+    };
+    handler(req, res).catch((err) => resolve({ status: -1, body: { error: String(err) }, headers: null }));
+  });
 }
 
 /**
@@ -326,6 +379,9 @@ function makeHost(root, workspaces) {
       if (!record) throw Object.assign(new Error(`unknown session ${id}`), { name: "WorkspaceUnknownSessionError" });
       if (running.has(id)) throw Object.assign(new Error(`session ${id} is active`), { name: "WorkspaceActiveSessionError" });
       if (!this.archivedSessionIds.includes(id)) this.archivedSessionIds.push(id);
+    },
+    async unarchiveSession(id) {
+      this.archivedSessionIds = this.archivedSessionIds.filter((value) => value !== id);
     }
   };
 
@@ -492,346 +548,87 @@ async function main() {
   check("墓碑让残留 live 行继续被过滤", !(await manager.payload({ lean: true })).sessions.some((row) => row.id === cold.id));
   check("hidden 快照返回墓碑 id", (await manager.payload({ hiddenOnly: true })).purgedIds.includes(cold.id));
 
-  // 6. 跨工作区移动
-  const movable = seedSession(host, {
-    id: "session-44444444-4444-4444-8444-444444444444",
+  // 6. 归档与取消归档：真实工作区索引 + 列表标记
+  const archId = "session-34343434-3434-4434-8434-343434343434";
+  seedSession(host, {
+    id: archId,
     cwd: wsDirA,
-    title: "move me",
-    events: [{ type: "user/message", data: { content: "hello" } }, { type: "assistant/message", data: { content: "hi" } }]
-  });
-  const fromDir = sessionDirOf(sessionsRoot, wsDirA, movable.id);
-  const toDir = sessionDirOf(sessionsRoot, wsDirB, movable.id);
-  const moved = await manager.move(movable.id, "ws-b");
-  note(`跨工作区移动 source=${fromDir} target=${moved.targetDir} events=${moved.eventCount} header.cwd=${moved.headerCwd} index=${moved.indexWritten}`);
-  check("跨工作区移动成功", moved.ok === true && moved.moved === true);
-  check("移动结果带源/目标目录与事件数",
-    moved.sourceDir === fromDir && moved.targetDir === toDir && moved.eventCount === 2);
-  check("源目录已清理", !fs.existsSync(fromDir));
-  const movedHeader = JSON.parse(fs.readFileSync(path.join(toDir, LOG_NAME), "utf8").split("\n")[0]);
-  check("目标 header.cwd 已更新", movedHeader.cwd === wsDirB);
-  const movedEvents = fs.readFileSync(path.join(toDir, LOG_NAME), "utf8").split("\n").slice(1).filter(Boolean);
-  check("事件数量完整保留", movedEvents.length === 2);
-  check("工作区索引已挂载", host.registry.get("ws-b").sessionIds.includes(movable.id));
-
-  // 7. 同工作区移动：幂等成功
-  const same = await manager.move(movable.id, "ws-b");
-  check("同工作区移动幂等", same.ok === true && same.already === true);
-
-  // 8. 目标工作区不存在：失败但原目录不动
-  const rollbackHeader = seedSession(host, {
-    id: "session-55555555-5555-4555-8555-555555555555",
-    cwd: wsDirA,
-    title: "rollback",
-    events: []
-  });
-  const rollbackDir = sessionDirOf(sessionsRoot, wsDirA, rollbackHeader.id);
-  const failed = await manager.move(rollbackHeader.id, "ws-missing");
-  check("目标工作区不存在时报错", failed.ok === false && failed.error === "WORKSPACE_NOT_FOUND");
-  check("失败回滚后目录仍在", fs.existsSync(rollbackDir));
-
-  // 8b. 工作区已注册但目录被删：明确返回 WORKSPACE_MISSING
-  const missing = await manager.move(rollbackHeader.id, "ws-deleted");
-  note(`目标目录缺失 => code=${missing.error} src=${missing.detail ? missing.detail.sourceDir : ""}`);
-  check("目标目录缺失时返回 WORKSPACE_MISSING", missing.ok === false && missing.error === "WORKSPACE_MISSING");
-  check("目标目录缺失后源目录未动", fs.existsSync(rollbackDir));
-
-  // 8c. 目标已有同名会话：返回 TARGET_EXISTS，源目录保持原样
-  const clashHeader = seedSession(host, {
-    id: "session-abababab-abab-4bab-8bab-abababababab",
-    cwd: wsDirA,
-    title: "clash",
-    events: []
-  });
-  const clashFromDir = sessionDirOf(sessionsRoot, wsDirA, clashHeader.id);
-  const clashToDir = sessionDirOf(sessionsRoot, wsDirB, clashHeader.id);
-  fs.mkdirSync(clashToDir, { recursive: true });
-  fs.writeFileSync(path.join(clashToDir, LOG_NAME), JSON.stringify(Object.assign({}, clashHeader, { cwd: wsDirB })) + "\n", "utf8");
-  const clash = await manager.move(clashHeader.id, "ws-b");
-  note(`目标同名 => code=${clash.error} stage=${clash.detail ? clash.detail.stage : ""} source=${clash.detail ? clash.detail.sourceDir : ""}`);
-  check("目标已有同名会话时返回 TARGET_EXISTS", clash.ok === false && clash.error === "TARGET_EXISTS");
-  check("同名冲突后源目录未动", fs.existsSync(clashFromDir));
-  fs.rmSync(clashToDir, { recursive: true, force: true });
-  fs.rmSync(clashFromDir, { recursive: true, force: true });
-
-  // 9. 打开中（live）的会话移动：写句柄被占用仍应放行
-  const liveMoveHeader = seedSession(host, {
-    id: "session-66666666-6666-4666-8666-666666666666",
-    cwd: wsDirA,
-    title: "live move",
-    events: [
-      { type: "user/message", data: { content: "a" } },
-      { type: "assistant/message", data: { content: "b" } },
-      { type: "user/message", data: { content: "c" } }
-    ]
-  });
-  host.live.add(liveMoveHeader.id);
-  host.owned.add(liveMoveHeader.id);
-  const liveFromDir = sessionDirOf(sessionsRoot, wsDirA, liveMoveHeader.id);
-  const liveToDir = sessionDirOf(sessionsRoot, wsDirB, liveMoveHeader.id);
-  let createErr = null;
-  try {
-    await host.persistence.create(Object.assign({}, liveMoveHeader, { cwd: wsDirB }));
-  } catch (err) {
-    createErr = err;
-  }
-  check("桩复现真实根因：live 会话 create 抛 SessionAlreadyExistsError",
-    createErr !== null && createErr.name === "SessionAlreadyExistsError");
-  const liveMove = await manager.move(liveMoveHeader.id, "ws-b");
-  note(`live 移动 source=${liveFromDir} target=${liveMove.targetDir} events=${liveMove.eventCount} header.cwd=${liveMove.headerCwd} index=${liveMove.indexWritten} restart=${liveMove.restartRequired}`);
-  check("live 会话移动放行（写句柄被占用）", liveMove.ok === true && liveMove.moved === true);
-  check("live 移动失败路径不再回滚（无 MOVE_FAILED）", liveMove.error === undefined);
-  check("live 移动后旧目录已清理", !fs.existsSync(liveFromDir));
-  const liveMovedHeader = JSON.parse(fs.readFileSync(path.join(liveToDir, LOG_NAME), "utf8").split("\n")[0]);
-  check("live 移动后 header.cwd 更新", liveMovedHeader.cwd === wsDirB);
-  const liveMovedEvents = fs.readFileSync(path.join(liveToDir, LOG_NAME), "utf8").split("\n").slice(1).filter(Boolean);
-  check("live 移动后事件数量完整", liveMovedEvents.length === 3);
-  check("live 移动后新工作区索引已挂载", host.registry.get("ws-b").sessionIds.includes(liveMoveHeader.id));
-  host.live.delete(liveMoveHeader.id);
-  host.owned.delete(liveMoveHeader.id);
-
-  // 9b. 跨盘符边界：会话日志始终在 sessionsRoot 下，只是 header.cwd 指向另一盘符的工作区。
-  const currentDrive = path.parse(sessionsRoot).root;
-  const otherDrive = ["D:\\", "E:\\", "F:\\", "G:\\"]
-    .find((drive) => fs.existsSync(drive) && drive.toLowerCase() !== currentDrive.toLowerCase());
-  if (otherDrive) {
-    const crossRoot = path.join(otherDrive, `dma-e2e-cross-${Date.now().toString(36)}`);
-    fs.mkdirSync(crossRoot, { recursive: true });
-    const crossEntity = {
-      id: "ws-cross",
-      title: "Cross drive",
-      path: crossRoot,
-      sessionIds: [],
-      attachSession(id) {
-        if (!this.sessionIds.includes(id)) this.sessionIds.push(id);
-      },
-      detachSession(id) {
-        this.sessionIds = this.sessionIds.filter((value) => value !== id);
-      }
-    };
-    host.registry.list().push(crossEntity);
-    const crossHeader = seedSession(host, {
-      id: "session-acacacac-acac-4cac-8cac-acacacacacac",
-      cwd: wsDirA,
-      title: "cross drive",
-      events: [{ type: "user/message", data: { content: "cross" } }]
-    });
-    const cross = await manager.move(crossHeader.id, "ws-cross");
-    const crossTarget = sessionDirOf(sessionsRoot, crossRoot, crossHeader.id);
-    note(`跨盘符 ${currentDrive} -> ${otherDrive} target=${cross.targetDir} events=${cross.eventCount} header.cwd=${cross.headerCwd} index=${cross.indexWritten}`);
-    check("跨盘符移动成功", cross.ok === true && cross.moved === true);
-    check("跨盘符 header.cwd 指向另一盘符工作区",
-      cross.headerCwd === crossRoot
-        && JSON.parse(fs.readFileSync(path.join(crossTarget, LOG_NAME), "utf8").split("\n")[0]).cwd === crossRoot);
-    check("跨盘符会话日志仍在 sessionsRoot 下", fs.existsSync(crossTarget) && fs.existsSync(path.join(crossRoot, "..")));
-    check("跨盘符索引已挂载", crossEntity.sessionIds.includes(crossHeader.id));
-    fs.rmSync(crossRoot, { recursive: true, force: true });
-  } else {
-    note("跨盘符边界 N/A：当前环境没有第二个可用盘符");
-  }
-
-  // 10. 运行中会话移动被拒绝，原目录不动
-  host.running.add(rollbackHeader.id);
-  const runningMove = await manager.move(rollbackHeader.id, "ws-b");
-  check("运行中会话移动被拒绝", runningMove.ok === false && runningMove.error === "SESSION_RUNNING");
-  check("被拒绝后目录仍在", fs.existsSync(rollbackDir));
-  host.running.delete(rollbackHeader.id);
-
-  // 11. 批量移动：混入一条 running，单独失败、其余成功、已成功项不回滚
-  const batchA = seedSession(host, {
-    id: "session-77777777-7777-4777-8777-777777777777",
-    cwd: wsDirA,
-    title: "batch a",
+    title: "archive me",
     events: [{ type: "user/message", data: { content: "a" } }]
   });
-  const batchB = seedSession(host, {
-    id: "session-88888888-8888-4888-8888-888888888888",
-    cwd: wsDirA,
-    title: "batch b",
-    events: [{ type: "user/message", data: { content: "b" } }]
-  });
-  const batchRunning = seedSession(host, {
-    id: "session-99999999-9999-4999-8999-999999999999",
-    cwd: wsDirA,
-    title: "batch running",
-    events: []
-  });
-  host.running.add(batchRunning.id);
-  const batchFromA = sessionDirOf(sessionsRoot, wsDirA, batchA.id);
-  const batchFromB = sessionDirOf(sessionsRoot, wsDirA, batchB.id);
-  const batchRunningDir = sessionDirOf(sessionsRoot, wsDirA, batchRunning.id);
-  const batchMoved = await manager.moveMany([batchA.id, batchRunning.id, batchB.id], "ws-b");
-  check("批量移动返回逐条结果", batchMoved.results.length === 3);
-  check("批量移动成功项 a", batchMoved.results[0].ok === true);
-  check("批量移动 running 单独失败",
-    batchMoved.results[1].ok === false && batchMoved.results[1].error === "SESSION_RUNNING");
-  check("批量移动其余项 b 成功", batchMoved.results[2].ok === true);
-  check("批量移动成功项不回滚", !fs.existsSync(batchFromA) && !fs.existsSync(batchFromB));
-  check("批量移动 running 目录未动", fs.existsSync(batchRunningDir));
-  host.running.delete(batchRunning.id);
+  const archDir = sessionDirOf(sessionsRoot, wsDirA, archId);
+  const archived = await manager.archive([archId]);
+  check("归档单条成功", archived.results[0].ok === true);
+  check("归档后工作区索引包含该 id", host.registry.archivedSessionIds.includes(archId));
+  check("归档后列表标记 archived=true",
+    (await manager.payload({ lean: true })).sessions.find((row) => row.id === archId).archived === true);
+  check("归档不移动、不删除日志", fs.existsSync(archDir) && fs.existsSync(path.join(archDir, LOG_NAME)));
+  await manager.unarchive(archId);
+  check("取消归档后工作区索引移除该 id", !host.registry.archivedSessionIds.includes(archId));
+  check("取消归档后列表标记 archived=false",
+    (await manager.payload({ lean: true })).sessions.find((row) => row.id === archId).archived === false);
 
-  // 12. 批量删除进回收站并恢复
-  const trashBatchA = seedSession(host, {
-    id: "session-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
-    cwd: wsDirB,
-    title: "trash a",
-    events: [{ type: "user/message", data: { content: "a" } }]
-  });
-  const trashBatchB = seedSession(host, {
-    id: "session-bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
-    cwd: wsDirB,
-    title: "trash b",
-    events: []
-  });
-  const trashDirA = sessionDirOf(sessionsRoot, wsDirB, trashBatchA.id);
-  const trashDirB = sessionDirOf(sessionsRoot, wsDirB, trashBatchB.id);
-  const trashBatch = await manager.removeToTrash([trashBatchA.id, trashBatchB.id]);
-  check("批量删除两条均成功", trashBatch.every((item) => item.ok === true));
-  check("软回收站：批量删除后日志仍在原位", fs.existsSync(trashDirA) && fs.existsSync(trashDirB));
-  check("批量删除后列表立即不含这两条",
-    !(await manager.payload({ lean: true })).sessions.some((row) => row.id === trashBatchA.id || row.id === trashBatchB.id));
-  const restoredBatch = await manager.restore(trashBatch.map((item) => item.trashId));
-  check("批量恢复两条均成功", restoredBatch.every((item) => item.ok === true));
-  check("批量恢复无需重启", restoredBatch.every((item) => item.restartRequired === false));
-  check("批量恢复后目录与日志仍在", fs.existsSync(trashDirA) && fs.existsSync(trashDirB));
-
-  // 12b. 批量删除混入 running：单独失败，其余成功
-  const trashBatchC = seedSession(host, {
-    id: "session-cccccccc-cccc-4ccc-8ccc-cccccccccccc",
-    cwd: wsDirA,
-    title: "trash c",
-    events: []
-  });
-  const trashDirC = sessionDirOf(sessionsRoot, wsDirA, trashBatchC.id);
-  host.running.add(batchRunning.id);
-  const mixedDelete = await manager.removeToTrash([trashBatchC.id, batchRunning.id]);
-  check("批量删除成功项 c", mixedDelete[0].ok === true);
-  check("批量删除 running 单独失败",
-    mixedDelete[1].ok === false && mixedDelete[1].error === "SESSION_RUNNING");
-  check("批量删除部分成功后源目录仍在（软回收站）", fs.existsSync(trashDirC));
-  host.running.delete(batchRunning.id);
-  await manager.restore([mixedDelete[0].trashId]);
-
-  // 13. 批量归档：running 单独失败，其余成功；列表标记一致
-  const archiveA = seedSession(host, {
-    id: "session-dddddddd-dddd-4ddd-8ddd-dddddddddddd",
-    cwd: wsDirB,
-    title: "archive a",
-    events: []
-  });
-  const archiveB = seedSession(host, {
-    id: "session-eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
-    cwd: wsDirB,
-    title: "archive b",
-    events: []
-  });
-  const archiveRunning = seedSession(host, {
-    id: "session-ffffffff-ffff-4fff-8fff-ffffffffffff",
-    cwd: wsDirB,
-    title: "archive running",
-    events: []
-  });
-  host.running.add(archiveRunning.id);
-  const archived = await manager.archive([archiveA.id, archiveRunning.id, archiveB.id]);
-  check("批量归档返回逐条结果", archived.results.length === 3);
-  check("批量归档成功项 a", archived.results[0].ok === true);
-  check("批量归档 running 单独失败",
-    archived.results[1].ok === false && archived.results[1].error === "SESSION_RUNNING");
-  check("批量归档成功项 b", archived.results[2].ok === true);
-  check("归档索引包含成功项、不含 running",
-    host.registry.archivedSessionIds.includes(archiveA.id)
-      && host.registry.archivedSessionIds.includes(archiveB.id)
-      && !host.registry.archivedSessionIds.includes(archiveRunning.id));
-  const payload = await manager.payload({});
-  const payloadRows = new Map(payload.sessions.map((row) => [row.id, row]));
-  check("列表归档标记与归档结果一致",
-    payloadRows.get(archiveA.id).archived === true
-      && payloadRows.get(archiveB.id).archived === true
-      && payloadRows.get(archiveRunning.id).archived === false);
-  const archiveMissing = await manager.archive(["session-00000000-0000-4000-8000-000000000000"]);
-  check("批量归档不存在的会话返回 TARGET_NOT_FOUND",
-    archiveMissing.results[0].ok === false && archiveMissing.results[0].error === "TARGET_NOT_FOUND");
-  host.running.delete(archiveRunning.id);
-
-  // 15. 真实 zstd 日志：移动后仍是 zstd，首行 cwd 已改写、事件完整
-  const zstdHeader = seedSession(host, {
-    id: "session-15151515-1515-4515-8515-151515151515",
-    cwd: wsDirA,
-    title: "zstd move",
-    events: [
-      { type: "user/message", data: { content: "z1" } },
-      { type: "assistant/message", data: { content: "z2" } },
-      { type: "user/message", data: { content: "z3" } }
-    ],
-    zstd: true
-  });
-  const zstdTargetDir = sessionDirOf(sessionsRoot, wsDirB, zstdHeader.id);
-  const zstdMove = await manager.move(zstdHeader.id, "ws-b");
-  note(`zstd 移动 target=${zstdMove.targetDir} events=${zstdMove.eventCount} compressed=${zstdMove.compressed} header.cwd=${zstdMove.headerCwd}`);
-  check("zstd 日志移动成功", zstdMove.ok === true && zstdMove.compressed === true && zstdMove.eventCount === 3);
-  const zstdBuf = fs.readFileSync(path.join(zstdTargetDir, LOG_NAME));
-  check("zstd 移动后文件仍是 zstd 压缩", isZstd(zstdBuf));
-  const zstdText = decodeLog(zstdBuf);
-  check("zstd 移动后 header.cwd 更新", JSON.parse(zstdText.split("\n")[0]).cwd === wsDirB);
-  check("zstd 移动后事件完整", zstdText.split("\n").slice(1).filter(Boolean).length === 3);
-
-  // 14. 批量删除 3 条（含 live 内存残留）→ 立即不可见 → 批量恢复当场回原工作区 → 批量彻底清理
-  const groupIds = [
+  // 7. 批量删除到回收站（无 OK）→ 列表无「未分组」残留 → 批量恢复当场回原分组
+  const batchIds = [
     "session-12121212-1212-4212-8212-121212121212",
     "session-13131313-1313-4313-8313-131313131313",
     "session-14141414-1414-4414-8414-141414141414"
   ];
-  const groupDirs = new Map();
-  for (const id of groupIds) {
+  const batchDirs = new Map();
+  for (const id of batchIds) {
     seedSession(host, { id, cwd: wsDirA, title: id.slice(-6), events: [{ type: "user/message", data: { content: id } }] });
-    groupDirs.set(id, sessionDirOf(sessionsRoot, wsDirA, id));
+    batchDirs.set(id, sessionDirOf(sessionsRoot, wsDirA, id));
   }
   // 中间一条模拟「UI 中打开」：删除后宿主内存里的 live 记录仍会被 listSessions 返回。
-  host.live.add(groupIds[1]);
+  host.live.add(batchIds[1]);
   const trashBefore = (await manager.payload({})).trash.count;
-  const groupDelete = await manager.removeToTrash(groupIds);
-  check("批量删除三条均成功", groupDelete.every((item) => item.ok === true));
-  check("软回收站保留三条日志", groupIds.every((id) => fs.existsSync(groupDirs.get(id))));
+  const batchDelete = await manager.removeToTrash(batchIds);
+  check("批量删除三条均成功", batchDelete.every((item) => item.ok === true));
+  check("软回收站：三条日志仍在原位", batchIds.every((id) => fs.existsSync(batchDirs.get(id))));
   const afterDelete = await manager.payload({});
   const afterDeleteIds = new Set(afterDelete.sessions.map((row) => row.id));
-  check("删除后列表立即不含这三条", groupIds.every((id) => !afterDeleteIds.has(id)));
+  check("删除后列表立即不含这三条", batchIds.every((id) => !afterDeleteIds.has(id)));
   check("删除后列表无「未分组」残留",
     afterDelete.sessions.every((row) => row.workspaceId !== "" && row.workspaceId !== undefined));
+  check("删除后 hidden 快照包含三条",
+    batchIds.every((id) => (afterDelete.trashedIds || []).includes(id)
+      || afterDelete.trash.entries.some((entry) => entry.id === id)));
   const hiddenAfterDelete = await manager.payload({ hiddenOnly: true });
-  check("删除后 hidden 快照包含三条", groupIds.every((id) => hiddenAfterDelete.trashedIds.includes(id)));
+  check("hidden 快照按 trashedIds 标记", batchIds.every((id) => hiddenAfterDelete.trashedIds.includes(id)));
   const afterRefresh = await manager.payload({});
-  const afterRefreshIds = new Set(afterRefresh.sessions.map((row) => row.id));
-  check("刷新（再次拉取列表）后仍不含这三条", groupIds.every((id) => !afterRefreshIds.has(id)));
+  check("再次拉取列表仍不含这三条",
+    batchIds.every((id) => !new Set(afterRefresh.sessions.map((row) => row.id)).has(id)));
   check("回收站里 3 条都在",
     afterRefresh.trash.count === trashBefore + 3
-      && groupIds.every((id) => afterRefresh.trash.entries.some((entry) => entry.id === id)));
+      && batchIds.every((id) => afterRefresh.trash.entries.some((entry) => entry.id === id)));
   note(`批量删除后 rows=${afterRefresh.sessions.length} trash=${afterRefresh.trash.count} 未分组=${afterRefresh.sessions.filter((row) => row.workspaceId === "").length}`);
-  const restoredGroup = await manager.restore(groupDelete.map((item) => item.trashId));
-  check("批量恢复三条均成功", restoredGroup.every((item) => item.ok === true));
-  check("批量恢复无需重启", restoredGroup.every((item) => item.restartRequired === false));
+  const restoredBatch = await manager.restore(batchDelete.map((item) => item.trashId));
+  check("批量恢复三条均成功", restoredBatch.every((item) => item.ok === true));
+  check("批量恢复无需重启", restoredBatch.every((item) => item.restartRequired === false));
   check("恢复后回收站条目全部移除",
-    groupDelete.every((item) => !fs.existsSync(path.join(trashRoot, item.trashId))));
-  const afterGroupRestore = await manager.payload({});
-  const afterGroupRestoreRows = new Map(afterGroupRestore.sessions.map((row) => [row.id, row]));
-  check("恢复后立即回到原工作区分组（不重启、不重新挂载）",
-    groupIds.every((id) => afterGroupRestoreRows.get(id) && afterGroupRestoreRows.get(id).workspaceId === "ws-a"));
-  check("恢复后回收站回到删除前数量", afterGroupRestore.trash.count === trashBefore);
+    batchDelete.every((item) => !fs.existsSync(path.join(trashRoot, item.trashId))));
+  const afterBatchRestore = await manager.payload({});
+  const restoredRows = new Map(afterBatchRestore.sessions.map((row) => [row.id, row]));
+  check("恢复后立即回到原工作区分组",
+    batchIds.every((id) => restoredRows.get(id) && restoredRows.get(id).workspaceId === "ws-a"));
+  check("恢复后回收站回到删除前数量", afterBatchRestore.trash.count === trashBefore);
 
-  // 14b. 批量彻底清理：不可恢复；日志删除、墓碑隐藏 live 残留
-  const regrab = await manager.removeToTrash(groupIds);
+  // 8. 批量彻底清理（不可恢复）：日志删除、墓碑过滤 live 残留、列表无未分组
+  const regrab = await manager.removeToTrash(batchIds);
   const groupPurge = await manager.purge(regrab.map((item) => item.trashId), false);
   check("批量彻底清理三条均成功", groupPurge.results.every((item) => item.ok === true));
-  check("批量彻底清理删除全部日志", groupIds.every((id) => !fs.existsSync(groupDirs.get(id))));
+  check("批量彻底清理删除全部日志", batchIds.every((id) => !fs.existsSync(batchDirs.get(id))));
   const afterPurge = await manager.payload({});
-  const afterPurgeIds = new Set(afterPurge.sessions.map((row) => row.id));
   check("清理后列表不含三条且无未分组",
-    groupIds.every((id) => !afterPurgeIds.has(id))
+    batchIds.every((id) => !new Set(afterPurge.sessions.map((row) => row.id)).has(id))
       && afterPurge.sessions.every((row) => row.workspaceId !== "" && row.workspaceId !== undefined));
   check("清理后回收站恢复原数量", afterPurge.trash.count === trashBefore);
   const hiddenAfterPurge = await manager.payload({ hiddenOnly: true });
-  check("清理后 hidden 快照按墓碑隐藏", groupIds.every((id) => hiddenAfterPurge.purgedIds.includes(id)));
-  host.live.delete(groupIds[1]);
+  check("清理后 hidden 快照按墓碑隐藏",
+    batchIds.every((id) => hiddenAfterPurge.purgedIds.includes(id)));
+  host.live.delete(batchIds[1]);
 
-  // 14c. 旧版物理回收站条目仍可恢复（向后兼容）
+  // 9. 旧版物理回收站条目仍可恢复（向后兼容）
   const legacyHeader = seedSession(host, {
     id: "session-16161616-1616-4616-8616-161616161616",
     cwd: wsDirA,
@@ -860,126 +657,9 @@ async function main() {
     && fs.existsSync(legacyDir)
     && !fs.existsSync(legacyEntry));
 
-  // 16. 宿主查找路径：移动后用宿主同一条磁盘扫描路径打开、可再次移回、来回两次无脏数据
-  const rtId = "session-17171717-1717-4717-8717-171717171717";
-  const rtEvents = [
-    { type: "user/message", data: { content: "hello" } },
-    { type: "assistant/message", data: { content: "hi" } },
-    { type: "user/message", data: { content: "again" } },
-    { type: "assistant/message", data: { content: "ok" } }
-  ];
-  seedSession(host, { id: rtId, cwd: wsDirA, title: "Greeting", events: rtEvents, zstd: true });
-  const rtDirA = sessionDirOf(sessionsRoot, wsDirA, rtId);
-  const rtDirB = sessionDirOf(sessionsRoot, wsDirB, rtId);
-
-  const rt1 = await manager.move(rtId, "ws-b");
-  check("往返：A→B 移动成功且事件数不变", rt1.ok === true && rt1.eventCount === 4 && rt1.frames === 5);
-  const rtOpenB = host.hostOpen(rtId);
-  check("往返：A→B 后宿主扫描路径能打开并读到事件",
-    !!rtOpenB && rtOpenB.header.cwd === wsDirB && rtOpenB.events.length === 4);
-  check("往返：A→B 后 sessionPaths 指向工作区路径而不是会话目录",
-    pathKey(host.registry.sessionPaths.get(rtId)) === pathKey(wsDirB));
-  check("往返：A→B 后 headers 索引是新的 cwd",
-    host.registry.headers.get(rtId) && host.registry.headers.get(rtId).cwd === wsDirB);
-  check("往返：A→B 后源工作区不再包含、目标工作区包含",
-    !host.registry.get("ws-a").sessionIds.includes(rtId)
-      && host.registry.get("ws-b").sessionIds.includes(rtId));
-  check("往返：移动时用宿主 locate 算出了目标路径",
-    host.locateCalls.some((call) => call.id === rtId && pathKey(call.cwd) === pathKey(wsDirB)));
-  const rtPayloadB = await manager.payload({});
-  check("往返：A→B 后列表在 B 分组且只有一条",
-    rtPayloadB.sessions.filter((row) => row.id === rtId).length === 1
-      && rtPayloadB.sessions.find((row) => row.id === rtId).workspaceId === "ws-b");
-
-  const rt2 = await manager.move(rtId, "ws-a");
-  check("往返：B→A 移回成功且事件数不变", rt2.ok === true && rt2.eventCount === 4);
-  const rtOpenA = host.hostOpen(rtId);
-  check("往返：B→A 后宿主扫描路径仍能打开并读到事件",
-    !!rtOpenA && rtOpenA.header.cwd === wsDirA && rtOpenA.events.length === 4);
-  const rtPayloadA = await manager.payload({});
-  check("往返：B→A 后列表回到 A 分组且 B 分组消失",
-    rtPayloadA.sessions.find((row) => row.id === rtId).workspaceId === "ws-a"
-      && !host.registry.get("ws-b").sessionIds.includes(rtId));
-
-  const rt3 = await manager.move(rtId, "ws-b");
-  const rt4 = await manager.move(rtId, "ws-a");
-  check("往返：再连续来回一次仍成功", rt3.ok === true && rt4.ok === true && rt4.eventCount === 4);
-  const dirsWithId = [];
-  for (const projectDir of fs.readdirSync(sessionsRoot, { withFileTypes: true })) {
-    if (!projectDir.isDirectory()) continue;
-    const candidate = path.join(sessionsRoot, projectDir.name, rtId);
-    if (fs.existsSync(candidate)) dirsWithId.push(candidate);
-  }
-  check("往返：磁盘上只有一份会话目录", dirsWithId.length === 1 && pathKey(dirsWithId[0]) === pathKey(rtDirA));
-  const rtFinal = await manager.payload({});
-  check("往返：列表里没有重复条目",
-    rtFinal.sessions.filter((row) => row.id === rtId).length === 1);
-  check("往返：没有「未分组」错位条目",
-    rtFinal.sessions.filter((row) => row.id === rtId && row.workspaceId === "").length === 0);
-  check("往返：最终仍在 A 分组", rtFinal.sessions.find((row) => row.id === rtId).workspaceId === "ws-a");
-  check("往返：源目录 B 已清理", !fs.existsSync(rtDirB) && fs.existsSync(rtDirA));
-
-  // 17. 目标工作区已有同名会话目录：明确冲突、源端不动
-  const clashId = "session-18181818-1818-4818-8818-181818181818";
-  seedSession(host, { id: clashId, cwd: wsDirA, title: "clash", events: rtEvents, zstd: true });
-  const clashTarget = sessionDirOf(sessionsRoot, wsDirB, clashId);
-  fs.mkdirSync(clashTarget, { recursive: true });
-  fs.writeFileSync(path.join(clashTarget, LOG_NAME), encodeLog(
-    [JSON.stringify({ type: "session", version: 4, id: "session-19191919-1919-4919-8919-191919191919", createdAt: 1000, cwd: wsDirB, isSeeded: false, delegationDepth: 0 })].join("\n") + "\n",
-    true
-  ));
-  const clashMove = await manager.move(clashId, "ws-b");
-  check("同名目录：返回 TARGET_EXISTS 且不回滚源", clashMove.ok === false && clashMove.error === "TARGET_EXISTS"
-    && fs.existsSync(sessionDirOf(sessionsRoot, wsDirA, clashId)));
-  fs.rmSync(clashTarget, { recursive: true, force: true });
-
-  // 18. 列表暂时失败时仍能移回（用宿主 stat 兜底，不再报「目标消息不存在」）
-  const originalList = host.query.listSessions;
-  host.query.listSessions = async () => { throw new Error("temporary list failure"); };
-  const fallbackMove = await manager.move(clashId, "ws-b");
-  host.query.listSessions = originalList;
-  check("列表失败时移动仍成功（stat 兜底）", fallbackMove.ok === true && fallbackMove.eventCount === 4);
-  check("列表失败时移动后宿主扫描路径可打开",
-    host.hostOpen(clashId) && host.hostOpen(clashId).events.length === 4);
-
-  // 19. 旧插件留下的「整段压成一帧」坏日志：移动时把事件行拆成独立帧，事件不丢
-  const salvageId = "session-20202020-2020-4020-8020-202020202020";
-  const salvageDir = sessionDirOf(sessionsRoot, wsDirA, salvageId);
-  fs.mkdirSync(salvageDir, { recursive: true });
-  const salvageText = [JSON.stringify({
-    type: "session", version: 4, id: salvageId, createdAt: 1000, cwd: wsDirA, isSeeded: false, delegationDepth: 0
-  })].concat(rtEvents.map((event) => JSON.stringify(event))).join("\n") + "\n";
-  fs.writeFileSync(path.join(salvageDir, LOG_NAME), zlib.zstdCompressSync(Buffer.from(salvageText, "utf8")));
-  host.headers.set(salvageId, { type: "session", version: 4, id: salvageId, createdAt: 1000, cwd: wsDirA, isSeeded: false, delegationDepth: 0 });
-  const salvageMove = await manager.move(salvageId, "ws-b");
-  note(`坏日志修复 salvaged=${salvageMove.salvaged} frames=${salvageMove.frames} events=${salvageMove.eventCount}`);
-  check("坏日志：移动成功并保留全部事件", salvageMove.ok === true && salvageMove.eventCount === 4);
-  check("坏日志：首帧里的事件被拆成独立帧", salvageMove.salvaged === 4 && salvageMove.frames === 5);
-  const salvageOpen = host.hostOpen(salvageId);
-  check("坏日志：移动后宿主扫描路径可读且事件完整",
-    !!salvageOpen && salvageOpen.header.cwd === wsDirB && salvageOpen.events.length === 4);
-
-  // 20. live 会话移动：live 对象与持久化写状态都必须重定向
-  const liveRtId = "session-21212121-2121-4121-8121-212121212121";
-  seedSession(host, { id: liveRtId, cwd: wsDirA, title: "live roundtrip", events: rtEvents, zstd: true });
-  host.live.add(liveRtId);
-  host.owned.add(liveRtId);
-  const liveBefore = host.liveObjects.get(liveRtId);
-  const liveMoveRt = await manager.move(liveRtId, "ws-b");
-  const liveAfter = host.liveObjects.get(liveRtId) || liveBefore;
-  check("live 往返：移动成功且无需重启", liveMoveRt.ok === true && liveMoveRt.restartRequired === false);
-  check("live 往返：live header/meta/cwd 已重定向",
-    liveAfter && liveAfter.header.cwd === wsDirB && liveAfter.meta.cwd === wsDirB && liveAfter.cwd === wsDirB);
-  check("live 往返：持久化 states.meta.cwd 已重定向",
-    host.states.get(liveRtId) && host.states.get(liveRtId).meta.cwd === wsDirB);
-  check("live 往返：宿主扫描路径可打开", host.hostOpen(liveRtId)
-    && host.hostOpen(liveRtId).header.cwd === wsDirB && host.hostOpen(liveRtId).events.length === 4);
-  host.live.delete(liveRtId);
-  host.owned.delete(liveRtId);
-
-  // 21. 「删除 / 未分组」若只是普通会话标题，应正常保留，不是墓碑
+  // 10. 「删除 / 未分组」若只是普通会话标题，应正常保留，不是墓碑
   const titleDeleteId = "session-24242424-2424-4424-8424-242424242424";
-  seedSession(host, { id: titleDeleteId, cwd: wsDirA, title: "删除 未分组", events: rtEvents, zstd: true });
+  seedSession(host, { id: titleDeleteId, cwd: wsDirA, title: "删除 未分组", events: [], zstd: true });
   const titlePayload = await manager.payload({});
   const titleRow = titlePayload.sessions.find((row) => row.id === titleDeleteId);
   const titleHidden = await manager.payload({ hiddenOnly: true });
@@ -988,84 +668,94 @@ async function main() {
   check("标题为「删除」的普通会话不会被墓碑/回收站过滤",
     !titleHidden.trashedIds.includes(titleDeleteId) && !titleHidden.purgedIds.includes(titleDeleteId));
 
-  // 22. 只有 header、没有事件（真机 Greeting 的现状）也能移动与打开
-  const headerOnlyId = "session-23232323-2323-4323-8323-232323232323";
-  seedSession(host, { id: headerOnlyId, cwd: wsDirA, title: "Greeting", events: [], zstd: true });
-  const headerOnlyMove = await manager.move(headerOnlyId, "ws-b");
-  check("空日志：移动成功且事件数为 0", headerOnlyMove.ok === true && headerOnlyMove.eventCount === 0);
-  check("空日志：移动后宿主扫描路径可打开", host.hostOpen(headerOnlyId)
-    && host.hostOpen(headerOnlyId).header.cwd === wsDirB && host.hostOpen(headerOnlyId).events.length === 0);
-  const headerOnlyBack = await manager.move(headerOnlyId, "ws-a");
-  check("空日志：可再次移回并打开", headerOnlyBack.ok === true
-    && host.hostOpen(headerOnlyId).header.cwd === wsDirA);
+  // 11. 「删除会话」开关：关闭时宿主拒绝 delete / purge，恢复与归档不受影响
+  const routeCtx = Object.assign({}, host.ctx, {
+    webServer: { getOrigin: () => "http://127.0.0.1:1" },
+    logger: { warn() {} }
+  });
+  const handlerOff = makeSessionsHandler(routeCtx, manager, { sessionsDelete: false });
+  const switchVictim = seedSession(host, {
+    id: "session-28282828-2828-4828-8828-282828282828",
+    cwd: wsDirA,
+    title: "switch victim",
+    events: [{ type: "user/message", data: { content: "keep" } }]
+  });
+  const switchVictimDir = sessionDirOf(sessionsRoot, wsDirA, switchVictim.id);
+  let routeRes = await callRoute(handlerOff, "POST", { action: "delete", sessionIds: [switchVictim.id] });
+  check("开关关闭：delete 被宿主拒绝（403 SESSIONS_DELETE_DISABLED）",
+    routeRes.status === 403 && routeRes.body.error.code === "SESSIONS_DELETE_DISABLED");
+  check("开关关闭：日志未被删除", fs.existsSync(switchVictimDir));
+  const purgeVictim = seedSession(host, {
+    id: "session-29292929-2929-4929-8929-292929292929",
+    cwd: wsDirA,
+    title: "purge victim",
+    events: []
+  });
+  const purgeVictimDir = sessionDirOf(sessionsRoot, wsDirA, purgeVictim.id);
+  const purgePrepared = await manager.removeToTrash([purgeVictim.id]);
+  routeRes = await callRoute(handlerOff, "POST", {
+    action: "purge",
+    trashIds: [purgePrepared[0].trashId],
+    confirm: "OK"
+  });
+  check("开关关闭：purge 被宿主拒绝（403 SESSIONS_DELETE_DISABLED）",
+    routeRes.status === 403 && routeRes.body.error.code === "SESSIONS_DELETE_DISABLED");
+  check("开关关闭：回收站条目与日志仍在",
+    fs.existsSync(path.join(trashRoot, purgePrepared[0].trashId)) && fs.existsSync(purgeVictimDir));
+  routeRes = await callRoute(handlerOff, "POST", {
+    action: "restore",
+    trashIds: [purgePrepared[0].trashId]
+  });
+  check("开关关闭：恢复仍可用（200）", routeRes.status === 200 && routeRes.body.ok === true);
+  routeRes = await callRoute(handlerOff, "POST", { action: "archive", sessionIds: [switchVictim.id] });
+  check("开关关闭：归档仍可用（200）", routeRes.status === 200 && routeRes.body.ok === true);
+  routeRes = await callRoute(handlerOff, "GET");
+  check("开关关闭：列表读取仍可用（200）", routeRes.status === 200 && routeRes.body.ok === true);
 
-  // 23. 跨盘符：rename 抛 EXDEV 时必须回退到 cp + rm，且事件不丢
-  const exdevId = "session-25252525-2525-4525-8525-252525252525";
-  seedSession(host, { id: exdevId, cwd: wsDirA, title: "exdev", events: rtEvents, zstd: true });
-  const realRename = fsp.rename;
-  let exdevHits = 0;
-  fsp.rename = async (from, to) => {
-    exdevHits += 1;
-    throw Object.assign(new Error(`cross-device link not permitted: ${from} -> ${to}`), { code: "EXDEV" });
-  };
-  let exdevMove;
-  try {
-    exdevMove = await manager.move(exdevId, "ws-b");
-  } finally {
-    fsp.rename = realRename;
+  // 开关开启：同一路由允许删除到回收站
+  const handlerOn = makeSessionsHandler(routeCtx, manager, { sessionsDelete: true });
+  routeRes = await callRoute(handlerOn, "POST", { action: "delete", sessionIds: [switchVictim.id] });
+  check("开关开启：delete 成功（200）",
+    routeRes.status === 200 && routeRes.body.ok === true
+      && routeRes.body.value.results[0].ok === true);
+  check("开关开启：会话进入回收站",
+    !fs.existsSync(switchVictimDir)
+      || routeRes.body.value.results[0].trashId !== undefined);
+
+  // 12. 路由层确认策略：批量删除到回收站不需要 OK；批量彻底清理仍需要 OK
+  const routeIds = [
+    "session-30303030-3030-4030-8030-303030303030",
+    "session-31313131-3131-4131-8131-313131313131"
+  ];
+  const routeDirs = new Map();
+  for (const id of routeIds) {
+    seedSession(host, { id, cwd: wsDirB, title: id.slice(-6), events: [] });
+    routeDirs.set(id, sessionDirOf(sessionsRoot, wsDirB, id));
   }
-  check("跨盘符：EXDEV 触发并回退成功", exdevHits >= 1 && exdevMove.ok === true && exdevMove.eventCount === 4);
-  check("跨盘符：目标工作区可打开且事件完整", !!host.hostOpen(exdevId)
-    && host.hostOpen(exdevId).header.cwd === wsDirB && host.hostOpen(exdevId).events.length === 4);
-  check("跨盘符：源目录已清理", !fs.existsSync(sessionDirOf(sessionsRoot, wsDirA, exdevId)));
-  const exdevBack = await manager.move(exdevId, "ws-a");
-  check("跨盘符：可再次移回", exdevBack.ok === true && !!host.hostOpen(exdevId)
-    && host.hostOpen(exdevId).header.cwd === wsDirA);
-
-  // 24. 旧版移动留下的 corrupt header（缺 type / 混入 title）：移动时修复，宿主可打开
-  const legacyId = "session-26262626-2626-4626-8626-262626262626";
-  seedSession(host, { id: legacyId, cwd: wsDirA, title: "Greeting", events: rtEvents, zstd: true });
-  const legacyFile = path.join(sessionDirOf(sessionsRoot, wsDirA, legacyId), LOG_NAME);
-  const legacyBadHeader = {
-    version: 4, id: legacyId, createdAt: 1000, cwd: wsDirA,
-    isSeeded: false, delegationDepth: 0, title: "Greeting"
-  };
-  const legacyText = [JSON.stringify(legacyBadHeader)]
-    .concat(rtEvents.map((event) => JSON.stringify(event))).join("\n") + "\n";
-  fs.writeFileSync(legacyFile, encodeLog(legacyText, true));
-  check("旧坏 header：宿主确实打不开", host.hostOpen(legacyId) === null);
-  const legacyMove = await manager.move(legacyId, "ws-b");
-  check("旧坏 header：移动成功且事件不丢", legacyMove.ok === true && legacyMove.eventCount === 4);
-  const legacyTextAfter = decodeLog(fs.readFileSync(path.join(sessionDirOf(sessionsRoot, wsDirB, legacyId), LOG_NAME)));
-  const legacyHeaderAfter = JSON.parse(legacyTextAfter.split("\n")[0]);
-  check("旧坏 header：补回 type 并剔除非法字段",
-    legacyHeaderAfter.type === "session"
-      && !Object.hasOwn(legacyHeaderAfter, "title")
-      && legacyHeaderAfter.cwd === wsDirB);
-  check("旧坏 header：移动后宿主可打开并读到事件",
-    !!host.hostOpen(legacyId) && host.hostOpen(legacyId).events.length === 4);
-
-  // 25. 宿主内存里的 header 仍指旧 cwd：scan 磁盘按目录名找到真实源目录
-  const staleId = "session-27272727-2727-4727-8727-272727272727";
-  seedSession(host, { id: staleId, cwd: wsDirB, title: "stale", events: rtEvents, zstd: true });
-  const staleHeader = {
-    type: "session", version: 4, id: staleId, createdAt: 1000,
-    cwd: wsDirA, isSeeded: false, delegationDepth: 0
-  };
-  host.headers.set(staleId, staleHeader);
-  const realListSessions = host.query.listSessions;
-  host.query.listSessions = async () => [{ header: staleHeader, live: false, running: false }];
-  let staleMove;
-  try {
-    staleMove = await manager.move(staleId, "ws-a");
-  } finally {
-    host.query.listSessions = realListSessions;
-  }
-  check("旧内存 header：扫描找到真实目录并移动成功",
-    staleMove.ok === true && staleMove.moved === true && staleMove.eventCount === 4);
-  check("旧内存 header：目标可打开且事件完整", !!host.hostOpen(staleId)
-    && host.hostOpen(staleId).header.cwd === wsDirA && host.hostOpen(staleId).events.length === 4);
-  check("旧内存 header：旧目录已清理", !fs.existsSync(sessionDirOf(sessionsRoot, wsDirB, staleId)));
+  routeRes = await callRoute(handlerOn, "POST", { action: "delete", sessionIds: routeIds });
+  check("批量删除到回收站：无 confirm 直接执行",
+    routeRes.status === 200 && routeRes.body.ok === true
+      && routeRes.body.value.results.every((item) => item.ok === true));
+  check("批量删除到回收站：日志仍留在原位",
+    routeIds.every((id) => fs.existsSync(routeDirs.get(id))));
+  const trashIds = routeRes.body.value.results.map((item) => item.trashId);
+  routeRes = await callRoute(handlerOn, "POST", { action: "purge", trashIds });
+  check("批量彻底清理：缺 OK 被拒绝（400 CONFIRM_REQUIRED）",
+    routeRes.status === 400 && routeRes.body.error.code === "CONFIRM_REQUIRED");
+  check("批量彻底清理：被拒绝后条目与日志未动",
+    trashIds.every((id) => fs.existsSync(path.join(trashRoot, id)))
+      && routeIds.every((id) => fs.existsSync(routeDirs.get(id))));
+  routeRes = await callRoute(handlerOn, "POST", { action: "purge", trashIds, confirm: "ok" });
+  check("批量彻底清理：输入小写 ok 也可执行",
+    routeRes.status === 200 && routeRes.body.value.results.every((item) => item.ok === true));
+  check("批量彻底清理：日志已删除", routeIds.every((id) => !fs.existsSync(routeDirs.get(id))));
+  routeRes = await callRoute(handlerOn, "POST", { action: "purge", all: true });
+  check("清空回收站：缺 OK 被拒绝（400 CONFIRM_REQUIRED）",
+    routeRes.status === 400 && routeRes.body.error.code === "CONFIRM_REQUIRED");
+  routeRes = await callRoute(handlerOn, "POST", { action: "purge", all: true, confirm: "OK" });
+  check("清空回收站：输入 OK 后执行成功",
+    routeRes.status === 200 && routeRes.body.ok === true);
+  check("清空回收站后回收站为空", (await manager.payload({})).trash.count === 0);
 
   fs.rmSync(root, { recursive: true, force: true });
   console.log(report.join("\n"));

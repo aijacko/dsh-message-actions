@@ -87,6 +87,8 @@ const Config = z.object({
   export: z.boolean().default(true).volatile(),
   delete: z.boolean().default(true).volatile(),
   deleteFrom: z.boolean().default(true).volatile(),
+  // 会话管理里的「删除会话」（删除到回收站 / 彻底清理）总开关。
+  sessionsDelete: z.boolean().default(true).volatile(),
   confirm: z.boolean().default(true).volatile(),
   stats: z.boolean().default(true).volatile(),
   // 0.2.2 起「完成提示音」不再有独立开关：由 soundTone 的「off」表示关闭。
@@ -1592,11 +1594,16 @@ function makeBillingHandler(ctx, cost) {
 
 const SESSIONS_ROUTE = "/dsh-message-actions/sessions";
 const MAX_SESSION_BATCH = 50;
-/** 删除类操作的确认口令：输入 OK（大小写不敏感、忽略首尾空格）。 */
+/** 彻底清理（不可恢复）的确认口令：输入 OK（大小写不敏感、忽略首尾空格）。 */
 const SESSION_CONFIRM_CODE = "OK";
 
 function isSessionConfirm(value) {
   return typeof value === "string" && value.trim().toUpperCase() === SESSION_CONFIRM_CODE;
+}
+
+/** 「删除会话」开关：关闭时宿主拒绝一切删除 / 彻底清理请求。 */
+function sessionsDeleteEnabled(config) {
+  return !(config && config.sessionsDelete === false);
 }
 
 /** 解析去重后的 id 数组；数量、类型或重复项不合法都返回 null。 */
@@ -1613,7 +1620,7 @@ function readIdList(body, key) {
   return out;
 }
 
-function makeSessionsHandler(ctx, sessions) {
+function makeSessionsHandler(ctx, sessions, config) {
   return async function handleSessions(req, res) {
     if (req.method !== "GET" && req.method !== "POST") {
       drainRequest(req);
@@ -1660,18 +1667,18 @@ function makeSessionsHandler(ctx, sessions) {
     }
 
     try {
+      // 「删除会话」关闭时，删除到回收站与彻底清理一律拒绝（恢复 / 归档不受影响）。
+      if ((body.action === "delete" || body.action === "purge") && !sessionsDeleteEnabled(config)) {
+        sendError(res, 403, "SESSIONS_DELETE_DISABLED");
+        return;
+      }
       if (body.action === "delete") {
         const ids = readIdList(body, "sessionIds");
         if (!ids || !ids.every(sessionsPure.isSessionId)) {
           sendBadRequest(res);
           return;
         }
-        // 单条删除直接进回收站（可恢复），不再要求输入口令；
-        // 批量删除才需要 OK，避免一次误删多条。
-        if (ids.length > 1 && !isSessionConfirm(body.confirm)) {
-          sendError(res, 400, "CONFIRM_REQUIRED");
-          return;
-        }
+        // 删除到回收站是可恢复操作：单条与批量都直接执行，不需要输入口令。
         sendJson(res, 200, { ok: true, value: { results: await sessions.removeToTrash(ids) } });
         return;
       }
@@ -1705,23 +1712,6 @@ function makeSessionsHandler(ctx, sessions) {
           return;
         }
         sendJson(res, 200, { ok: true, value: await sessions.purge(ids, false) });
-        return;
-      }
-      if (body.action === "move") {
-        if (!sessionsPure.isSessionId(body.sessionId) || !sessionsPure.isWorkspaceId(body.workspaceId)) {
-          sendBadRequest(res);
-          return;
-        }
-        sendJson(res, 200, { ok: true, value: await sessions.move(body.sessionId, body.workspaceId) });
-        return;
-      }
-      if (body.action === "moveBatch") {
-        const ids = readIdList(body, "sessionIds");
-        if (!ids || !ids.every(sessionsPure.isSessionId) || !sessionsPure.isWorkspaceId(body.workspaceId)) {
-          sendBadRequest(res);
-          return;
-        }
-        sendJson(res, 200, { ok: true, value: await sessions.moveMany(ids, body.workspaceId) });
         return;
       }
       if (body.action === "archive") {
@@ -1780,8 +1770,8 @@ function apply(ctx, config) {
   route(STATS_ROUTE, makeStatsHandler(ctx, stats), "session stats route");
   route(STATS_BUDGET_ROUTE, makeStatsBudgetHandler(ctx, cost), "stats budget route");
   route(BILLING_ROUTE, makeBillingHandler(ctx, cost), "billing route");
-  // —— 会话管理（删除到回收站 / 恢复 / 彻底清理 / 移动到工作区）——
-  route(SESSIONS_ROUTE, makeSessionsHandler(ctx, sessions), "sessions route");
+  // —— 会话管理（删除到回收站 / 恢复 / 彻底清理 / 归档）——
+  route(SESSIONS_ROUTE, makeSessionsHandler(ctx, sessions, config), "sessions route");
 
   ctx.effect(() => {
     const offEvent = ctx.on("session/event", (session, event) => cost.onSessionEvent(session, event));
@@ -1800,4 +1790,5 @@ function apply(ctx, config) {
   }, "dsh-message-actions: cost service");
 }
 
-export { Config, apply, inject, name };
+// makeSessionsHandler 仅供端到端测试直接驱动会话路由（真实文件系统 + 真实处理器）。
+export { Config, apply, inject, name, makeSessionsHandler };

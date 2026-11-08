@@ -34,8 +34,8 @@ Features you don't use can be turned off in settings. Turn off cost statistics, 
 | **Peak / off-peak hint** | Peak in orange, off-peak in blue, showing whether now is expensive and when it switches |
 | **Balance scope** | The main figure is the account's **total available balance** (top-up + bonus), each wallet truncated to the cent; bonus is merged into the main figure and broken out in the hover tooltip only, with no manual adjustment layer |
 | **Bilingual UI** | Follows the DSH language; interface and tooltips switch automatically |
-| **Session management** | Sidebar footer entry: search sessions, group by workspace, delete to trash, restore, move to another workspace |
-| **Trash bin** | Deleted sessions move to `~/.dsh/dsh-message-actions-trash`; restore one, purge one, or empty all with an `OK` confirmation |
+| **Session management** | Sidebar footer entry: search sessions, group by workspace, delete to trash, restore, and archive |
+| **Trash bin** | Deleted sessions go to `~/.dsh/dsh-message-actions-trash`; restore one, purge one, or empty all — only purge and emptying need an `OK` confirmation |
 | **Overlay keyboard** | In the share / export overlay, `Enter` runs the primary action (Share image / Export); in a confirmation dialog it confirms, and `Esc` cancels. Enter is ignored while focus is in a text field, and when the primary action is disabled or busy |
 
 Deletion uses **tombstone-style surface replacement**: it only appends a marker and hides the original span; it never rewrites the history log and doesn't affect other sessions. The marker is persisted in the session event log, so deleted content stays hidden after a page refresh, after switching to another conversation and back, and after restarting DSH. `/messages` and `full=1` both recompute the visible set from those markers instead of trusting the host surface alone.
@@ -46,13 +46,13 @@ Deletion uses **tombstone-style surface replacement**: it only appends a marker 
 
 Open the panel from the **Message Butler** entry at the sidebar footer (same area as the cost card) or Settings → Message Butler → **Session manager**:
 
-- **Delete a session**: uses a soft trash — it only writes a trash index entry and leaves the log in the original workspace, never moving files or detaching workspace membership. Only sessions that are actively replying are refused — sessions that are merely open (live) are allowed. A single delete needs only one confirmation click; only bulk delete, bulk permanent delete, and emptying the trash in Settings require typing `OK` (case-insensitive, surrounding spaces ignored). Pressing `Enter` after typing acts as the confirm button, and IME composition Enter does not submit. On success the row is hidden immediately in both this page and the host sidebar, and never falls into the "Ungrouped" bucket.
-- **Multi-select and batch actions**: every row has a checkbox with select all / clear; batch delete, batch move (one target workspace) and batch archive. Results are summarized per item; successful items are never rolled back, and failed items stay selected for retry.
-- **Trash**: single/bulk restore, single/bulk permanent delete, select all / clear. A soft-trash restore only removes the index entry, so the session **returns to its original workspace group immediately without a restart**. Bulk permanent delete requires `OK`; successful items are removed immediately and failed items stay selected. Emptying the whole trash also requires `OK`. The trash lives at `~/.dsh/dsh-message-actions-trash` (directory `0700`, metadata `0600`).
-- **Move to another workspace**: moves the original log directory and only rewrites the zstd first frame (header), splicing every later event frame byte-for-byte. Host logs are multi-frame; the old "decompress and recompress the whole file" dropped every event after frame 0. Frame-level relocation now asserts the event count is unchanged before committing. The header is rebuilt against the host v4 whitelist and regains the `type: "session"` field that older versions dropped — without it the host treats the log as corrupt and opening fails with `session/not-found`. The target directory comes from host `locate`, so it matches the same encoding used by startup scan and open. It no longer calls `sessionPersistence.create`, so an open (live) session can move; a held write handle just skips the write claim. After moving: detach from the source workspace → redirect the live object and `persistence.states` `cwd` → attach to the target (`sessionPaths` stores the workspace path) → refresh the host index → verify via host `stat`. On failure the client shows the real error code (e.g. `TARGET_EXISTS`, `WORKSPACE_MISSING`, `LOG_VERIFY_FAILED`) and the original message.
-- **Freshness**: trash delete and restore take effect immediately; a move refreshes the registry index, so the session opens in the target workspace and can be moved back, usually with no restart. Only a rejected attach or an unredirectable live state asks for a restart.
+- **Delete a session**: uses a soft trash — it only writes a trash index entry and leaves the log in the original workspace, never moving files or detaching workspace membership. Only sessions that are actively replying are refused — sessions that are merely open (live) are allowed. Single and bulk delete-to-trash run immediately, **no `OK` required**; on success the row is hidden immediately in both this page and the host sidebar, and never falls into the "Ungrouped" bucket.
+- **Multi-select and batch actions**: every row has a checkbox with select all / clear; batch delete to trash and batch archive. Results are summarized per item; successful items are never rolled back, and failed items stay selected for retry.
+- **Trash**: single/bulk restore, single/bulk permanent delete, select all / clear. A soft-trash restore only removes the index entry, so the session **returns to its original workspace group immediately without a restart**. Permanent delete, bulk permanent delete, and emptying the trash are irreversible and require typing `OK` (case-insensitive, surrounding spaces ignored; `Enter` acts as the confirm button). Successful items are removed immediately and failed items stay selected. The trash lives at `~/.dsh/dsh-message-actions-trash` (directory `0700`, metadata `0600`).
+- **Delete-session switch**: Settings → Message Butler → Session manager has a top toggle. When off, delete / purge entries disappear from the sidebar and session page, and the host rejects every delete and purge request (`SESSIONS_DELETE_DISABLED`); restore, archive, and listing are unaffected.
+- **Freshness**: trash delete and restore take effect immediately; no restart is needed.
 
-Known limits: the target workspace directory must exist; a move only recompresses frame 0, so even huge logs are fast; repeated round-trips never duplicate rows or leave "Ungrouped" residue; the trash is managed by this plugin only and is not part of DSH's own session cleanup. If an older build already dropped a log's events (only the header remains), repair can make the session openable again but cannot restore its content.
+Known limits: the trash is managed by this plugin only and is not part of DSH's own session cleanup. If an older build already dropped a log's events (only the header remains), repair can make the session openable again but cannot restore its content.
 
 ---
 
@@ -293,7 +293,7 @@ test/check.mjs   # dependency-free assertion script
 ```
 
 
-- Version: `0.2.12` (source version; not published)
+- Version: `0.2.13` (source version; not published)
 - Latest release: [v0.2.4](https://github.com/aijacko/dsh-message-actions/releases/tag/v0.2.4)
 - Compatible with: DSH `0.2.1-rc.5` and `0.2.2-rc.1`; `0.2.2-rc.1` (web profile) verified, older hosts take the portal fallback
 - Dependencies: none at runtime

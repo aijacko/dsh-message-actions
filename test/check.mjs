@@ -1319,8 +1319,8 @@ function fakeRes() {
   ok("i18n en 非空", enKeys.length > 50);
   eq("i18n meta.zh.title 为显示名", i18n.meta.zh.title, "消息管家");
   eq("i18n meta.en.title 为显示名", i18n.meta.en.title, "Message Butler");
-  eq("i18n meta.zh.description 按定稿原文", i18n.meta.zh.description, "撤回、删除、删至末尾、多选分享与导出；会话管理（回收站、恢复、移动到其他工作区）；每条回答的用量计费、余额与费用展示、完成提示音。");
-  eq("i18n meta.en.description 与中文同义", i18n.meta.en.description, "Recall, delete, delete-to-end, and multi-select share/export; session management with trash, restore, and moving across workspaces; per-reply usage billing, balance and cost display, and a completion sound.");
+  eq("i18n meta.zh.description 按定稿原文", i18n.meta.zh.description, "撤回、删除、删至末尾、多选分享与导出；会话管理（回收站、恢复、归档）；每条回答的用量计费、余额与费用展示、完成提示音。");
+  eq("i18n meta.en.description 与中文同义", i18n.meta.en.description, "Recall, delete, delete-to-end, and multi-select share/export; session management with trash, restore, and archive; per-reply usage billing, balance and cost display, and a completion sound.");
   const iconSrc = fs.readFileSync(fileURLToPath(new URL("../icon.svg", import.meta.url)), "utf8");
   ok("插件图标：蓝底对话气泡内嵌三档滑块", /viewBox="0 0 64 64"/.test(iconSrc) &&
     iconSrc.includes('fill="#2563eb"') && iconSrc.includes("M23 23h18M23 30h18M23 37h18") &&
@@ -2864,128 +2864,109 @@ function pushTombstone(bag, plan, id, action) {
   // —— 会话菜单：必须走宿主正规扩展点 ——
   ok("会话菜单：读取宿主 contextMenus 服务", clientSrc.includes('ctx.get("contextMenus")'));
   ok("会话菜单：存在 target session 的注册", /target: "session"/.test(clientSrc));
-  ok("会话菜单：注册移动项 id", clientSrc.includes('"dsh-message-actions.move"'));
+  ok("会话菜单：不再注册移动项",
+    !clientSrc.includes('"dsh-message-actions.move"') && !clientSrc.includes("sessions.actionMove"));
   ok("会话菜单：注册删除项 id", clientSrc.includes('"dsh-message-actions.delete"'));
-  ok("会话菜单：移动项 order 650（归档之后）", /\border:\s*650\b/.test(clientSrc));
   ok("会话菜单：删除项 order 700（菜单末尾）", /\border:\s*700\b/.test(clientSrc));
   ok("会话菜单：宿主无 contextMenus 时退回 DOM 兜底",
     clientSrc.includes("startSidebarMenuAugment()"));
-  ok("会话菜单：移动文案绑定 i18n",
-    /label: t\("sessions\.actionMove"\)/.test(clientSrc));
+  ok("会话菜单：删除文案绑定 i18n",
+    /label: t\("sessions\.actionDelete"\)/.test(clientSrc));
   ok("会话菜单：删除项 danger 标红",
     /label: t\("sessions\.actionDelete"\),\n\s+icon: \{ key: MENU_ICON_KEYS\.delete \},\n\s+danger: true/.test(clientSrc));
-  ok("会话菜单：移动/删除项带图标 key",
-    /label: t\("sessions\.actionMove"\), icon: \{ key: MENU_ICON_KEYS\.move \}/.test(clientSrc)
-      && clientSrc.includes("icon: { key: MENU_ICON_KEYS.delete }"));
+  ok("会话菜单：删除项带图标 key", clientSrc.includes("icon: { key: MENU_ICON_KEYS.delete }"));
   ok("会话菜单：图标走宿主 contextMenu.icon 槽且尺寸随宿主",
     clientSrc.includes('ctx.slots.inject("contextMenu.icon"')
-      && clientSrc.includes("IconFolderOpenRegular")
-      && clientSrc.includes("IconTrashOutlineRegular"));
-  ok("会话菜单：移动为二级菜单（children）",
-    clientSrc.includes("children") && clientSrc.includes("workspace-\" + workspace.id"));
-  ok("会话菜单：当前工作区置灰并标注「当前」",
-    clientSrc.includes('t("sessions.currentWorkspace")') && clientSrc.includes("disabled: isCurrent"));
+      && clientSrc.includes("IconTrashOutlineRegular")
+      && !clientSrc.includes("IconFolderOpenRegular"));
+  ok("会话菜单：删除入口受「删除会话」开关控制",
+    clientSrc.includes("sessionsDeleteEnabled()")
+      && clientSrc.includes("if (!sessionsDeleteEnabled()) return;"));
   ok("会话菜单：构建产物包含扩展点注册与图标槽",
     libClient.includes('ctx.get("contextMenus")')
-      && libClient.includes('"dsh-message-actions.move"')
+      && !libClient.includes('"dsh-message-actions.move"')
       && libClient.includes('"dsh-message-actions.delete"')
       && libClient.includes('contextMenu.icon')
-      && libClient.includes("IconFolderOpenRegular"));
+      && !libClient.includes("IconFolderOpenRegular"));
 
-  // —— 删除失败修复：只拒运行中；live 会话允许迁移目录 ——
+  // —— 删除失败修复：只拒运行中 ——
   ok("删除：只拒绝运行中的会话",
     managerSrc.includes('record.running === true || runningSet().has(id)')
       && !managerSrc.includes('failureOf(id, "SESSION_LIVE")'));
-  ok("删除：live 写句柄冲突时跳过写声明",
-    managerSrc.includes("isOwnershipConflict")
-      && managerSrc.includes("SessionAlreadyOwnedError"));
-  ok("移动：只拒绝运行中，live 允许移动",
-    !managerSrc.includes('error: "SESSION_LIVE"')
-      && managerSrc.includes('if ((record && record.running === true) || runningSet().has(sessionId)) {')
-      && managerSrc.includes('return { ok: false, error: "SESSION_RUNNING" };'));
-  ok("移动：写句柄冲突时跳过写声明并继续迁移",
-    (managerSrc.match(/isOwnershipConflict\(err\)/g) || []).length >= 2);
-  ok("移动：不再用 sp.create（避免 live 会话 SessionAlreadyExistsError）",
-    !managerSrc.includes("sp.create(nextHeader)")
-      && managerSrc.includes("async function relocateLog(")
-      && managerSrc.includes("LOG_VERIFY_FAILED"));
-  ok("移动：原日志迁移只改写首行 header 并保留事件",
-    managerSrc.includes("splitLogText") && managerSrc.includes("countEvents")
-      && managerSrc.includes("function scanZstdFrames(")
-      && managerSrc.includes("const tail = buf.subarray(first.end);")
-      && managerSrc.includes("JSON.stringify(nextHeaderObj)")
-      && managerSrc.includes("if (tail.length > 0 && !verifyBuf.subarray(verifyBuf.length - tail.length).equals(tail))")
-      && managerSrc.includes("moved log lost events"));
-  ok("移动：zstd 多帧只重写首帧，不整段解压重压",
-    managerSrc.includes("const first = frames[0];")
-      && managerSrc.includes("const newFrame0 = await compressZstdBuffer(")
-      && managerSrc.includes("const data = Buffer.concat([newFrame0, ...salvageFrames, tail]);")
-      && managerSrc.includes("const salvage = firstLines.slice(1)"));
-  ok("移动：header 按宿主 v4 白名单重整并补回 type",
-    managerSrc.includes("const SESSION_HEADER_KEYS = new Set([")
-      && managerSrc.includes("function sanitizeHeader(header)")
-      && managerSrc.includes('if (out.type !== "session") out.type = "session";')
-      && managerSrc.includes("Object.assign(sanitizeHeader(header), { cwd: nextHeader.cwd })")
-      && managerSrc.includes('verifyHeader.type !== "session"'));
-  ok("移动：失败路径透出错误码/阶段/路径给客户端",
-    managerSrc.includes("detail = {") && managerSrc.includes("stage,")
-      && managerSrc.includes("stackLine: firstStackLine(err)")
-      && managerSrc.includes('error: errorCodeOf(err) || "MOVE_FAILED"'));
-  ok("移动：目标已有同名会话返回 TARGET_EXISTS",
-    managerSrc.includes('code: "TARGET_EXISTS"') && managerSrc.includes("target session directory already exists"));
-  ok("移动：迁移后重挂工作区索引并刷新宿主索引",
-    managerSrc.includes("attached = await attachToWorkspace(sessionId, nextHeader, target.path);")
-      && managerSrc.includes("const indexRefreshed = await refreshRegistryIndex();")
-      && managerSrc.includes("async function refreshRegistryIndex()")
-      && managerSrc.includes("await serviceValue.replaceHeaderIndex(headers);")
-      && managerSrc.includes("indexLiveSessions()"));
-  ok("移动：sessionPaths 写工作区路径而不是会话目录",
-    managerSrc.includes("function attachToWorkspace(sessionId, header, workspacePath)")
-      && managerSrc.includes("sessionPaths.set(sessionId, canonical)")
-      && managerSrc.includes("if (!ids.includes(sessionId)) {"));
-  ok("移动：live 会话重定向 header/meta/cwd 与持久化 states",
-    managerSrc.includes("function redirectLiveSession(sessionId, header, workspacePath)")
-      && managerSrc.includes("states.get(sessionId)")
-      && managerSrc.includes("redirect = redirectLiveSession(sessionId, nextHeader, target.path);"));
-  ok("移动：找不到列表记录时回退宿主 stat / readSession，不误报「目标不存在」",
-    managerSrc.includes("let records = null;")
-      && managerSrc.includes("if (!header) header = await statHeaderOf(sp, sessionId);")
-      && managerSrc.includes("const read = await queryService.readSession(sessionId, 0);"));
-  ok("移动：目标目录优先走宿主 locate 编码",
-    managerSrc.includes("const locatedTargetPath = locateLogPath(sp, nextHeader);")
-      && managerSrc.includes("if (targetDir === \"\" || !insideRoot(root, targetDir))")
-      && managerSrc.includes("function locateLogPath(sp, header)"));
-  ok("移动：源目录缺失时按目录名扫描磁盘兜底",
-    managerSrc.includes("function findSessionDirOnDisk(root, sessionId)")
-      && managerSrc.includes("const scanned = findSessionDirOnDisk(root, sessionId);")
-      && managerSrc.includes("if (scanned !== \"\") sourceDir = scanned;")
-      && managerSrc.includes("normalizePathKey(header.cwd) === canonical && isDirectory(locatedDir(sp, header, root))"));
 
-  // —— 口令：只有批量删除 / 批量彻底清理 / 清空回收站要求输入 OK ——
+  // —— 移动功能已移除：宿主实现、路由与共享工具 ——
+  const sharedText = fs.readFileSync(path.join(rootDir, "src", "shared.cjs"), "utf8");
+  ok("移动：宿主 side 不再导出 move / moveMany",
+    !managerSrc.includes("async function move(")
+      && !managerSrc.includes("async function moveMany(")
+      && !managerSrc.includes("relocateLog")
+      && !managerSrc.includes("sanitizeHeader")
+      && !managerSrc.includes("redirectLiveSession")
+      && !managerSrc.includes("statHeaderOf"));
+  ok("移动：路由不再分发 move / moveBatch",
+    !indexSrc.includes('body.action === "move"') && !indexSrc.includes('body.action === "moveBatch"'));
+  ok("移动：仅为移动存在的错误码已清理",
+    !sharedText.includes("MOVE_UNAVAILABLE") && !sharedText.includes("MOVE_FAILED")
+      && !sharedText.includes("LOG_VERIFY_FAILED") && !sharedText.includes("TARGET_EXISTS"));
+  ok("共享：日志读取/归属校验工具仍被回收站使用",
+    managerSrc.includes("function scanZstdFrames(")
+      && managerSrc.includes("async function readLogText(")
+      && managerSrc.includes("async function logBelongsTo(")
+      && managerSrc.includes("function splitLogText("));
+  ok("共享：恢复/清理仍走 moveDirectory 与工作区索引",
+    managerSrc.includes("function moveDirectory(")
+      && managerSrc.includes("async function refreshRegistryIndex()")
+      && managerSrc.includes("function attachToWorkspace(sessionId, header, workspacePath)"));
+
+  // —— 「删除会话」开关：宿主拦截 + 设置页开关 ——
+  ok("删除开关：Config 新增 sessionsDelete（默认开启）",
+    indexSrc.includes("sessionsDelete: z.boolean().default(true).volatile()"));
+  ok("删除开关：宿主拒绝 delete / purge",
+    indexSrc.includes('(body.action === "delete" || body.action === "purge")')
+      && indexSrc.includes('sendError(res, 403, "SESSIONS_DELETE_DISABLED")'));
+  ok("删除开关：设置页新增开关行并传给会话页",
+    clientSrc.includes('labelKey: "sessions.settingsDelete"')
+      && clientSrc.includes("canDelete: value ? value.sessionsDelete !== false : true")
+      && clientSrc.includes("const deleteEnabled = canDelete !== false;"));
+  ok("删除开关：关闭后隐藏删除与彻底清理入口",
+    clientSrc.includes("multiSelect || !deleteEnabled ? null : e(\"button\"")
+      && clientSrc.includes("deleteEnabled ? e(\"button\"")
+      && clientSrc.includes("!menu || !menu.row || multiSelect || !deleteEnabled"));
+  ok("删除开关：中英文案存在",
+    i18nSrc.includes("'sessions.settingsDelete': '删除会话'")
+      && i18nSrc.includes("'sessions.settingsDelete': 'Delete sessions'"));
+
+  // —— 口令：删除到回收站不需要 OK；彻底清理 / 清空才需要 ——
   ok("口令：客户端确认码为 OK 且不再出现 PURGE_ALL",
     clientSrc.includes('SESSIONS_CONFIRM_CODE = "OK"')
       && !clientSrc.includes("PURGE_ALL")
       && clientSrc.includes("function sessionConfirmMatches"));
-  ok("口令：单条删除免确认，批量删除/批量清理/清空才要求 OK",
-    (clientSrc.match(/confirm: SESSIONS_CONFIRM_CODE/g) || []).length === 2
+  ok("口令：单条与批量删除到回收站都不输入 OK",
+    !/postSessionAction\(\{ action: "delete", sessionIds: ids, confirm/.test(clientSrc)
+      && !clientSrc.slice(clientSrc.indexOf('} else if (dialog.kind === "bulkDelete")')).split("const needsCode")[0].includes("confirmField")
+      && clientSrc.includes("// 批量删除到回收站同样可恢复，直接执行，不需要输入口令。"));
+  ok("口令：彻底清理 / 清空回收站仍要求 OK",
+    (clientSrc.match(/confirmField\("sessions\.purgeCodePrompt"\)/g) || []).length === 1
+      && (clientSrc.match(/confirmField\("sessions\.confirmPrompt"\)/g) || []).length === 1
       && clientSrc.includes("body.confirm = SESSIONS_CONFIRM_CODE")
-      && (clientSrc.match(/confirmField\("sessions\.confirmPrompt"\)/g) || []).length === 2
-      && (clientSrc.match(/confirmField\("sessions\.purgeCodePrompt"\)/g) || []).length === 1
-      && clientSrc.includes("单条删除只进回收站，可恢复；不再输入 OK")
-      && clientSrc.includes("单条删除只进回收站（可恢复），无需输入 OK")
-      && clientSrc.includes("if (bulk) body.confirm = SESSIONS_CONFIRM_CODE"));
+      && clientSrc.includes("const needsCode = dialog.kind === \"purgeAll\" || dialog.kind === \"bulkPurge\";"));
   ok("口令：输入去首尾空格且大小写不敏感",
     /trim\(\)\.toUpperCase\(\) === SESSIONS_CONFIRM_CODE/.test(clientSrc));
   ok("口令：中英文案同步为输入 OK",
-    i18nSrc.includes("'sessions.confirmPrompt': '输入 OK 确认删除'")
-      && i18nSrc.includes("'sessions.confirmPrompt': 'Type OK to confirm deletion'")
+    i18nSrc.includes("'sessions.confirmPrompt': '输入 OK 确认彻底清理'")
+      && i18nSrc.includes("'sessions.confirmPrompt': 'Type OK to confirm permanent deletion'")
       && i18nSrc.includes("'sessions.purgeCodePrompt': '输入 OK 确认清空'")
       && !i18nSrc.includes("PURGE_ALL"));
-  ok("口令：服务端仅批量操作校验 OK",
+  const deleteBranch = indexSrc.slice(
+    indexSrc.indexOf('if (body.action === "delete")'),
+    indexSrc.indexOf('if (body.action === "restore")')
+  );
+  ok("口令：服务端仅彻底清理校验 OK",
     indexSrc.includes('const SESSION_CONFIRM_CODE = "OK"')
       && indexSrc.includes("function isSessionConfirm(value)")
+      && !deleteBranch.includes("isSessionConfirm")
       && indexSrc.includes("if (ids.length > 1 && !isSessionConfirm(body.confirm))")
-      && indexSrc.includes("if (body.all === true)")
+      && indexSrc.includes("if (!isSessionConfirm(body.confirm))")
       && !indexSrc.includes("PURGE_ALL"));
 
   // —— 删除后从工作区索引与列表移除（含 live 内存残留） ——
@@ -3047,7 +3028,7 @@ function pushTombstone(bag, plan, id, action) {
     clientSrc.includes("const sessionsStore = createStore({ revision: 0 })")
       && clientSrc.includes("function bumpSessionsRevision()")
       && clientSrc.includes("sessionsStore.subscribe(() => {")
-      && clientSrc.includes("if (ok) bumpSessionsRevision();"));
+      && (clientSrc.match(/bumpSessionsRevision\(\);/g) || []).length >= 6);
   ok("前端：旧请求结果不会覆盖删除后的新快照",
     clientSrc.includes("const loadSeq = React.useRef(0)")
       && clientSrc.includes("seq !== loadSeq.current"));
@@ -3094,20 +3075,16 @@ function pushTombstone(bag, plan, id, action) {
   ok("多选：全选 / 清空选择",
     clientSrc.includes("function selectAllFiltered") && clientSrc.includes("function clearSelected"));
   ok("多选：多选模式下隐藏单项菜单",
-    clientSrc.includes('multiSelect ? null : e("button"')
-      && clientSrc.includes("if (!menu || !menu.row || multiSelect) return null;"));
-  ok("批量：删除 / 移动 / 归档入口",
-    clientSrc.includes('runBulk("delete"') && clientSrc.includes('runBulk("move"') && clientSrc.includes('runBulk("archive"'));
+    clientSrc.includes('multiSelect || !deleteEnabled ? null : e("button"')
+      && clientSrc.includes("if (!menu || !menu.row || multiSelect || !deleteEnabled) return null;"));
+  ok("批量：删除到回收站 / 归档入口（无移动）",
+    clientSrc.includes('runBulk("delete"') && clientSrc.includes('runBulk("archive"')
+      && !clientSrc.includes('runBulk("move"'));
   ok("批量：结果汇总（成功/失败条数及原因）",
     clientSrc.includes("sessions.bulkResult") && clientSrc.includes("sessions.bulkMoreFailed"));
-  ok("批量接口：moveBatch 参数校验",
-    indexSrc.includes('body.action === "moveBatch"')
-      && indexSrc.includes('readIdList(body, "sessionIds")')
-      && indexSrc.includes("sessionsPure.isWorkspaceId(body.workspaceId)"));
   ok("批量接口：archive 参数校验", indexSrc.includes('body.action === "archive"'));
-  ok("批量实现：moveMany 逐条独立、部分失败不回滚",
-    managerSrc.includes("async function moveMany(ids, workspaceId)")
-      && managerSrc.includes("results.push(failureOf(id"));
+  ok("批量接口：delete 不要求确认口令",
+    !deleteBranch.includes("isSessionConfirm") && !deleteBranch.includes("CONFIRM_REQUIRED"));
   ok("批量实现：archive 逐条独立",
     managerSrc.includes("async function archive(ids)")
       && managerSrc.includes("serviceValue.archiveSession(id)"));
@@ -3126,12 +3103,11 @@ function pushTombstone(bag, plan, id, action) {
   ok("设置 Tab：顺序为 消息操作 → 会话管理 → 费用统计",
     tabActions < tabSessions && tabSessions < tabBilling);
   ok("会话管理：作为 Tab 渲染而非独立页面",
-    libClient.includes("e(SessionsPage, { t: tt })"));
+    libClient.includes("e(SessionsPage, { t: tt, canDelete:"));
 
   // —— 能力不因挪位置而丢失 ——
   const abilityMarkers = [
     "function runDelete",
-    "function runMove",
     "function runRestore",
     "function runPurge",
     "function runPurgeAll",
@@ -3142,7 +3118,7 @@ function pushTombstone(bag, plan, id, action) {
     "sessions.sortUpdated"
   ];
   const missingAbilities = abilityMarkers.filter((marker) => !clientSrc.includes(marker));
-  eq("会话管理 Tab：分组/搜索/筛选/排序/回收站/移动/删除/口令清空齐备",
+  eq("会话管理 Tab：分组/搜索/筛选/排序/回收站/删除/口令清空齐备",
     missingAbilities.join(","), "");
 })();
 

@@ -1,15 +1,11 @@
-// dsh-message-actions — 会话管理（删除到回收站 / 恢复 / 彻底清理 / 移动到工作区）。
+// dsh-message-actions — 会话管理（删除到回收站 / 恢复 / 彻底清理 / 归档）。
 //
 // 数据源与写入都走宿主官方服务：
 //   - sessionQuery.listSessions / readSession / readTitleSnapshots：枚举与正文；
-//   - sessionPersistence.open / create / append / stat：删除、恢复与迁移日志；
+//   - sessionPersistence.open / create / append / stat：删除与恢复日志；
 //   - workspaceRegistry：工作区分组、归档集与成员关系。
 //
 // 删除采用「整目录移入回收站」而不是删文件：恢复时原样移回，宿主无需迁移格式。
-// 移动工作区采用「原日志迁移 + 只改写首行 header」：把会话目录从源项目目录
-// 移到目标项目目录，再复制日志并替换首行 cwd。这样不调用
-// `sessionPersistence.create`，避开「会话在 UI 中打开、宿主仍持有写句柄」
-// 时抛出的 SessionAlreadyExistsError（真机移动失败并回滚的真实原因）。
 
 import fs from "node:fs";
 import fsp from "node:fs/promises";
@@ -21,7 +17,6 @@ import pure from "./sessions.cjs";
 
 const {
   isSessionId,
-  isWorkspaceId,
   isTrashId,
   isContainedPath,
   sessionDirOf,
@@ -70,18 +65,13 @@ function isDirectory(value) {
 }
 
 // ---------------------------------------------------------------------------
-// 会话日志读取 / 改写（移动工作区时保留原事件字节）
+// 会话日志读取（回收站校验 / 归档 / 恢复时确认归属）
 // ---------------------------------------------------------------------------
 
 const LOG_NAME_RE = /^session\.v\d+\.jsonl(?:\.zstd)?$/;
 const ZSTD_MAGIC = 0x28b52ffd;
 const zstdDecompressSync = typeof zlib.zstdDecompressSync === "function" ? zlib.zstdDecompressSync : null;
-const zstdCompressSync = typeof zlib.zstdCompressSync === "function" ? zlib.zstdCompressSync : null;
 const zstdDecompress = typeof zlib.zstdDecompress === "function" ? promisify(zlib.zstdDecompress) : null;
-const zstdCompress = typeof zlib.zstdCompress === "function" ? promisify(zlib.zstdCompress) : null;
-// 宿主的日志写入器给每一帧都带校验和；改写首帧时保持一致，避免行为差异。
-const ZSTD_CHECKSUM_FLAG = typeof zlib.constants === "object" ? zlib.constants.ZSTD_c_checksumFlag : undefined;
-const ZSTD_HEADER_OPTS = ZSTD_CHECKSUM_FLAG === undefined ? undefined : { params: { [ZSTD_CHECKSUM_FLAG]: 1 } };
 
 function isZstdBuffer(buf) {
   return buf.length >= 4 && buf.readUInt32BE(0) === ZSTD_MAGIC;
@@ -162,52 +152,6 @@ async function decompressZstdBuffer(buf) {
   throw Object.assign(new Error("zstd logs are not supported by this runtime"), { code: "ZSTD_UNAVAILABLE" });
 }
 
-async function compressZstdBuffer(buf) {
-  try {
-    if (zstdCompressSync) return ZSTD_HEADER_OPTS ? zstdCompressSync(buf, ZSTD_HEADER_OPTS) : zstdCompressSync(buf);
-    if (zstdCompress) return Buffer.from(await zstdCompress(buf, ZSTD_HEADER_OPTS));
-  } catch (err) {
-    throw Object.assign(new Error(`could not encode session log: ${err instanceof Error ? err.message : String(err)}`), { code: "LOG_ENCODE_FAILED" });
-  }
-  throw Object.assign(new Error("zstd logs are not supported by this runtime"), { code: "ZSTD_UNAVAILABLE" });
-}
-
-function parseHeaderLine(line) {
-  try {
-    const value = JSON.parse(line);
-    return value && typeof value === "object" && !Array.isArray(value) ? value : null;
-  } catch {
-    return null;
-  }
-}
-
-// 宿主 v4 header 的合法字段集（见 dsh-session-persistence-jsonl 的 HEADER_KEYS）。
-// 旧版移动把 query 的 meta 直接写成 header，会丢掉 `type: "session"` 或混入
-// `title` 等额外字段，宿主校验失败后整份日志被判为 corrupt，打开即
-// `session/not-found`。迁移时按该白名单重整 header。
-const SESSION_HEADER_KEYS = new Set([
-  "type",
-  "version",
-  "id",
-  "createdAt",
-  "isSeeded",
-  "delegationDepth",
-  "cwd",
-  "parentSession",
-  "origin",
-  "agentPreset"
-]);
-
-/** 只保留宿主允许的 header 字段，并补回旧版丢失的 `type`。 */
-function sanitizeHeader(header) {
-  const out = {};
-  for (const key of Object.keys(header)) {
-    if (SESSION_HEADER_KEYS.has(key)) out[key] = header[key];
-  }
-  if (out.type !== "session") out.type = "session";
-  return out;
-}
-
 /** 在会话目录里找日志文件（`session.v4.jsonl.zstd` / 明文测试桩同名文件）。 */
 function findLogFile(dir) {
   let names;
@@ -224,11 +168,6 @@ function splitLogText(text) {
   const index = text.indexOf("\n");
   if (index === -1) return { firstLine: text, rest: "" };
   return { firstLine: text.slice(0, index), rest: text.slice(index + 1) };
-}
-
-function countEvents(rest) {
-  if (rest === "") return 0;
-  return rest.split("\n").filter((line) => line.trim() !== "").length;
 }
 
 /**
@@ -251,123 +190,6 @@ async function readLogText(dir) {
   return { file, compressed: true, text, scan, buf };
 }
 
-/** 统计一份多帧 zstd 日志里的事件行数（首帧的首行是 header，不算事件）。 */
-async function countZstdEvents(buf, frames) {
-  let count = 0;
-  for (let index = 0; index < frames.length; index += 1) {
-    const frame = frames[index];
-    const text = (await decompressZstdBuffer(buf.subarray(frame.start, frame.end))).toString("utf8");
-    const lines = text.split("\n");
-    for (let line = index === 0 ? 1 : 0; line < lines.length; line += 1) {
-      if (lines[line].trim() !== "") count += 1;
-    }
-  }
-  return count;
-}
-
-function parseHeaderOrThrow(line, nextHeader) {
-  const header = parseHeaderLine(line);
-  if (!header || header.id !== nextHeader.id) {
-    throw Object.assign(new Error("source log header does not match the session being moved"), { code: "LOG_VERIFY_FAILED" });
-  }
-  return header;
-}
-
-/**
- * 把源目录里的日志写到目标目录，只改写 header 的 cwd。
- *
- * zstd 日志按「帧」处理：仅重新压缩首帧（header），首帧之后的所有字节
- * 原样拼接。宿主日志是多帧拼接，Node 的 zstd 解压只看首帧；旧的
- * 「整段解压再压缩」会把首帧之后的事件全部丢掉。
- *
- * 明文 JSONL（测试桩 / 旧格式）仍按行处理。
- */
-async function relocateLog(sourceDir, targetDir, nextHeader) {
-  const sourceFile = findLogFile(sourceDir);
-  if (sourceFile === "") {
-    throw Object.assign(new Error(`session log not found in ${sourceDir}`), { code: "LOG_NOT_FOUND" });
-  }
-  const buf = await fsp.readFile(sourceFile);
-  const targetFile = path.join(targetDir, path.basename(sourceFile));
-  await fsp.mkdir(targetDir, { recursive: true, mode: 0o700 });
-
-  if (!isZstdBuffer(buf)) {
-    const text = buf.toString("utf8");
-    const { firstLine, rest } = splitLogText(text);
-    const header = parseHeaderOrThrow(firstLine, nextHeader);
-    const eventCount = countEvents(rest);
-    const nextHeaderObj = Object.assign(sanitizeHeader(header), { cwd: nextHeader.cwd });
-    const data = Buffer.from(JSON.stringify(nextHeaderObj) + "\n" + rest, "utf8");
-    await fsp.writeFile(targetFile, data, { mode: 0o600 });
-    const verify = splitLogText(fs.readFileSync(targetFile, "utf8"));
-    const verifyHeader = parseHeaderLine(verify.firstLine);
-    if (!verifyHeader || verifyHeader.id !== nextHeader.id
-      || verifyHeader.type !== "session"
-      || normalizePathKey(verifyHeader.cwd) !== normalizePathKey(nextHeader.cwd)
-      || verify.rest !== rest) {
-      throw Object.assign(new Error("moved log did not verify at the target workspace"), { code: "LOG_VERIFY_FAILED" });
-    }
-    return { file: targetFile, header: nextHeaderObj, eventCount, compressed: false, frames: 0, bytes: data.length };
-  }
-
-  // ---- zstd：只重写首帧，保留其余所有帧的字节 ----
-  const scan = scanZstdFrames(buf);
-  if (scan.frames.length === 0 || scan.tornStart !== undefined) {
-    throw Object.assign(new Error("source session log has an invalid Zstandard frame layout"), { code: "LOG_FORMAT_INVALID" });
-  }
-  const frames = scan.frames;
-  const first = frames[0];
-  const firstText = (await decompressZstdBuffer(buf.subarray(first.start, first.end))).toString("utf8");
-  const firstLines = firstText.split("\n");
-  const header = parseHeaderOrThrow(firstLines[0] || "", nextHeader);
-  const nextHeaderObj = Object.assign(sanitizeHeader(header), { cwd: nextHeader.cwd });
-  const tail = buf.subarray(first.end);
-
-  // 兼容旧错误实现：若首帧里还被塞进了事件行，把它们单独成帧，避免丢弃。
-  const salvage = firstLines.slice(1).filter((line) => line.trim() !== "");
-  const salvageFrames = [];
-  for (const line of salvage) {
-    salvageFrames.push(await compressZstdBuffer(Buffer.from(line + "\n", "utf8")));
-  }
-
-  const sourceEventCount = await countZstdEvents(buf, frames);
-  const newFrame0 = await compressZstdBuffer(Buffer.from(JSON.stringify(nextHeaderObj) + "\n", "utf8"));
-  const data = Buffer.concat([newFrame0, ...salvageFrames, tail]);
-  await fsp.writeFile(targetFile, data, { mode: 0o600 });
-
-  // 读回校验：帧结构合法、首帧 header 正确、尾帧字节完全一致、事件数不减。
-  const verifyBuf = fs.readFileSync(targetFile);
-  const verify = scanZstdFrames(verifyBuf);
-  const expectedFrames = 1 + salvageFrames.length + (frames.length - 1);
-  if (verify.frames.length === 0 || verify.tornStart !== undefined || verify.frames.length !== expectedFrames) {
-    throw Object.assign(new Error("moved log frame layout did not verify"), { code: "LOG_VERIFY_FAILED" });
-  }
-  const verifyHeader = parseHeaderLine(
-    (await decompressZstdBuffer(verifyBuf.subarray(verify.frames[0].start, verify.frames[0].end))).toString("utf8").split("\n")[0]
-  );
-  if (!verifyHeader || verifyHeader.id !== nextHeader.id
-    || verifyHeader.type !== "session"
-    || normalizePathKey(verifyHeader.cwd) !== normalizePathKey(nextHeader.cwd)) {
-    throw Object.assign(new Error("moved log header did not verify at the target workspace"), { code: "LOG_VERIFY_FAILED" });
-  }
-  if (tail.length > 0 && !verifyBuf.subarray(verifyBuf.length - tail.length).equals(tail)) {
-    throw Object.assign(new Error("moved log tail bytes changed"), { code: "LOG_VERIFY_FAILED" });
-  }
-  const eventCount = await countZstdEvents(verifyBuf, verify.frames);
-  if (eventCount !== sourceEventCount) {
-    throw Object.assign(new Error(`moved log lost events: ${sourceEventCount} -> ${eventCount}`), { code: "LOG_VERIFY_FAILED" });
-  }
-  return {
-    file: targetFile,
-    header: nextHeaderObj,
-    eventCount,
-    compressed: true,
-    frames: verify.frames.length,
-    salvaged: salvage.length,
-    bytes: data.length
-  };
-}
-
 /** 校验目录里的日志首行 header.id 是否就是目标会话（防止误删/误恢复同目录的其他日志）。 */
 async function logBelongsTo(dir, sessionId) {
   try {
@@ -377,17 +199,6 @@ async function logBelongsTo(dir, sessionId) {
   } catch {
     return false;
   }
-}
-
-function firstStackLine(err) {
-  const stack = err && typeof err.stack === "string" ? err.stack : "";
-  if (stack === "") return "";
-  return stack.split("\n")[0] || "";
-}
-
-function errorCodeOf(err) {
-  const code = err && typeof err.code === "string" ? err.code : "";
-  return /^[A-Z][A-Z0-9_]*$/.test(code) ? code : "";
 }
 
 export function createSessionManager(ctx, options) {
@@ -755,7 +566,7 @@ export function createSessionManager(ctx, options) {
 
   /**
    * 会话管理快照。
-   * `lean` 只用于侧栏菜单的即时可用性判断（工作区 / canMove），
+   * `lean` 用于跳过逐条正文统计（只返回工作区与会话基础字段）。
    * 跳过模型、消息数等需要折叠日志的补充字段，避免菜单打开时等待。
    */
   async function payload(options) {
@@ -774,7 +585,6 @@ export function createSessionManager(ctx, options) {
         trash: { count: 0, bytes: 0, entries: [] },
         trashedIds: [],
         purgedIds: [],
-        canMove: false,
         canReset: false
       };
     }
@@ -809,7 +619,6 @@ export function createSessionManager(ctx, options) {
         sessions: [],
         workspaces: wsList,
         trash: { count: 0, bytes: 0, entries: await readTrashEntries().catch(() => []) },
-        canMove: false,
         canReset: false
       };
     }
@@ -885,7 +694,6 @@ export function createSessionManager(ctx, options) {
       },
       trashedIds: trashEntries.map((entry) => entry.id),
       purgedIds,
-      canMove: typeof sp.stat === "function",
       canReset: true
     };
   }
@@ -929,47 +737,6 @@ export function createSessionManager(ctx, options) {
 
   function insideRoot(root, dir) {
     return isContainedPath(root, dir) && normalizePathKey(root) !== normalizePathKey(dir);
-  }
-
-  /**
-   * 宿主内存里若仍保留移动前的 header.cwd，`locate` 会指向已不存在的旧目录；
-   * 这时按目录名（宿主启动扫描的同一套编码）在根下扫一遍，找到真正的源目录。
-   */
-  function findSessionDirOnDisk(root, sessionId) {
-    let projectDirs;
-    try {
-      projectDirs = fs.readdirSync(root, { withFileTypes: true });
-    } catch {
-      return "";
-    }
-    const leaf = path.basename(sessionDirOf(root, root, sessionId));
-    for (const entry of projectDirs) {
-      if (!entry.isDirectory()) continue;
-      const candidate = path.join(root, entry.name, leaf);
-      if (isDirectory(candidate)) return candidate;
-    }
-    return "";
-  }
-
-  /** 把源会话目录里除日志以外的附属文件复制到新目录（日志已按帧原样迁移）。 */
-  async function copyArtifacts(sourceDir, targetDir) {
-    let dirents;
-    try {
-      dirents = await fsp.readdir(sourceDir, { withFileTypes: true });
-    } catch {
-      return;
-    }
-    for (const dirent of dirents) {
-      if (dirent.name.startsWith("session.v") && dirent.name.includes(".jsonl")) continue;
-      const from = path.join(sourceDir, dirent.name);
-      const to = path.join(targetDir, dirent.name);
-      if (!isContainedPath(sourceDir, from) || !isContainedPath(targetDir, to)) continue;
-      try {
-        await fsp.cp(from, to, { recursive: dirent.isDirectory(), force: true, errorOnExist: false });
-      } catch (err) {
-        warn(`could not copy session artifact "${dirent.name}": ${err instanceof Error ? err.message : String(err)}`);
-      }
-    }
   }
 
   // -------------------------------------------------------------------------
@@ -1056,41 +823,7 @@ export function createSessionManager(ctx, options) {
   }
 
   /**
-   * 把宿主内存里的 live 会话对象与持久化层的写状态重定向到新 cwd。
-   * 宿主的 `workspaceRegistry.readSessionHeader()` 会优先读 live header；
-   * 若不改，attachSession 会因为 cwd 仍指向源工作区而拒绝。
-   */
-  function redirectLiveSession(sessionId, header, workspacePath) {
-    const sessions = service("sessions");
-    let live = false;
-    let object = null;
-    try {
-      if (sessions && typeof sessions.get === "function") object = sessions.get(sessionId) || null;
-    } catch {
-      object = null;
-    }
-    if (object) {
-      live = true;
-      try { object.header = header; } catch { /* ignore */ }
-      try { object.meta = header; } catch { /* ignore */ }
-      try { object.cwd = workspacePath; } catch { /* ignore */ }
-    }
-    const sp = persistence();
-    let state = false;
-    try {
-      const entry = sp && sp.states && typeof sp.states.get === "function" ? sp.states.get(sessionId) : null;
-      if (entry && entry.meta && typeof entry.meta === "object") {
-        entry.meta = Object.assign({}, entry.meta, { cwd: workspacePath });
-        state = true;
-      }
-    } catch {
-      /* 旧宿主没有 states：只靠 live 对象本身 */
-    }
-    return { live, state, object };
-  }
-
-  /**
-   * 宿主的工作区索引是启动时扫描建立的。移动后主动触发它的重建入口，
+   * 宿主的工作区索引是启动时扫描建立的。恢复后主动触发它的重建入口，
    * 把 headers / sessionPaths / missingSessionPaths 全部按磁盘现状重算。
    */
   async function refreshRegistryIndex() {
@@ -1110,17 +843,6 @@ export function createSessionManager(ctx, options) {
     return false;
   }
 
-  /** 用宿主自己的 `stat` 读回磁盘 header，作为「宿主确实能定位到该会话」的证据。 */
-  async function statHeaderOf(sp, sessionId) {
-    try {
-      if (!sp || typeof sp.stat !== "function") return null;
-      const snapshot = await sp.stat(sessionId);
-      return snapshot && snapshot.header ? snapshot.header : null;
-    } catch {
-      return null;
-    }
-  }
-
   async function unarchive(sessionId) {
     const serviceValue = registry();
     if (!serviceValue || typeof serviceValue.unarchiveSession !== "function") return;
@@ -1136,14 +858,6 @@ export function createSessionManager(ctx, options) {
       if (record && record.header && record.header.id === id) return record;
     }
     return null;
-  }
-
-  /** 宿主写句柄已被占用（会话在 UI 中打开）。这不阻止目录迁移，只影响写入声明。 */
-  function isOwnershipConflict(err) {
-    if (!err) return false;
-    if (err.name === "SessionAlreadyOwnedError") return true;
-    if (err.code === "SESSION_OWNED" || err.code === "SESSION_LIVE") return true;
-    return /already owned by an active write handle/i.test(String(err.message || ""));
   }
 
   // -------------------------------------------------------------------------
@@ -1372,321 +1086,6 @@ export function createSessionManager(ctx, options) {
     return { results };
   }
 
-  // -------------------------------------------------------------------------
-  // 移动到其他工作区
-  // -------------------------------------------------------------------------
-
-  async function move(sessionId, workspaceId) {
-    const sp = persistence();
-    const queryService = query();
-    const root = sessionRoot();
-    const serviceValue = registry();
-    if (!sp || !queryService || root === "" || !serviceValue) {
-      return { ok: false, error: "MOVE_UNAVAILABLE" };
-    }
-    const target = serviceValue.get(workspaceId);
-    if (!target || typeof target.path !== "string") return { ok: false, error: "WORKSPACE_NOT_FOUND" };
-    if (!isDirectory(target.path)) return { ok: false, error: "WORKSPACE_MISSING" };
-    // 列表是「live + 磁盘」的合并结果，可能因为宿主内存里的旧 header 与磁盘
-    // 不一致而失败，也可能暂时漏掉刚移动过的会话。因此列表只作首选，
-    // 找不到时回退到宿主自己的 stat / readSession，避免误报「目标消息不存在」。
-    let records = null;
-    try {
-      records = await queryService.listSessions();
-    } catch (err) {
-      warn(`could not list sessions before move: ${err instanceof Error ? err.message : String(err)}`);
-    }
-    let record = records ? recordOf(records, sessionId) : null;
-    let header = record && record.header ? record.header : null;
-    if (!header) header = await statHeaderOf(sp, sessionId);
-    if (!header && typeof queryService.readSession === "function") {
-      try {
-        const read = await queryService.readSession(sessionId, 0);
-        if (read && read.meta && typeof read.meta === "object") header = read.meta;
-      } catch {
-        /* fall through */
-      }
-    }
-    if (!header) return { ok: false, error: "TARGET_NOT_FOUND" };
-    // 只拒绝「正在生成回复」的会话。仅在 UI 中打开（live）的会话允许移动：
-    // 移动迁移的是磁盘目录，不依赖宿主的写句柄。
-    if ((record && record.running === true) || runningSet().has(sessionId)) {
-      return { ok: false, error: "SESSION_RUNNING" };
-    }
-    const canonical = normalizePathKey(target.path);
-    if (normalizePathKey(header.cwd) === canonical && isDirectory(locatedDir(sp, header, root))) {
-      return { ok: true, moved: false, already: true };
-    }
-
-    const workspaceList = workspaces();
-    const sourceWorkspace = workspaceOf(header.cwd, sessionId, workspaceList);
-    let nextHeader = Object.assign({}, header, { cwd: target.path });
-    let sourceDir = locatedDir(sp, header, root);
-    // 目标目录也走宿主的 locate（它和启动扫描、打开会话用的是同一套编码）。
-    // 只有旧宿主没有 locate 时才回退到本插件的命名约定。
-    const locatedTargetPath = locateLogPath(sp, nextHeader);
-    let targetDir = locatedTargetPath !== "" ? path.dirname(locatedTargetPath) : "";
-    if (targetDir === "" || !insideRoot(root, targetDir)) {
-      targetDir = sessionDirOf(root, target.path, sessionId);
-    }
-    let stage = "prepare";
-    let claim = null;
-    let backupDir = "";
-    let staging = "";
-    let movedSource = false;
-    let wroteTarget = false;
-    let attached = false;
-    let redirect = { live: false, state: false };
-    try {
-      // 目标目录已被同名会话占用：先检查再动源目录，避免覆盖别人的会话。
-      if (fs.existsSync(targetDir)) {
-        throw Object.assign(new Error(`target session directory already exists: ${targetDir}`), { code: "TARGET_EXISTS" });
-      }
-
-      try {
-        claim = await sp.open(sessionId, "write");
-        await claim.close();
-        claim = null;
-      } catch (err) {
-        if (!isOwnershipConflict(err)) throw err;
-        // 会话在 UI 中打开、宿主持有写句柄：跳过写声明，直接迁移目录。
-        // 与删除路径一致：写声明只保护日志追加，不阻止目录迁移。
-      }
-
-      stage = "locate";
-      sourceDir = locatedDir(sp, header, root);
-      if (!isDirectory(sourceDir)) {
-        const scanned = findSessionDirOnDisk(root, sessionId);
-        if (scanned !== "") sourceDir = scanned;
-      }
-      if (!insideRoot(root, sourceDir)) {
-        throw Object.assign(new Error(`source session path is outside the session root: ${sourceDir}`), { code: "SOURCE_OUTSIDE_ROOT" });
-      }
-      if (!isDirectory(sourceDir)) {
-        throw Object.assign(new Error(`source session directory is missing: ${sourceDir}`), { code: "LOG_NOT_FOUND" });
-      }
-
-      stage = "stage";
-      const trash = await ensureTrashRoot();
-      staging = path.join(trash, STAGING_PREFIX + randomUUID());
-      if (!isContainedPath(trash, staging)) {
-        throw Object.assign(new Error("staging path is outside the trash root"), { code: "INTERNAL" });
-      }
-      await fsp.mkdir(staging, { recursive: true, mode: 0o700 });
-      backupDir = path.join(staging, TRASH_SESSION_DIR);
-
-      stage = "move-source";
-      await moveDirectory(sourceDir, backupDir);
-      movedSource = true;
-
-      // 不调用 sp.create（live 会话会抛 SessionAlreadyExistsError）：只重写日志
-      // 首帧的 header.cwd，首帧之后的事件字节原样保留。
-      stage = "write-target";
-      wroteTarget = true;
-      const relocated = await relocateLog(backupDir, targetDir, nextHeader);
-      nextHeader = relocated.header;
-
-      stage = "copy-artifacts";
-      await copyArtifacts(backupDir, targetDir);
-
-      // 源工作区先摘除，再重定向 live 状态，最后挂到目标并刷新宿主索引。
-      stage = "index";
-      for (const entity of serviceValue.list()) {
-        if (!entity || !Array.isArray(entity.sessionIds) || !entity.sessionIds.includes(sessionId)) continue;
-        try {
-          await entity.detachSession(sessionId);
-        } catch {
-          /* ignore */
-        }
-      }
-      // 必须在 attachSession 之前改：宿主的 readSessionHeader() 会优先读 live header。
-      redirect = redirectLiveSession(sessionId, nextHeader, target.path);
-      const attachSupported = typeof target.attachSession === "function";
-      attached = await attachToWorkspace(sessionId, nextHeader, target.path);
-      if (attachSupported && !attached) {
-        throw Object.assign(new Error(`workspace did not accept the moved session: ${target.path}`), { code: "INDEX_ATTACH_FAILED" });
-      }
-      const indexRefreshed = await refreshRegistryIndex();
-
-      // 用宿主自己的 stat 走一遍它打开会话时的查找路径，确认磁盘 header 与索引一致。
-      const persisted = await statHeaderOf(sp, sessionId);
-      if (!persisted || persisted.id !== sessionId || normalizePathKey(persisted.cwd) !== canonical) {
-        throw Object.assign(new Error("host could not locate the moved session after relocation"), { code: "LOG_VERIFY_FAILED" });
-      }
-      const targetMember = Array.isArray(target.sessionIds) ? target.sessionIds.includes(sessionId) : null;
-      let sourceStillMember = false;
-      if (sourceWorkspace && typeof serviceValue.get === "function") {
-        const sourceEntity = serviceValue.get(sourceWorkspace.id);
-        sourceStillMember = !!(sourceEntity && Array.isArray(sourceEntity.sessionIds)
-          && sourceEntity.sessionIds.includes(sessionId));
-      }
-
-      stage = "cleanup";
-      let backupCleaned = true;
-      try {
-        await fsp.rm(backupDir, { recursive: true, force: true });
-      } catch (err) {
-        backupCleaned = false;
-        warn(`moved session "${sessionId}" but could not remove backup "${backupDir}": ${err instanceof Error ? err.message : String(err)}`);
-      }
-      await fsp.rm(staging, { recursive: true, force: true }).catch(() => {});
-      forgetTitle(sessionId);
-      const evidence = {
-        sourceDir,
-        targetDir,
-        locatedTargetPath: locateLogPath(sp, nextHeader),
-        headerCwd: nextHeader.cwd,
-        diskHeaderCwd: persisted.cwd,
-        sessionPaths: serviceValue.sessionPaths && typeof serviceValue.sessionPaths.get === "function"
-          ? serviceValue.sessionPaths.get(sessionId)
-          : null,
-        targetMember,
-        sourceStillMember,
-        indexWritten: attached,
-        indexRefreshed,
-        live: redirect.live,
-        liveStateRedirected: redirect.state,
-        eventCount: relocated.eventCount,
-        frames: relocated.frames,
-        salvaged: relocated.salvaged,
-        compressed: relocated.compressed
-      };
-      // 把每一环的实际值写进日志，便于真机取证。
-      warn(`move evidence: ${JSON.stringify(evidence)}`);
-      return {
-        ok: true,
-        moved: true,
-        sessionId,
-        workspaceId,
-        workspaceTitle: typeof target.title === "string" ? target.title : target.path,
-        sourceWorkspaceId: sourceWorkspace ? sourceWorkspace.id : "",
-        sourceDir,
-        targetDir,
-        headerCwd: nextHeader.cwd,
-        eventCount: relocated.eventCount,
-        compressed: relocated.compressed,
-        frames: relocated.frames,
-        salvaged: relocated.salvaged,
-        indexWritten: attached,
-        indexRefreshed,
-        backupCleaned,
-        evidence,
-        // live 对象或写状态没能重定向时，后续追加写仍可能落到旧路径：提示重启。
-        restartRequired: !attached || (redirect.live && !redirect.state)
-      };
-    } catch (err) {
-      if (claim) {
-        try {
-          await claim.close();
-        } catch {
-          /* ignore */
-        }
-      }
-      stage = stage || "unknown";
-      let rollbackError = "";
-      if (movedSource && backupDir !== "") {
-        // 清掉本次已经生成的目标日志，再把原目录放回原处。
-        if (wroteTarget) {
-          try {
-            await fsp.rm(targetDir, { recursive: true, force: true });
-          } catch (cleanupError) {
-            rollbackError = cleanupError instanceof Error ? cleanupError.message : String(cleanupError);
-            warn(`could not remove partially written target "${targetDir}": ${rollbackError}`);
-          }
-        }
-        try {
-          if (isDirectory(backupDir)) {
-            await fsp.mkdir(path.dirname(sourceDir), { recursive: true, mode: 0o700 });
-            await moveDirectory(backupDir, sourceDir);
-          }
-        } catch (restoreError) {
-          rollbackError = restoreError instanceof Error ? restoreError.message : String(restoreError);
-          warn(`could not roll back moved session "${sessionId}": ${rollbackError}`);
-        }
-        // 索引与 live 状态也要一起回滚，避免「文件恢复了、分组却还挂在目标工作区」。
-        try {
-          if (attached && typeof target.detachSession === "function") {
-            await target.detachSession(sessionId);
-          }
-        } catch {
-          /* ignore */
-        }
-        try {
-          const sourcePath = sourceWorkspace && typeof sourceWorkspace.path === "string"
-            ? sourceWorkspace.path
-            : header.cwd;
-          redirectLiveSession(sessionId, header, sourcePath);
-          await attachToWorkspace(sessionId, header, sourcePath);
-          await refreshRegistryIndex();
-        } catch (indexError) {
-          const text = indexError instanceof Error ? indexError.message : String(indexError);
-          rollbackError = rollbackError === "" ? text : `${rollbackError}; ${text}`;
-          warn(`could not roll back session index "${sessionId}": ${text}`);
-        }
-      }
-      if (staging !== "") await fsp.rm(staging, { recursive: true, force: true }).catch(() => {});
-      const detail = {
-        sessionId,
-        workspaceId,
-        workspaceTitle: typeof target.title === "string" ? target.title : target.path,
-        sourceWorkspaceId: sourceWorkspace ? sourceWorkspace.id : "",
-        sourceDir,
-        targetDir,
-        stage,
-        name: err && err.name ? err.name : "Error",
-        code: err && typeof err.code === "string" ? err.code : "",
-        message: err instanceof Error ? err.message : String(err),
-        stackLine: firstStackLine(err),
-        rollbackError
-      };
-      warn(`move failed: ${JSON.stringify(detail)}`);
-      return {
-        ok: false,
-        error: errorCodeOf(err) || "MOVE_FAILED",
-        message: detail.message,
-        detail
-      };
-    }
-  }
-
-  // -------------------------------------------------------------------------
-  // 批量操作（移动 / 归档）
-  // -------------------------------------------------------------------------
-
-  /**
-   * 批量移动：逐条独立执行，失败项不影响已成功项。
-   * 每条结果都带 ok 标志，便于前端汇总「成功 n / 失败 m」。
-   */
-  async function moveMany(ids, workspaceId) {
-    const results = [];
-    for (const id of ids) {
-      if (!isSessionId(id)) {
-        results.push(failureOf(id, "INVALID_REQUEST"));
-        continue;
-      }
-      let outcome;
-      try {
-        outcome = await move(id, workspaceId);
-      } catch (err) {
-        outcome = { ok: false, error: "MOVE_FAILED", message: err instanceof Error ? err.message : String(err) };
-      }
-      if (outcome && outcome.ok === true) {
-        results.push(resultOf(id, {
-          sessionId: id,
-          workspaceId,
-          workspaceTitle: outcome.workspaceTitle,
-          already: outcome.already === true,
-          restartRequired: outcome.restartRequired === true
-        }));
-      } else {
-        const failure = failureOf(id, (outcome && outcome.error) || "MOVE_FAILED", outcome && outcome.message);
-        if (outcome && outcome.detail) failure.detail = outcome.detail;
-        results.push(failure);
-      }
-    }
-    return { results };
-  }
-
   /**
    * 批量归档：逐条独立执行；已归档的会话视为成功（宿主归档是幂等的）。
    * 正在生成回复的会话按 SESSION_RUNNING 单独失败，其余继续。
@@ -1761,5 +1160,5 @@ export function createSessionManager(ctx, options) {
     }
   }
 
-  return { payload, removeToTrash, restore, purge, move, moveMany, archive, sweepStaging };
+  return { payload, removeToTrash, restore, purge, archive, unarchive, sweepStaging };
 }
