@@ -2656,6 +2656,12 @@ function pushTombstone(bag, plan, id, action) {
   ok("客户端：计费设置入口与来源诊断", /BILLING_ROUTE/.test(clientSrc) && /BillingSection/.test(clientSrc) &&
     /stats\.billingEndpoints/.test(clientSrc));
   ok("客户端：单条金额并入统计行", /words \+ " " \+ tt\("stats\.unit"\),[\s\S]{0,40}replyCost/.test(clientSrc));
+  ok("客户端：深色主题跟随宿主 body 属性",
+    /body\[data-ds-dark-theme\] \.dma-session-row-selected/.test(clientSrc) &&
+    /body\[data-ds-dark-theme\] \.dma-billing-kind\{/.test(clientSrc));
+  ok("客户端：深色告警徽标与浮层阴影有单独色值",
+    /body\[data-ds-dark-theme\] \.dma-session-badge-warn\{color:#f0a24a/.test(clientSrc) &&
+    /body\[data-ds-dark-theme\] \.dma-session-dialog\{box-shadow:0 16px 40px/.test(clientSrc));
 
   eq("文案：单条金额说明中文", i18n.zh["stats.replyCostTitle"], "本条回答估算 {cost}；同一轮的合计见侧边栏「单次」");
   ok("文案：单条金额说明中英均有", (i18nSrc.match(/'stats\.replyCostTitle':/g) || []).length === 2 &&

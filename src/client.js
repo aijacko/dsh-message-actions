@@ -5223,6 +5223,28 @@ window.__ModuleLoader__.load({
 .dma-stats-pill-local{background:rgba(255,255,255,.1);color:#b9c0ca}
 .dma-stats-pill-unpriced,.dma-stats-pill-unconfirmed{background:rgba(217,164,65,.22);color:#f0c06a}
 }
+/* 宿主手动切换主题时以 <body data-ds-dark-theme> 为准（媒体查询只兜底系统深色）。 */
+body[data-ds-dark-theme] .dma-cost-peak .dma-cost-period-text{color:#f0a24a}
+body[data-ds-dark-theme] .dma-cost-valley .dma-cost-period-text{color:#8fb8ff}
+body[data-ds-dark-theme] .dma-cost-spinner{border-color:rgba(255,255,255,.18)}
+body[data-ds-dark-theme] .dma-billing-ok{color:#4ecb8d}
+body[data-ds-dark-theme] .dma-billing-error{color:#ff8585}
+body[data-ds-dark-theme] .dma-billing-kind{background:rgba(110,160,255,.2);color:#9cc0ff}
+body[data-ds-dark-theme] .dma-billing-kind-local,
+body[data-ds-dark-theme] .dma-billing-kind-price-unconfigured{background:rgba(255,255,255,.1);color:#b9c0ca}
+body[data-ds-dark-theme] .dma-billing-kind-third,
+body[data-ds-dark-theme] .dma-billing-kind-price-estimated{background:rgba(217,164,65,.24);color:#f0c06a}
+body[data-ds-dark-theme] .dma-billing-kind-price-custom{background:rgba(78,203,141,.2);color:#68d9a4}
+body[data-ds-dark-theme] .dma-stats-pill{background:rgba(110,160,255,.2);color:#9cc0ff}
+body[data-ds-dark-theme] .dma-stats-pill-running{background:rgba(78,203,141,.2);color:#68d9a4}
+body[data-ds-dark-theme] .dma-stats-pill-local{background:rgba(255,255,255,.1);color:#b9c0ca}
+body[data-ds-dark-theme] .dma-stats-pill-unpriced,
+body[data-ds-dark-theme] .dma-stats-pill-unconfirmed{background:rgba(217,164,65,.22);color:#f0c06a}
+/* 深色下选中行、告警徽标与浮层阴影需要单独提亮/加深，避免和宿主的深底同色。 */
+body[data-ds-dark-theme] .dma-session-row-selected{background:rgba(110,160,255,.14)}
+body[data-ds-dark-theme] .dma-session-badge-warn{color:#f0a24a;box-shadow:inset 0 0 0 .5px #f0a24a}
+body[data-ds-dark-theme] .dma-session-menu{box-shadow:0 12px 28px rgba(0,0,0,.55)}
+body[data-ds-dark-theme] .dma-session-dialog{box-shadow:0 16px 40px rgba(0,0,0,.6)}
 @media (max-width:680px){
 .dma-stats-panel{width:calc(100vw - 24px)}
 .dma-stats-body{padding:12px 14px;gap:12px}
