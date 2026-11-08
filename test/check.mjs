@@ -2652,6 +2652,15 @@ function pushTombstone(bag, plan, id, action) {
   const indexSrc = fs.readFileSync(path.join(root, "src", "index.mjs"), "utf8");
   const clientSrc = fs.readFileSync(path.join(root, "src", "client.js"), "utf8");
   const i18nSrc = fs.readFileSync(path.join(root, "src", "i18n.cjs"), "utf8");
+  const storeSrc = fs.readFileSync(path.join(root, "src", "store.cjs"), "utf8");
+
+  ok("安全：客户端不使用浏览器持久化存储",
+    !/localStorage|sessionStorage|document\.cookie|indexedDB/i.test(clientSrc));
+  ok("安全：状态文件结构与凭据字段无关",
+    !/apiKey|api_key|password|secret|credential/i.test(storeSrc));
+  ok("安全：禁用插件时卸载浮层并保留用户设置",
+    /statsRoot\.unmount\(\)/.test(clientSrc) &&
+    /费用状态文件属于用户设置/.test(clientSrc));
 
   ok("宿主：附件路由常量", /const ATTACHMENT_ROUTE = "\/dsh-message-actions\/attachment"/.test(indexSrc));
   ok("宿主：附件处理器存在", /function makeAttachmentHandler\(ctx\)/.test(indexSrc));

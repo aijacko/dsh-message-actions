@@ -1909,6 +1909,7 @@ window.__ModuleLoader__.load({
       '<path d="M13 8a5 5 0 1 1-1.6-3.7M13 2.6V5.4h-2.8" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>';
 
     let statsHost = null;
+    let statsRoot = null;
     let statsOpener = null;
     const statsStore = createStore({ open: false, seq: 0 });
 
@@ -1920,7 +1921,8 @@ window.__ModuleLoader__.load({
         statsHost = document.createElement("div");
         statsHost.className = "dma-stats-root";
         document.body.appendChild(statsHost);
-        ReactDOMClient.createRoot(statsHost).render(e(StatsOverlay));
+        statsRoot = ReactDOMClient.createRoot(statsHost);
+        statsRoot.render(e(StatsOverlay));
       }
       const snapshot = statsStore.getSnapshot();
       statsStore.set({ open: true, seq: snapshot.seq + 1 });
@@ -5540,7 +5542,18 @@ body[data-ds-dark-theme] .dma-session-dialog{box-shadow:0 16px 40px rgba(0,0,0,.
         stopLive();
         stopHiddenRows();
         stopCostPolling();
+        // 插件禁用/退出：卸载命令式创建的浮层与 React 根，避免 DOM 残留与内存引用。
+        // 费用状态文件属于用户设置（预算 / 价格表 / 消费记录），不含任何密钥或凭据，保留不动。
+        if (statsRoot) {
+          try { statsRoot.unmount(); } catch { /* ignore */ }
+          statsRoot = null;
+        }
+        if (statsHost) {
+          statsHost.remove();
+          statsHost = null;
+        }
         if (typeof document !== "undefined") {
+          document.querySelectorAll(".dma-session-dialog-layer").forEach((node) => node.remove());
           document.querySelectorAll("[data-dma-actions]").forEach((node) => disposeActionsRow(node));
           // 工具行按钮是命令式创建的，卸载时要一并移除（含可能的 React 图标根）。
           document.querySelectorAll("[data-dma-tool-actions]").forEach((node) => disposeActionsRow(node));
