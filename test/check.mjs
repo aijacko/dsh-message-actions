@@ -1319,8 +1319,8 @@ function fakeRes() {
   ok("i18n en 非空", enKeys.length > 50);
   eq("i18n meta.zh.title 为显示名", i18n.meta.zh.title, "消息管家");
   eq("i18n meta.en.title 为显示名", i18n.meta.en.title, "Message Butler");
-  eq("i18n meta.zh.description 按定稿原文", i18n.meta.zh.description, "功能：撤回、删除、删至末尾、多选分享与导出，会话管理与回收站，每条回答的用量计费、余额费用展示、对话完成声音提示等。");
-  eq("i18n meta.en.description 与中文同义", i18n.meta.en.description, "Features: recall, delete, delete-to-end, multi-select share and export; session management with a trash bin; per-reply usage billing, balance and cost display, and a completion sound.");
+  eq("i18n meta.zh.description 按定稿原文", i18n.meta.zh.description, "撤回、删除、删至末尾、多选分享与导出；会话管理（回收站、恢复、移动到其他工作区）；每条回答的用量计费、余额与费用展示、完成提示音。");
+  eq("i18n meta.en.description 与中文同义", i18n.meta.en.description, "Recall, delete, delete-to-end, and multi-select share/export; session management with trash, restore, and moving across workspaces; per-reply usage billing, balance and cost display, and a completion sound.");
   const iconSrc = fs.readFileSync(fileURLToPath(new URL("../icon.svg", import.meta.url)), "utf8");
   ok("插件图标：蓝底对话气泡内嵌三档滑块", /viewBox="0 0 64 64"/.test(iconSrc) &&
     iconSrc.includes('fill="#2563eb"') && iconSrc.includes("M23 23h18M23 30h18M23 37h18") &&
@@ -1356,6 +1356,19 @@ function fakeRes() {
   const rootDir = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
   const pkg = JSON.parse(fs.readFileSync(path.join(rootDir, "package.json"), "utf8"));
   const indexSource = fs.readFileSync(path.join(rootDir, "src", "index.mjs"), "utf8");
+  const market = JSON.parse(fs.readFileSync(path.join(rootDir, "market", "index.json"), "utf8"));
+  const entry = market.plugins.find((item) => item.name === pkg.name);
+
+  eq("市场索引：插件条目存在", Boolean(entry), true);
+  eq("市场索引：中文描述与 package.json 一致", entry.description.zh, pkg.description);
+  eq("市场索引：英文描述与 i18n 一致", entry.description.en, i18n.meta.en.description);
+  eq("市场索引：作者与 package.json 一致", entry.author, pkg.author);
+  eq("市场索引：仓库地址与 package.json 同源",
+    entry.repository.url.replace(/^git\+/, "").replace(/\.git$/, ""),
+    pkg.repository.url.replace(/^git\+/, "").replace(/\.git$/, ""));
+  ok("市场索引：版本列表只含已发布版本（当前版本高于列表最新）",
+    entry.versions.every((v) => v.publishTimestamp > 0) &&
+    entry.versions[0].version !== pkg.version);
 
   // 默认值与顺序：内部存储值仍为 compact / default，只改可见顺序与默认。
   eq("计费样式默认值为单行", DEFAULT_COST_LAYOUT, "compact");
