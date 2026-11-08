@@ -1,6 +1,6 @@
 # dsh-message-actions 自测清单与发布流程
 
-适用版本：**0.2.13**（设置页「消息操作」标签底部显示的版本号应与 `package.json` 一致）
+适用版本：**0.2.14**（设置页「消息操作」标签底部显示的版本号应与 `package.json` 一致）
 目标宿主：DeepSeek Harness 桌面版，profile `desktop`
 
 > 本文只描述验收与发布步骤，不包含任何已执行的发布操作。
@@ -190,13 +190,13 @@
    - 按本文 A–F 做真机抽测（至少覆盖删除到回收站、恢复、删除开关、异常兜底、深浅色、防重复提交）。
 
 3. **提交**
-   - 提交信息示例：`chore(release): 0.2.13`。
+   - 提交信息示例：`chore(release): 0.2.14`。
    - 确认工作树干净后再打 tag。
 
 4. **打 tag 并推送**
-   - `git tag v0.2.13`
+   - `git tag v0.2.14`
    - `git push origin main`
-   - `git push origin v0.2.13`
+   - `git push origin v0.2.14`
    - 注意：推送与发布均需人工确认后执行。
 
 5. **发布 npm**
@@ -209,7 +209,7 @@
    - 在 `market/index.json` 的 `versions` 数组**头部**插入：
      ```json
      {
-       "version": "0.2.13",
+       "version": "0.2.14",
        "publishTimestamp": <epoch 秒>,
        "source": { "type": "npm" }
      }
@@ -218,8 +218,8 @@
    - 校验：市场里的 `version` 与 npm 最新版本一致，`publishTimestamp` 与 npm 时间一致。
 
 7. **GitHub Release**
-   - 准备 `release-notes/v0.2.13.md`（UTF-8、无 BOM）。
-   - 运行 `node scripts/release-notes.mjs v0.2.13 release-notes/v0.2.13.md`。
+   - 准备 `release-notes/v0.2.14.md`（UTF-8、无 BOM）。
+   - 运行 `node scripts/release-notes.mjs v0.2.14 release-notes/v0.2.14.md`。
    - 脚本会回读校验正文；确认中文没有变成 `?`。
    - Release 的 tag 必须与 npm 版本一致。
 
@@ -240,4 +240,4 @@
 
 | 日期 | 插件版本 | 宿主 / profile | 执行人 | A 构建 | B 消息 | C 会话 | D 费用 | E 主题 | F 异常 / 安全 | 结论 | 备注 |
 |---|---|---|---|---|---|---|---|---|---|---|---|
-|  | 0.2.13 | DSH / desktop |  |  |  |  |  |  |  |  |  |
+|  | 0.2.14 | DSH / desktop |  |  |  |  |  |  |  |  |  |
