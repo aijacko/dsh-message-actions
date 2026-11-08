@@ -35,6 +35,7 @@ const {
   costSwitches,
   createScheduler,
   createRequestGate,
+  createWriteLock,
   collapseRail,
   isTombstone,
   textOf,
@@ -1172,6 +1173,20 @@ function bj(y, m, d, hh, mm) {
   ok("请求代际：再次发起后第二条过期", gate.isLatest(second) === false);
   ok("请求代际：第三条有效", gate.isLatest(third) === true);
   ok("请求代际：未知 token 拒绝", gate.isLatest(999) === false);
+}
+
+// ---------------------------------------------------------------------------
+// 36.1 写操作同步锁：第二次点击在状态更新前就被丢弃
+// ---------------------------------------------------------------------------
+
+{
+  const lock = createWriteLock();
+  ok("写锁：首次进入", lock.begin() === true);
+  ok("写锁：重复进入被拒", lock.begin() === false);
+  lock.end();
+  ok("写锁：释放后可再次进入", lock.begin() === true);
+  lock.end();
+  ok("写锁：释放后 busy 为 false", lock.busy === false);
 }
 
 // ---------------------------------------------------------------------------

@@ -2625,6 +2625,29 @@ function createRequestGate() {
   };
 }
 
+/**
+ * 写操作同步锁：begin() 在事件触发的同一 tick 占位，能挡住 React 重渲染前到达的第二次点击
+ * （仅靠 disabled / busy 状态在快速双击时仍可能重复提交）。
+ * 调用方必须在 finally 里 end()，任何提前 return 都不能漏放。
+ * @returns {{ begin: () => boolean, end: () => void, get busy(): boolean }}
+ */
+function createWriteLock() {
+  let busy = false;
+  return {
+    begin() {
+      if (busy) return false;
+      busy = true;
+      return true;
+    },
+    end() {
+      busy = false;
+    },
+    get busy() {
+      return busy;
+    }
+  };
+}
+
 /** HTML 转义（用于浮层内注入标题/正文）。 */
 function escapeHtml(value) {
   return String(value == null ? '' : value)
@@ -2782,6 +2805,7 @@ module.exports = {
   collapseRail,
   createScheduler,
   createRequestGate,
+  createWriteLock,
   escapeHtml,
   attachmentMediaType,
   MAX_BODY_BYTES,

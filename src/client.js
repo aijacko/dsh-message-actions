@@ -65,6 +65,7 @@ window.__ModuleLoader__.load({
       railTurnOfAttributes,
       createScheduler,
       createRequestGate,
+      createWriteLock,
       formatCents,
       formatYuanCents,
       formatCostMicros,
@@ -779,6 +780,7 @@ window.__ModuleLoader__.load({
         this.fetchedAt = 0; // 上次成功拉取快照的时间，用于 TTL 失效（避免永久缓存旧对话）
         this.hiddenTurns = new Set(); // 乐观隐藏的轮次（本地，用于导航与导出过滤）
         this.requestGate = createRequestGate(); // 丢弃后发先至的旧快照
+        this.writeLock = createWriteLock(); // 撤回 / 删除 / 删至末尾的单飞锁
         this.data = createStore({ messages: null, hidden: [] });
         this.overlay = createStore({ view: null });
       }
@@ -916,6 +918,15 @@ window.__ModuleLoader__.load({
       }
 
       async doAction(action, opts) {
+        if (!this.writeLock.begin()) return false;
+        try {
+          return await this.performAction(action, opts);
+        } finally {
+          this.writeLock.end();
+        }
+      }
+
+      async performAction(action, opts) {
         const body = { sessionId: this.sessionId, action };
         if (opts && opts.seq != null) body.seq = opts.seq;
         else if (opts && opts.messageId != null) body.messageId = opts.messageId;
@@ -1802,10 +1813,13 @@ window.__ModuleLoader__.load({
       const primaryLabel = mode === "share" ? t("pick.share") : t("pick.export");
       const primaryDisabled = chosen.length === 0;
       const [busy, setBusy] = React.useState(false);
+      const actionLock = React.useRef(createWriteLock());
 
       function primary() {
         // 与点击主按钮同一个处理函数；busy 期间忽略重复 Enter，避免重复生成 / 重复下载。
         if (primaryDisabled || busy) return;
+        // 同步锁兜住 React 重渲染前到达的第二次点击（分享会发请求、导出会重复下载）。
+        if (!actionLock.current.begin()) return;
         setBusy(true);
         const task = mode === "share" ? runShare(chosen) : runExport(chosen);
         Promise.resolve(task)
@@ -1820,6 +1834,9 @@ window.__ModuleLoader__.load({
           .catch(() => {
             showToast(t("toast.failed"));
             setBusy(false);
+          })
+          .finally(() => {
+            actionLock.current.end();
           });
       }
 
@@ -2187,6 +2204,7 @@ window.__ModuleLoader__.load({
       const [busy, setBusy] = React.useState(false);
       const [message, setMessage] = React.useState("");
       const [error, setError] = React.useState("");
+      const saveLock = React.useRef(createWriteLock());
       const endpoints = billing && Array.isArray(billing.endpoints) ? billing.endpoints : [];
 
       const save = async () => {
@@ -2203,6 +2221,7 @@ window.__ModuleLoader__.load({
           setError(tt("stats.billingInvalid"));
           return;
         }
+        if (!saveLock.current.begin()) return;
         setBusy(true);
         try {
           const res = await postJson(BILLING_ROUTE, { overrides: overridesText, prices });
@@ -2216,6 +2235,7 @@ window.__ModuleLoader__.load({
           setError(tt("stats.billingFailed"));
         } finally {
           setBusy(false);
+          saveLock.current.end();
         }
       };
 
@@ -2295,6 +2315,7 @@ window.__ModuleLoader__.load({
       const [budgetError, setBudgetError] = React.useState("");
       const alive = React.useRef(true);
       const budgetInit = React.useRef(false);
+      const budgetLock = React.useRef(createWriteLock());
 
       const load = React.useCallback(async () => {
         try {
@@ -2379,9 +2400,10 @@ window.__ModuleLoader__.load({
       );
 
       async function saveBudget() {
-        if (budgetBusy) return;
+        if (!budgetLock.current.begin()) return;
         const check = validateCorrectionAmount(budgetText);
         if (!check.ok) {
+          budgetLock.current.end();
           setBudgetError(tt("stats.budgetInvalid"));
           return;
         }
@@ -2399,6 +2421,7 @@ window.__ModuleLoader__.load({
         } catch {
           setBudgetError(tt("stats.budgetFailed"));
         } finally {
+          budgetLock.current.end();
           if (alive.current) setBudgetBusy(false);
         }
       }
@@ -3013,6 +3036,8 @@ window.__ModuleLoader__.load({
       const alive = React.useRef(true);
       const loadSeq = React.useRef(0);
       const menuRef = React.useRef(null);
+      // 所有会话写操作共享一把同步锁：快速双击时第二次点击在 enter 前就被丢弃。
+      const writeLock = React.useRef(createWriteLock());
 
       React.useEffect(() => () => {
         alive.current = false;
@@ -3278,6 +3303,8 @@ window.__ModuleLoader__.load({
        */
       async function runBulk(action, ids, targetWorkspace) {
         if (!ids || ids.length === 0) return;
+        if (!writeLock.current.begin()) return;
+        try {
         setMenu(null);
         setDialog(null);
         setBusy("bulk");
@@ -3334,6 +3361,9 @@ window.__ModuleLoader__.load({
         }
         setNotice({ ok: failedResults.length === 0, text });
         await load(true);
+        } finally {
+          writeLock.current.end();
+        }
       }
 
       function resultFailure(item, fallback) {
@@ -3363,6 +3393,8 @@ window.__ModuleLoader__.load({
 
       async function runDelete(row) {
         // 单条删除只进回收站（可恢复），不再要求输入 OK；批量删除才需要口令。
+        if (!writeLock.current.begin()) return;
+        try {
         setBusy(row.id);
         let message = "";
         let ok = false;
@@ -3385,9 +3417,14 @@ window.__ModuleLoader__.load({
           bumpSessionsRevision();
         }
         await load(true);
+        } finally {
+          writeLock.current.end();
+        }
       }
 
       async function runMove(row, target) {
+        if (!writeLock.current.begin()) return;
+        try {
         setBusy(row.id);
         let message = "";
         let ok = false;
@@ -3410,6 +3447,9 @@ window.__ModuleLoader__.load({
         setNotice({ ok, text: message });
         if (ok) bumpSessionsRevision();
         await load(true);
+        } finally {
+          writeLock.current.end();
+        }
       }
 
       /**
@@ -3418,6 +3458,8 @@ window.__ModuleLoader__.load({
        */
       async function runTrashRestore(trashIds) {
         if (!trashIds || trashIds.length === 0) return;
+        if (!writeLock.current.begin()) return;
+        try {
         const bulk = trashIds.length > 1;
         setBusy(bulk ? "trashBulk" : trashIds[0]);
         setDialog(null);
@@ -3463,6 +3505,9 @@ window.__ModuleLoader__.load({
         setNotice({ ok: failedResults.length === 0, text });
         bumpSessionsRevision();
         await load(true);
+        } finally {
+          writeLock.current.end();
+        }
       }
 
       async function runRestore(entry) {
@@ -3479,6 +3524,8 @@ window.__ModuleLoader__.load({
           setNotice({ ok: false, text: tt("sessions.purgeCodeWrong") });
           return;
         }
+        if (!writeLock.current.begin()) return;
+        try {
         setBusy(bulk ? "trashBulk" : trashIds[0]);
         let message = "";
         let ok = false;
@@ -3524,6 +3571,9 @@ window.__ModuleLoader__.load({
         setNotice({ ok: failedResults.length === 0, text: message });
         bumpSessionsRevision();
         await load(true);
+        } finally {
+          writeLock.current.end();
+        }
       }
 
       async function runPurgeAll() {
@@ -3531,6 +3581,8 @@ window.__ModuleLoader__.load({
           setNotice({ ok: false, text: tt("sessions.purgeCodeWrong") });
           return;
         }
+        if (!writeLock.current.begin()) return;
+        try {
         setBusy("purgeAll");
         let message = "";
         let ok = false;
@@ -3563,6 +3615,9 @@ window.__ModuleLoader__.load({
         setNotice({ ok, text: message });
         bumpSessionsRevision();
         await load(true);
+        } finally {
+          writeLock.current.end();
+        }
       }
 
       function renderBadges(row) {
