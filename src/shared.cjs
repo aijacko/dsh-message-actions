@@ -62,7 +62,8 @@ const ERROR_LABELS = {
     TRASH_CONFLICT: '原位置已存在同名会话，无法恢复',
     TRASH_LOG_MISSING: '会话日志已不存在，无法恢复',
     CONFIRM_REQUIRED: '需要二次确认',
-    INTERNAL: '内部错误'
+    INTERNAL: '内部错误',
+    NETWORK_ERROR: '无法连接宿主服务，请稍后重试'
   },
   en: {
     INVALID_REQUEST: 'Invalid request',
@@ -102,7 +103,8 @@ const ERROR_LABELS = {
     TRASH_CONFLICT: 'A session already exists at the original location',
     TRASH_LOG_MISSING: 'The session log no longer exists and cannot be restored',
     CONFIRM_REQUIRED: 'Confirmation is required',
-    INTERNAL: 'Internal error'
+    INTERNAL: 'Internal error',
+    NETWORK_ERROR: 'Cannot reach the host service. Please try again.'
   }
 };
 

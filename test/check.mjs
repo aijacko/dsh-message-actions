@@ -1263,6 +1263,36 @@ function fakeRes() {
 }
 
 // ---------------------------------------------------------------------------
+// 37.1 路由兜底：未预期异常收敛为 500 JSON，不穿透
+// ---------------------------------------------------------------------------
+
+{
+  const logs = [];
+  const guarded = http.guardedHandler(
+    async () => { throw new Error("boom"); },
+    { label: "test route", log: (message) => logs.push(message) }
+  );
+  const resF = fakeRes();
+  await guarded({}, resF);
+  eq("兜底：状态码 500", resF.status, 500);
+  eq("兜底：错误码 INTERNAL", JSON.parse(resF.body).error.code, "INTERNAL");
+  ok("兜底：错误日志保留", logs.length === 1 && logs[0].includes("test route") && logs[0].includes("boom"));
+
+  // 正常处理器不受影响
+  const resG = fakeRes();
+  await http.guardedHandler(async (_req, res) => http.sendJson(res, 200, { ok: true }))({}, resG);
+  eq("兜底：正常响应照常输出", resG.status, 200);
+
+  // 流式响应已写头后不能再写 JSON，只能销毁连接
+  const resH = fakeRes();
+  resH.headersSent = true;
+  resH.destroyed = false;
+  resH.destroy = () => { resH.destroyed = true; };
+  await http.guardedHandler(async () => { throw new Error("stream"); })({}, resH);
+  ok("兜底：已写头时销毁连接", resH.destroyed === true && resH.body === null);
+}
+
+// ---------------------------------------------------------------------------
 // 38. 本地化单一来源：zh / en 键一致，locale meta 与源码一致
 // ---------------------------------------------------------------------------
 
@@ -2198,8 +2228,8 @@ function pushTombstone(bag, plan, id, action) {
   eq("状态：非法预算回默认", store.normalizeCostState({ budgetCents: "abc" }).state.budgetCents, 500);
 
   // 宿主 / 客户端接线断言：路由、日志来源、入口位置与设置项。
-  ok("宿主：注册会话统计路由", /path: STATS_ROUTE/.test(indexSrc));
-  ok("宿主：预算路由", /path: STATS_BUDGET_ROUTE/.test(indexSrc));
+  ok("宿主：注册会话统计路由", /route\(STATS_ROUTE/.test(indexSrc));
+  ok("宿主：预算路由", /route\(STATS_BUDGET_ROUTE/.test(indexSrc));
   ok("宿主：复用官方 sessionQuery", /ctx\.get\("sessionQuery"\)/.test(indexSrc));
   ok("宿主：折叠复用共享纯函数", /foldSessionStats\(/.test(indexSrc) && /statsTimeline\(/.test(indexSrc));
   ok("宿主：结算按分类口径计价（默认计费 + 本地例外）",
@@ -2613,7 +2643,7 @@ function pushTombstone(bag, plan, id, action) {
   ok("宿主：附件处理器存在", /function makeAttachmentHandler\(ctx\)/.test(indexSrc));
   ok("宿主：图片走 readImage", /store\.readImage\(found\.ref\)/.test(indexSrc) && /typeof store\.readImage !== "function"/.test(indexSrc));
   ok("宿主：文件走 readFileStream", /store\.readFileStream\(found\.ref\)/.test(indexSrc) && /typeof store\.readFileStream !== "function"/.test(indexSrc));
-  ok("宿主：注册附件路由", /path: ATTACHMENT_ROUTE/.test(indexSrc));
+  ok("宿主：注册附件路由", /route\(ATTACHMENT_ROUTE/.test(indexSrc));
   ok("宿主：动作响应带回附件", /attachments: plan\.attachments \|\| \[\]/.test(indexSrc));
   ok("宿主：附件错误码已本地化", /ATTACHMENT_NOT_FOUND/.test(indexSrc) && /ATTACHMENT_UNAVAILABLE/.test(indexSrc) && /ATTACHMENT_READ_FAILED/.test(indexSrc));
 

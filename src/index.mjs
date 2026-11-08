@@ -14,7 +14,8 @@ const {
   sendBadRequest,
   sendForbidden,
   sendMethodNotAllowed,
-  readJsonBody
+  readJsonBody,
+  guardedHandler
 } = http;
 
 const {
@@ -1749,73 +1750,33 @@ function apply(ctx, config) {
   // 启动即探测一次 provider → baseURL；失败静默，不影响任何路由注册。
   cost.refreshEndpoints(false).catch(() => {});
 
-  ctx.effect(
-    () => ctx.webServer.register({
-      kind: "exact",
-      path: "/dsh-message-actions",
-      handler: makeActionHandler(ctx)
-    }),
-    "dsh-message-actions: write route"
-  );
-  ctx.effect(
-    () => ctx.webServer.register({
-      kind: "exact",
-      path: "/dsh-message-actions/messages",
-      handler: makeMessagesHandler(ctx, cost)
-    }),
-    "dsh-message-actions: read route"
-  );
-  ctx.effect(
-    () => ctx.webServer.register({
-      kind: "exact",
-      path: ATTACHMENT_ROUTE,
-      handler: makeAttachmentHandler(ctx)
-    }),
-    "dsh-message-actions: attachment route"
-  );
+  // 所有路由统一包一层兜底：handler 内部漏掉的异常只会变成 500 JSON，
+  // 不会以未处理 rejection 的形式穿透到宿主（宿主界面也就不会弹自己的报错）。
+  const route = (path, handler, label) =>
+    ctx.effect(
+      () => ctx.webServer.register({
+        kind: "exact",
+        path,
+        handler: guardedHandler(handler, {
+          label,
+          log: (message) => {
+            if (typeof ctx.logger?.warn === "function") ctx.logger.warn(message);
+          }
+        })
+      }),
+      `dsh-message-actions: ${label}`
+    );
 
-  ctx.effect(
-    () => ctx.webServer.register({
-      kind: "exact",
-      path: "/dsh-message-actions/cost/state",
-      handler: makeCostStateHandler(ctx, cost)
-    }),
-    "dsh-message-actions: cost state route"
-  );
+  route("/dsh-message-actions", makeActionHandler(ctx), "write route");
+  route("/dsh-message-actions/messages", makeMessagesHandler(ctx, cost), "read route");
+  route(ATTACHMENT_ROUTE, makeAttachmentHandler(ctx), "attachment route");
+  route("/dsh-message-actions/cost/state", makeCostStateHandler(ctx, cost), "cost state route");
   // —— 会话统计（数据来自官方会话日志）——
-  ctx.effect(
-    () => ctx.webServer.register({
-      kind: "exact",
-      path: STATS_ROUTE,
-      handler: makeStatsHandler(ctx, stats)
-    }),
-    "dsh-message-actions: session stats route"
-  );
-  ctx.effect(
-    () => ctx.webServer.register({
-      kind: "exact",
-      path: STATS_BUDGET_ROUTE,
-      handler: makeStatsBudgetHandler(ctx, cost)
-    }),
-    "dsh-message-actions: stats budget route"
-  );
-  ctx.effect(
-    () => ctx.webServer.register({
-      kind: "exact",
-      path: BILLING_ROUTE,
-      handler: makeBillingHandler(ctx, cost)
-    }),
-    "dsh-message-actions: billing route"
-  );
+  route(STATS_ROUTE, makeStatsHandler(ctx, stats), "session stats route");
+  route(STATS_BUDGET_ROUTE, makeStatsBudgetHandler(ctx, cost), "stats budget route");
+  route(BILLING_ROUTE, makeBillingHandler(ctx, cost), "billing route");
   // —— 会话管理（删除到回收站 / 恢复 / 彻底清理 / 移动到工作区）——
-  ctx.effect(
-    () => ctx.webServer.register({
-      kind: "exact",
-      path: SESSIONS_ROUTE,
-      handler: makeSessionsHandler(ctx, sessions)
-    }),
-    "dsh-message-actions: sessions route"
-  );
+  route(SESSIONS_ROUTE, makeSessionsHandler(ctx, sessions), "sessions route");
 
   ctx.effect(() => {
     const offEvent = ctx.on("session/event", (session, event) => cost.onSessionEvent(session, event));

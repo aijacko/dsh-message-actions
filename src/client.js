@@ -272,12 +272,21 @@ window.__ModuleLoader__.load({
       }
     }
 
-    async function postJson(path, body) {
-      const res = await fetchWithTimeout(apiUrl(path), {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify(body)
-      });
+    /**
+     * 统一请求收口：网络中断 / 超时 / 宿主关闭都不再抛 rejection，
+     * 而是转成 `status: 0` + `NETWORK_ERROR`，让所有调用方都走已有的错误提示分支。
+     * 否则轮询与按钮会各自出现「点了没反应」或未处理的 Promise。
+     */
+    async function requestJson(path, init, query) {
+      let res;
+      try {
+        res = await fetchWithTimeout(apiUrl(path, query), init);
+      } catch {
+        return {
+          status: 0,
+          data: { ok: false, error: { code: "NETWORK_ERROR" } }
+        };
+      }
       let data = null;
       try {
         data = await res.json();
@@ -287,15 +296,16 @@ window.__ModuleLoader__.load({
       return { status: res.status, data };
     }
 
+    async function postJson(path, body) {
+      return requestJson(path, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body)
+      });
+    }
+
     async function getJson(path, query) {
-      const res = await fetchWithTimeout(apiUrl(path, query), { cache: "no-store" });
-      let data = null;
-      try {
-        data = await res.json();
-      } catch {
-        data = null;
-      }
-      return { status: res.status, data };
+      return requestJson(path, { cache: "no-store" }, query);
     }
 
     // -------------------------------------------------------------------------
@@ -668,7 +678,8 @@ window.__ModuleLoader__.load({
         .then(({ status, data }) => {
           if (!costPolling || !costWaitActive) return;
           if (status === 200 && data && data.ok && data.value) applyCostState(data.value);
-          costWaitTimer = setTimeout(costWaitStep, 0);
+          // 网络失败（status 0）按 2s 退避，避免归一化后变成 0ms 的请求风暴。
+          costWaitTimer = setTimeout(costWaitStep, status === 0 ? 2000 : 0);
         })
         .catch(() => {
           costWaitTimer = setTimeout(costWaitStep, 2000);

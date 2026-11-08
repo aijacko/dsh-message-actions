@@ -118,6 +118,41 @@ async function readJsonBody(req, res) {
   }
 }
 
+/**
+ * 路由处理器兜底：任何未预期的异常都收敛为 500 JSON，不让 rejection 穿透到宿主 webServer。
+ * 流式响应已写出头部时不能再发 JSON，直接销毁连接（客户端会拿到网络错误而不是半截数据）。
+ *
+ * @param handler 原始请求处理器
+ * @param options { label?: string, log?: (message: string) => void }
+ */
+function guardedHandler(handler, options) {
+  const o = options || {};
+  const label = typeof o.label === 'string' && o.label !== '' ? o.label : 'request';
+  const log = typeof o.log === 'function' ? o.log : null;
+  return async function guarded(req, res) {
+    try {
+      await handler(req, res);
+    } catch (err) {
+      if (log) {
+        try {
+          log(`[dsh-message-actions] ${label} failed: ${err instanceof Error ? err.message : String(err)}`);
+        } catch {
+          /* 日志本身失败不能影响响应 */
+        }
+      }
+      if (res.headersSent) {
+        try { res.destroy(); } catch { /* 已断开 */ }
+        return;
+      }
+      try {
+        sendError(res, 500, 'INTERNAL');
+      } catch {
+        /* 连接已断开 */
+      }
+    }
+  };
+}
+
 module.exports = {
   jsonHeaders,
   sendJson,
@@ -127,5 +162,6 @@ module.exports = {
   sendBadRequest,
   sendForbidden,
   sendMethodNotAllowed,
-  readJsonBody
+  readJsonBody,
+  guardedHandler
 };
