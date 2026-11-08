@@ -3,7 +3,7 @@
 [English](README-en.md) | **中文**
 
 ![version](https://img.shields.io/badge/version-0.2.8-blue)
-![npm](https://img.shields.io/badge/npm-v0.2.4-orange)
+![npm](https://img.shields.io/badge/npm-v0.2.8-orange)
 ![license](https://img.shields.io/badge/license-MIT-green)
 ![DSH](https://img.shields.io/badge/DSH-0.2.2--rc.1-blue)
 [![GitHub repository](https://img.shields.io/badge/GitHub-repository-blue)](https://github.com/aijacko/dsh-message-actions)
@@ -73,7 +73,7 @@ pnpm add "file:/path/to/dsh-message-actions"
 - 把包名加入 profile `package.json` 的 `dsh.profile.bundles`；**不要**在 `cordis.patch.yml` 里再追加 `insert`，否则可能出现设置无法保存。
 - 升级插件后需**完全退出并重启 DSH**（含托盘 / 后台进程）；仅刷新页面不会加载新的客户端代码。
 
-已发布版本 `0.2.4`；当前源码版本 `0.2.8`（未发布）。
+已发布版本 `0.2.8`。
 
 ## 配置项
 

@@ -3,7 +3,7 @@
 **English** | [中文](README.md)
 
 ![version](https://img.shields.io/badge/version-0.2.8-blue)
-![npm](https://img.shields.io/badge/npm-v0.2.4-orange)
+![npm](https://img.shields.io/badge/npm-v0.2.8-orange)
 ![license](https://img.shields.io/badge/license-MIT-green)
 ![DSH](https://img.shields.io/badge/DSH-0.2.2--rc.1-blue)
 [![GitHub repository](https://img.shields.io/badge/GitHub-repository-blue)](https://github.com/aijacko/dsh-message-actions)
@@ -73,7 +73,7 @@ pnpm add "file:/path/to/dsh-message-actions"
 - Add the package name to `dsh.profile.bundles` in the profile `package.json`; do **not** add another `insert` in `cordis.patch.yml`, or settings may fail to save.
 - After upgrading, **fully quit and restart DSH** (including tray / background processes); a page refresh does not load the new client code.
 
-Published version `0.2.4`; current source version `0.2.8` (not published).
+Published version `0.2.8`.
 
 ## Configuration
 

@@ -1366,9 +1366,10 @@ function fakeRes() {
   eq("市场索引：仓库地址与 package.json 同源",
     entry.repository.url.replace(/^git\+/, "").replace(/\.git$/, ""),
     pkg.repository.url.replace(/^git\+/, "").replace(/\.git$/, ""));
-  ok("市场索引：版本列表只含已发布版本（当前版本高于列表最新）",
+  ok("市场索引：版本列表只含真实发布版本并按时间倒序",
     entry.versions.every((v) => v.publishTimestamp > 0) &&
-    entry.versions[0].version !== pkg.version);
+    entry.versions.every((v, i) => i === 0 || entry.versions[i - 1].publishTimestamp > v.publishTimestamp));
+  eq("市场索引：列表最新版本等于当前版本", entry.versions[0].version, pkg.version);
 
   // 默认值与顺序：内部存储值仍为 compact / default，只改可见顺序与默认。
   eq("计费样式默认值为单行", DEFAULT_COST_LAYOUT, "compact");
