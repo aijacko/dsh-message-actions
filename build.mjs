@@ -7,7 +7,7 @@
 //   - lib/http.cjs   HTTP 工具（原样复制，供宿主 require）
 //   - lib/sessions.cjs 会话管理纯函数（原样复制，供宿主 require）
 //   - lib/session-manager.mjs 会话管理宿主服务（由 src/session-manager.mjs 原样复制）
-//   - lib/client.js  客户端浏览器模块（将 shared.cjs / i18n.cjs 内联 + 注入构建时间戳）
+//   - lib/client.js  客户端浏览器模块（将 shared.cjs / i18n.cjs 内联 + 注入版本号）
 // 同时由 src/i18n.cjs 的 meta 生成 locale/zh.json 与 locale/en.json。
 //
 // 运行：node build.mjs
@@ -40,13 +40,12 @@ const pkg = JSON.parse(read("package.json"));
 const version = String(pkg.version || "").trim();
 if (version === "") throw new Error("build failed: package.json version is empty");
 
-// 客户端：内联 shared + i18n + 注入构建时间戳与版本号。
+// 客户端：内联 shared + i18n + 注入版本号。
 // 用函数式替换：shared 源码里可能出现 `$&` 等替换模式字符，
 // 直接传字符串会被 String.replace 当成特殊指令（`$&` 会回填占位符本身）。
 const client = read("src/client.js")
   .replace("/*__DMA_SHARED__*/ null", () => sharedIife)
   .replace("/*__DMA_I18N__*/ null", () => i18nIife)
-  .replaceAll("__DMA_BUILD_TIME__", new Date().toISOString())
   .replaceAll("__DMA_VERSION__", version);
 
 writeFileSync(join(lib, "index.js"), read("src/index.mjs"));
@@ -67,7 +66,7 @@ for (const lang of ["zh", "en"]) {
 }
 
 // 构建后断言：占位符必须全部消失，否则客户端会在运行时报语法错误。
-for (const marker of ["/*__DMA_SHARED__*/ null", "/*__DMA_I18N__*/ null", "__DMA_BUILD_TIME__", "__DMA_VERSION__"]) {
+for (const marker of ["/*__DMA_SHARED__*/ null", "/*__DMA_I18N__*/ null", "__DMA_VERSION__"]) {
   if (client.includes(marker)) {
     throw new Error("build failed: placeholder not replaced: " + marker);
   }

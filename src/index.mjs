@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+﻿import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import z from "@deepseek-ai/schemastery";
 import shared from "./shared.cjs";
@@ -71,6 +71,9 @@ const {
 // ---------------------------------------------------------------------------
 
 const name = "dsh-message-actions";
+
+/** 解析相对请求 URL 的占位基址；只用于 new URL，不发起任何网络请求。 */
+const URL_PARSE_BASE = "http://localhost";
 
 const inject = ["webServer", "sessions", "agents"];
 
@@ -192,7 +195,7 @@ function makeAttachmentHandler(ctx) {
     }
     let query;
     try {
-      query = new URL(req.url, "http://localhost").searchParams;
+      query = new URL(req.url, URL_PARSE_BASE).searchParams;
     } catch {
       sendBadRequest(res);
       return;
@@ -408,7 +411,7 @@ function makeMessagesHandler(ctx, cost) {
       sendForbidden(res);
       return;
     }
-    const url = new URL(req.url || "/", "http://x");
+    const url = new URL(req.url || "/", URL_PARSE_BASE);
     const sessionId = url.searchParams.get("sessionId");
     if (!sessionId) {
       sendBadRequest(res);
@@ -502,15 +505,17 @@ const ROUTING_CACHE_MS = 5 * 1000;
 // provider → baseURL 探测：缓存 60s；探测失败只用旧缓存，不阻塞事件结算。
 const ENDPOINT_CACHE_MS = 60 * 1000;
 const ENDPOINT_TIMEOUT_MS = 2 * 1000;
-const DSH_VERSION_FALLBACK = "0.2.1";
-
-/** getBalance 的客户端元数据：时区固定北京时间，不随本机漂移。 */
+/** getBalance 的客户端元数据：时区固定北京时间，不随本机漂移。
+ *  version 只作为遥测字段，宿主没注入时宁可不传，也不写死一个过期版本号。 */
 function accountClientMetadata() {
   const env = typeof process !== "undefined" && process.env ? process.env : {};
-  const version = typeof env.DSH_VERSION === "string" && env.DSH_VERSION.trim()
-    ? env.DSH_VERSION.trim()
-    : DSH_VERSION_FALLBACK;
-  return { version, locale: "zh-CN", timezoneOffsetSeconds: 8 * 3600 };
+  const raw = typeof env.DSH_VERSION === "string"
+    ? env.DSH_VERSION
+    : (typeof env.DSH_APP_VERSION === "string" ? env.DSH_APP_VERSION : "");
+  const metadata = { locale: "zh-CN", timezoneOffsetSeconds: 8 * 3600 };
+  const version = raw.trim();
+  if (version !== "") metadata.version = version;
+  return metadata;
 }
 
 /** 事件时刻：优先数值 time，其次 ISO 字符串，最后宿主收包时刻。 */
@@ -1199,7 +1204,7 @@ function makeCostStateHandler(ctx, service) {
       return;
     }
     try {
-      const url = new URL(req.url || "/", "http://x");
+      const url = new URL(req.url || "/", URL_PARSE_BASE);
       const force = url.searchParams.get("refresh") === "1";
       // wait=<lastTurn.at>：长轮询挂起，结算完成立即返回（上限 10s，短于客户端 15s 超时）。
       const waitRaw = url.searchParams.get("wait");
@@ -1624,7 +1629,7 @@ function makeSessionsHandler(ctx, sessions) {
       let lean = false;
       let hiddenOnly = false;
       try {
-        const query = new URL(req.url || SESSIONS_ROUTE, "http://localhost").searchParams;
+        const query = new URL(req.url || SESSIONS_ROUTE, URL_PARSE_BASE).searchParams;
         lean = query.get("lean") === "1";
         // 侧边栏隐藏行只需要 trashedIds / purgedIds，避免轮询时枚举全部日志。
         hiddenOnly = query.get("hidden") === "1";

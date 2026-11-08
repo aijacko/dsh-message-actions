@@ -2,7 +2,7 @@
 //
 // 本文件由 build.mjs 处理：
 //   - 共享纯函数占位符会被内联为 shared.cjs 的 IIFE（见下方 const shared 声明）；
-//   - 构建时间戳占位符会被替换为 ISO 时间（见下方 const BUILD 声明）。
+//   - 版本号占位符会被替换为 package.json 的 version（设置页显示用）。
 //
 // 官方图标组件（@deepseek-ai/dsh-client-ui-primitives）为可选依赖：
 // 加载成功时与官方「复制」等按钮保持同一套图标；失败时回退到内置图标。
@@ -38,13 +38,8 @@ window.__ModuleLoader__.load({
     // 占位符写成合法表达式，保证 src/client.js 可被 lint/typecheck 直接解析；
     // build.mjs 会把 `null` 整体替换为 shared.cjs 的 IIFE。
     const shared = /*__DMA_SHARED__*/ null;
-    const BUILD = "__DMA_BUILD_TIME__";
     // 构建时由 build.mjs 用 package.json 的 version 替换，避免设置页显示旧版本。
     const VERSION = "__DMA_VERSION__";
-
-    if (typeof console !== "undefined" && typeof console.info === "function") {
-      console.info("[dsh-message-actions] build", BUILD);
-    }
 
     const {
       ICONS,

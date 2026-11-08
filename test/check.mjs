@@ -1374,7 +1374,6 @@ function fakeRes() {
   const libClient = fs.readFileSync(path.join(rootDir, "lib", "client.js"), "utf8");
   ok("构建产物注入 package.json 版本", libClient.includes(`const VERSION = "${pkg.version}";`));
   ok("构建产物无 __DMA_VERSION__ 占位符", !libClient.includes("__DMA_VERSION__"));
-  ok("构建产物无 __DMA_BUILD_TIME__ 占位符", !libClient.includes("__DMA_BUILD_TIME__"));
   ok(
     "lib/index.js 与 src/index.mjs 一致",
     fs.readFileSync(path.join(rootDir, "lib", "index.js"), "utf8")
