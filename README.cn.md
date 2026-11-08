@@ -293,7 +293,7 @@ test/check.mjs   # 无依赖的断言脚本
 ```
 
 
-- 版本：`0.2.6`（源码版本，未发布）
+- 版本：`0.2.12`（源码版本，未发布）
 - 最新发布：`v0.2.4`
 - 发布说明：[v0.2.4](https://github.com/aijacko/dsh-message-actions/releases/tag/v0.2.4)
 - 兼容：DSH `0.2.1-rc.5` 与 `0.2.2-rc.1`；`0.2.2-rc.1`（web profile）已实测，旧版走 portal 探测失败回退

@@ -293,7 +293,7 @@ test/check.mjs   # dependency-free assertion script
 ```
 
 
-- Version: `0.2.6` (source version; not published)
+- Version: `0.2.12` (source version; not published)
 - Latest release: [v0.2.4](https://github.com/aijacko/dsh-message-actions/releases/tag/v0.2.4)
 - Compatible with: DSH `0.2.1-rc.5` and `0.2.2-rc.1`; `0.2.2-rc.1` (web profile) verified, older hosts take the portal fallback
 - Dependencies: none at runtime
