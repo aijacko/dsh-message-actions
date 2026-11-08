@@ -16,7 +16,7 @@
 - [ ] 工作树干净：`git status --short` 无输出。
 - [ ] `npm run build` 成功，`lib/` 下 7 个宿主/客户端产物与 `locale/zh.json`、`locale/en.json` 均更新。
 - [ ] `node test/check.mjs` 输出 `ALL CHECKS PASSED`。
-- [ ] `node test/e2e-sessions.mjs` 输出 `67 项真实文件系统端到端检查全部通过`（以脚本实际输出为准）。
+- [ ] `node test/e2e-sessions.mjs` 输出 `86 项真实文件系统端到端检查全部通过`（以脚本实际输出为准），其中含伪造 Host、跨站 Origin、路径穿越、批量上限、请求体上限与响应头的安全断言。
 - [ ] 构建产物中的版本号等于 `package.json` 的 `version`，且没有 `__DMA_VERSION__` / `__DMA_SHARED__` / `__DMA_I18N__` 占位符。
 
 ### A2 安装副本
@@ -186,7 +186,7 @@
 
 2. **验证**
    - `node test/check.mjs` → `ALL CHECKS PASSED`。
-   - `node test/e2e-sessions.mjs` → `67 项真实文件系统端到端检查全部通过`。
+   - `node test/e2e-sessions.mjs` → `86 项真实文件系统端到端检查全部通过`。
    - 按本文 A–F 做真机抽测（至少覆盖删除到回收站、恢复、删除开关、异常兜底、深浅色、防重复提交）。
 
 3. **提交**

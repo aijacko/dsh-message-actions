@@ -118,6 +118,45 @@ function tempRoot() {
  * 直接用真实会话路由处理器驱动一次请求（真实 req 流 + 假 res 收集响应）。
  * 用于验证「删除会话」开关的宿主侧拦截，而不是只测管理器内部函数。
  */
+/** 精确控制请求头 / 方法 / 原始请求体，用于安全围栏验证。 */
+function callRaw(handler, options) {
+  return new Promise((resolve) => {
+    const opts = options || {};
+    const raw = opts.body === undefined ? "" : opts.body;
+    const req = Readable.from(raw === "" ? [] : [Buffer.from(raw, "utf8")]);
+    req.method = opts.method || "POST";
+    req.url = opts.url || "/dsh-message-actions/sessions";
+    req.headers = Object.assign({
+      host: "127.0.0.1:1",
+      origin: "http://127.0.0.1:1",
+      "sec-fetch-site": "same-origin",
+      "content-type": "application/json",
+      "content-length": String(Buffer.byteLength(raw))
+    }, opts.headers || {});
+    const res = {
+      headersSent: false,
+      writeHead(status, headers) {
+        this.status = status;
+        this.headers = headers;
+        this.headersSent = true;
+      },
+      end(body) {
+        let parsed = null;
+        try {
+          parsed = JSON.parse(body);
+        } catch {
+          parsed = body;
+        }
+        resolve({ status: this.status, body: parsed, headers: this.headers });
+      },
+      destroy() {
+        resolve({ status: 0, body: null, headers: null });
+      }
+    };
+    handler(req, res).catch((err) => resolve({ status: -1, body: { error: String(err) }, headers: null }));
+  });
+}
+
 function callRoute(handler, method, payload) {
   return new Promise((resolve) => {
     const raw = payload === undefined ? "" : JSON.stringify(payload);
@@ -756,6 +795,91 @@ async function main() {
   check("清空回收站：输入 OK 后执行成功",
     routeRes.status === 200 && routeRes.body.ok === true);
   check("清空回收站后回收站为空", (await manager.payload({})).trash.count === 0);
+
+  // 13. 路由安全围栏：伪造来源、跨站、路径穿越、批量上限、请求体与响应头
+  let secRes = await callRaw(handlerOn, { method: "GET", headers: { host: "evil.example:80" } });
+  check("伪造 Host（非回环）→ 403 FORBIDDEN",
+    secRes.status === 403 && secRes.body.error.code === "FORBIDDEN");
+  secRes = await callRaw(handlerOn, {
+    method: "GET",
+    headers: { "sec-fetch-site": "cross-site", origin: "http://evil.example" }
+  });
+  check("跨站请求（cross-site + 异源 Origin）→ 403", secRes.status === 403);
+  secRes = await callRaw(handlerOn, {
+    method: "GET",
+    headers: { "sec-fetch-site": "same-site", origin: "http://127.0.0.1:2" }
+  });
+  check("同站不同端口（same-site）→ 403", secRes.status === 403);
+  secRes = await callRaw(handlerOn, { method: "GET", headers: { origin: "http://127.0.0.1:2" } });
+  check("同源校验：Origin 与宿主不一致 → 403", secRes.status === 403);
+  const noOriginCtx = Object.assign({}, routeCtx, {
+    webServer: { getOrigin: () => { throw new Error("web server unavailable"); } }
+  });
+  const handlerNoOrigin = makeSessionsHandler(noOriginCtx, manager, { sessionsDelete: true });
+  secRes = await callRaw(handlerNoOrigin, { method: "GET" });
+  check("宿主无法给出同源地址时，带 Origin 请求被拒（失败即关闭）", secRes.status === 403);
+  secRes = await callRaw(handlerOn, { method: "GET" });
+  check("正常同源 GET 仍为 200", secRes.status === 200 && secRes.body.ok === true);
+  check("响应不带 CORS 放行头",
+    secRes.headers["access-control-allow-origin"] === undefined);
+  check("响应带 nosniff / 同源 CORP / no-store",
+    secRes.headers["x-content-type-options"] === "nosniff"
+      && secRes.headers["cross-origin-resource-policy"] === "same-origin"
+      && secRes.headers["cache-control"] === "no-store");
+
+  secRes = await callRaw(handlerOn, {
+    body: JSON.stringify({ action: "delete", sessionIds: ["../../etc/passwd"] })
+  });
+  check("会话 id 路径穿越 → 400 INVALID_REQUEST",
+    secRes.status === 400 && secRes.body.error.code === "INVALID_REQUEST");
+  secRes = await callRaw(handlerOn, {
+    body: JSON.stringify({ action: "restore", trashIds: ["trash-../../escape"] })
+  });
+  check("回收站 id 路径穿越 → 400 INVALID_REQUEST", secRes.status === 400);
+  const manyIds = Array.from({ length: 51 }, (_, i) =>
+    `session-${String(i).padStart(8, "0")}-0000-4000-8000-000000000000`);
+  secRes = await callRaw(handlerOn, {
+    body: JSON.stringify({ action: "delete", sessionIds: manyIds })
+  });
+  check("批量超过 50 条 → 400", secRes.status === 400);
+  const duplicateId = "session-00000000-0000-4000-8000-000000000000";
+  secRes = await callRaw(handlerOn, {
+    body: JSON.stringify({ action: "delete", sessionIds: [duplicateId, duplicateId] })
+  });
+  check("重复 id → 400", secRes.status === 400);
+  secRes = await callRaw(handlerOn, {
+    body: JSON.stringify({ action: "delete", sessionIds: [duplicateId] }),
+    headers: { "content-type": "text/plain" }
+  });
+  check("非 JSON Content-Type → 400", secRes.status === 400);
+  secRes = await callRaw(handlerOn, {
+    body: "{}",
+    headers: { "content-length": String(2 * 1024 * 1024) }
+  });
+  check("请求体超过 1MB → 413 PAYLOAD_TOO_LARGE",
+    secRes.status === 413 && secRes.body.error.code === "PAYLOAD_TOO_LARGE");
+  secRes = await callRaw(handlerOn, { method: "PUT", body: "{}" });
+  check("不支持的 HTTP 方法 → 405 且声明 Allow",
+    secRes.status === 405 && String(secRes.headers.allow || "").includes("POST"));
+  secRes = await callRaw(handlerOn, { body: JSON.stringify({ action: "unknown" }) });
+  check("未知 action → 400 INVALID_REQUEST", secRes.status === 400);
+  check("错误响应不泄露内部路径",
+    !String(secRes.body.error.message || "").includes(root)
+      && !String(secRes.body.error.message || "").includes("\\\\"));
+
+  // 彻底清理不可恢复：清理后同一条目无法恢复，日志也不在磁盘上
+  const irreversibleId = "session-32323232-3232-4232-8232-323232323232";
+  seedSession(host, { id: irreversibleId, cwd: wsDirA, title: "irreversible", events: [] });
+  const irreversibleDir = sessionDirOf(sessionsRoot, wsDirA, irreversibleId);
+  const irreversible = await manager.removeToTrash([irreversibleId]);
+  secRes = await callRaw(handlerOn, {
+    body: JSON.stringify({ action: "purge", trashIds: [irreversible[0].trashId], confirm: "OK" })
+  });
+  const restoreAfterPurge = await manager.restore([irreversible[0].trashId]);
+  check("彻底清理后恢复失败（条目已不可恢复）",
+    secRes.status === 200 && restoreAfterPurge[0].ok === false);
+  check("彻底清理后日志与回收站条目都已删除",
+    !fs.existsSync(irreversibleDir) && !fs.existsSync(path.join(trashRoot, irreversible[0].trashId)));
 
   fs.rmSync(root, { recursive: true, force: true });
   console.log(report.join("\n"));

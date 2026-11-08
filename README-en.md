@@ -17,25 +17,26 @@
 
 ### Message actions
 
-- **Recall**: hover a question row and click Recall — the whole exchange disappears, and the text plus images / files return to the composer for editing and resending.
+- **Recall**: hover a question row and click Recall — the whole exchange disappears, and the text plus images / files return to the composer for editing and resending. Running sessions cannot be recalled.
 - **Delete**: the question row deletes the whole exchange; the tool row deletes only that step's tool result, hiding the answer in the same step while leaving other steps untouched.
 - **Delete to end**: remove everything from that message onward — handy for closing off a topic.
 - Deletion is tombstone-style: it appends a marker without rewriting the history log, so deleted content does not come back after a refresh, a session switch, or a DSH restart.
 
 ### Share and export
 
-- **Share as image**: multi-select turns in a full-screen picker and generate a long PNG locally; nothing is uploaded.
-- **Export Markdown**: the same selection, exported as a `.md` with question / answer structure.
+- **Selecting turns**: hover any question row and click Share or Export to open the full-screen picker; click a turn card to select or deselect it, or use Select all.
+- **Share as image**: renders a 720 px wide long PNG locally with nothing uploaded. Content taller than 12000 px is rejected with a hint, so split it into batches.
+- **Export Markdown**: a `.md` with `# title`, `## Q N`, and `### A` structure, named `dsh-{sessionId}-{YYYYMMDD-HHmm}.md`.
 - A failed run keeps the picker and selection open for retry; buttons are disabled while a reply is being generated.
 
 ### Usage and cost
 
 - **Per-reply usage and cost**: `tok · chars · ¥0.0023` under every answer; the amount sums only that reply's own usage, so multi-step turns are not billed twice.
-- **Cost card**: balance / today / per-turn in the sidebar; the main figure is the account total (top-up + bonus, each wallet truncated to the cent). Local models show "Local · no billing".
+- **Where the numbers live**: the per-reply amount sits under the answer, the turn total is the sidebar's "Turn" figure, and balance / today / turn are on the cost card; session and time breakdowns are in the statistics panel.
+- **Cost card**: the main figure is the account total (top-up + bonus, each wallet truncated to the cent); hover for the split. Local models show "Local · no billing".
 - **Statistics**: the icon at the end of the cost row opens token totals, a 24 h / 30 d timeline, per-session cost, source diagnostics, and the third-party price table.
-- **Budget**: edited inside the statistics panel (default `¥5`, `0` hides the ratio and shows only the estimate). It only computes the budget-used ratio and remaining allowance; it never bills you.
+- **Budget**: edited inside the statistics panel (default `¥5`; `0` shows only the estimate). It only computes the used ratio and remaining allowance, never blocks a turn; when exceeded it shows "Over budget" with the real, uncapped percentage.
 - **Peak / off-peak hint**: weekdays `09:00–12:00` and `14:00–18:00` are peak, everything else is off-peak (`0.5×`); peak is orange, off-peak is blue.
-- **Model billing tiers**: DeepSeek official models use official prices; confirmed local / private endpoints are unbilled; third-party models use the price table, and unpriced tokens still count but add `0` to the cost.
 
 ### Session management
 
@@ -44,7 +45,8 @@
 - **Restore**: single / bulk restore takes effect right away, no restart, and the session returns to its original workspace group.
 - **Archive / unarchive**: move sessions out of the regular list; archiving never moves chat logs.
 - **Purge**: single / bulk purge and emptying the trash are irreversible and require typing `OK` (case-insensitive, surrounding spaces ignored).
-- **Delete switch**: turn off **Delete session** at the top of Settings → Message Butler → Session manager. Entries disappear and the host rejects delete / purge requests (`SESSIONS_DELETE_DISABLED`); restore, archive, and listing are unaffected.
+- **How long trashed items stay**: there is no TTL or auto-expiry. Entries remain until you purge them or empty the trash; a soft-deleted log still occupies disk space.
+- **Delete switch**: turn off **Delete session** at the top of Settings → Message Butler → Session manager. This hides the delete item in the question menu, bulk delete, and the trash's purge / empty buttons; the host also rejects delete / purge requests (`SESSIONS_DELETE_DISABLED`). Restore, archive, and listing keep working.
 
 ### Sound and volume
 
@@ -96,15 +98,50 @@ Settings → Plugins → Message Butler. Changes save and take effect immediatel
 | Delete session `sessionsDelete` | Master switch for delete / purge in session management | On |
 | Completion sound `sound` | Legacy compatibility field; `false` equals muted | On |
 
+## Billing rules
+
+### What is not billed
+
+- **Overrides first**: mark a provider `local` in Statistics → Billing rules to make that source free; `always` forces billing.
+- **Automatic local detection**: `localhost`, `*.localhost`, `127.0.0.0/8`, `::1`, `0.0.0.0`, `*.local`, and container / host aliases such as `host.docker.internal` count as local unless they look like an official domain.
+- **Official sources**: a DeepSeek provider name or official domain is billed at official prices, including peak / off-peak.
+- **Unconfirmed sources**: billed as third-party and marked "source unconfirmed" — never silently treated as local.
+
+### Third-party gateways and overrides
+
+Statistics → Billing rules edits `overrides` (provider → `local` / `always`), `prices` (the price table), and recalculates history after saving. The gateway base URL is probed by the host and shown under "Source diagnostics"; no manual URL entry is needed.
+
+### Price table priority
+
+Third-party prices resolve in this order: **exact model name → longest model prefix → provider → global fallback**. If nothing matches, the UI shows "not configured", tokens are still counted, and cost stays `0` — official prices are never applied automatically.
+
+## Data and permissions
+
+- **State file**: `$DSH_HOME/plugins/dsh-message-actions/cost-state.json` (directory `0700`, file `0600`) holds the budget, third-party price table, spending records, and balance baseline.
+- **Trash**: `$DSH_HOME/dsh-message-actions-trash/trash-*/meta.json` (`0600`) plus the `purged.json` tombstone list; the session logs themselves stay in the original workspace.
+- **Delete markers**: recall / delete / delete-to-end append events to the matching `session.v*.jsonl`; history text is never rewritten.
+- **Uploads**: the plugin sends no conversations, attachments, or statistics anywhere. Share images and Markdown are generated locally. Endpoints only accept same-origin local requests and open no extra port.
+- **Credentials**: no API keys, tokens, or cookies are stored; balance and usage come from the host's existing session.
+- **Backup**: back up the `plugins/dsh-message-actions/` and `dsh-message-actions-trash/` directories; session logs are backed up with the DSH session directory.
+- **Clean removal**: empty the trash first (to avoid leftover tombstones), then disable and remove the plugin; delete `plugins/dsh-message-actions/` to clear statistics. Delete markers already written into session logs stay with the logs and do not restore hidden content on uninstall.
+
 ## Usage notes
 
 1. Hover a question row for Recall / Share / Export / Delete / Delete to end; hover a tool row to delete that step's tool result.
 2. The stats line under each answer shows that reply's own tokens, characters, and estimated cost; the whole-turn total is in the sidebar's **Turn** figure.
 3. In the share / export picker `Enter` runs the primary action; in a confirmation dialog `Enter` confirms and `Esc` cancels. Enter is ignored while focus is in a text field.
-4. The trash lives at `~/.dsh/dsh-message-actions-trash` (same name under `$DSH_HOME`). Restore is instant; purge cannot be undone.
+4. Trash restore is instant; purge is irreversible and also removes the session from the workspace index.
 5. Delete markers are written into session event logs; deleting a session directory by hand removes the markers with it.
-6. The plugin opens no extra port and only accepts same-origin local requests; conversation data is never sent to an external service.
-7. Restart DSH fully after upgrading or changing host-side code; for client-only changes that already loaded, disable and re-enable the plugin or refresh the page.
+6. Restart DSH fully after upgrading or changing host-side code; for client-only changes that already loaded, disable and re-enable the plugin or refresh the page.
+
+## FAQ
+
+- **No entry appears after installing**: confirm the plugin is enabled, the profile's `dsh.profile.bundles` contains the package name, then fully quit and restart DSH; if it is still missing, check the developer console for load errors.
+- **No completion sound**: make sure the tone is not Off, volume is above `0`, and neither the OS nor the browser is muted; a legacy `sound=false` also mutes it. Browsers require a prior page interaction before playing audio.
+- **Cost shows "not configured"**: the third-party model did not match the price table. Add a price by model / prefix / provider / fallback under Statistics → Billing rules; for official or local sources, check the baseURL and overrides under Source diagnostics.
+- **Balance does not add up**: the balance is a snapshot of the account total, "today" observes drops in that total, and "turn" is converted from list prices — different bases, so they need not match turn by turn. Top-ups / refunds only move the baseline without reducing recorded spend, and cross-day or long gaps do not backfill the difference.
+- **Delete is rejected**: `SESSIONS_DELETE_DISABLED` means the Delete session switch is off; `SESSION_RUNNING` means the reply is still generating; `TRASH_UNAVAILABLE` usually means an old host or a disabled plugin; non-local requests get 403.
+- **Disk usage did not drop after deleting**: delete-to-trash is a soft delete and the log stays in the workspace; only purge or empty trash frees the space.
 
 ## Feedback
 
