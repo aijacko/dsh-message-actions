@@ -11,7 +11,7 @@
 
 > **Compatibility**: built for the latest DSH (`0.2.2-rc.1`), tested on both desktop and web profiles.
 
-**Make every turn in DSH controllable, shareable, and measurable.** The host has no recall, delete, or cost view; this plugin fills those gaps — message actions, share/export, session management, and usage billing all run locally, with conversation data never uploaded.
+**Features: recall, delete, and delete-to-end; multi-select share and export; session deletion, trash, restore, and batch actions; usage billing with balance and cost views; a completion sound when a reply finishes.** The host has no recall, delete, or cost view; this plugin fills those gaps — message actions, share/export, session management, and usage billing all run locally, with conversation data never uploaded.
 
 ## Features
 

@@ -9,11 +9,11 @@
 const meta = {
   zh: {
     title: '消息管家',
-    description: '撤回、删除、删至末尾、多选分享与导出；会话管理（回收站、恢复、归档）；每条回答的用量计费、余额与费用展示、完成提示音。'
+    description: '功能：撤回、删除、删至末尾、多选分享与导出；删除会话、回收站、恢复、批量操作；用量计费、余额与费用展示；对话完成提示音。'
   },
   en: {
     title: 'Message Butler',
-    description: 'Recall, delete, delete-to-end, and multi-select share/export; session management with trash, restore, and archive; per-reply usage billing, balance and cost display, and a completion sound.'
+    description: 'Features: recall, delete, and delete-to-end; multi-select share and export; session deletion, trash, restore, and batch actions; usage billing with balance and cost views; a completion sound when a reply finishes.'
   }
 };
 

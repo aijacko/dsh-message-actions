@@ -1319,8 +1319,8 @@ function fakeRes() {
   ok("i18n en 非空", enKeys.length > 50);
   eq("i18n meta.zh.title 为显示名", i18n.meta.zh.title, "消息管家");
   eq("i18n meta.en.title 为显示名", i18n.meta.en.title, "Message Butler");
-  eq("i18n meta.zh.description 按定稿原文", i18n.meta.zh.description, "撤回、删除、删至末尾、多选分享与导出；会话管理（回收站、恢复、归档）；每条回答的用量计费、余额与费用展示、完成提示音。");
-  eq("i18n meta.en.description 与中文同义", i18n.meta.en.description, "Recall, delete, delete-to-end, and multi-select share/export; session management with trash, restore, and archive; per-reply usage billing, balance and cost display, and a completion sound.");
+  eq("i18n meta.zh.description 按定稿原文", i18n.meta.zh.description, "功能：撤回、删除、删至末尾、多选分享与导出；删除会话、回收站、恢复、批量操作；用量计费、余额与费用展示；对话完成提示音。");
+  eq("i18n meta.en.description 与中文同义", i18n.meta.en.description, "Features: recall, delete, and delete-to-end; multi-select share and export; session deletion, trash, restore, and batch actions; usage billing with balance and cost views; a completion sound when a reply finishes.");
   const iconSrc = fs.readFileSync(fileURLToPath(new URL("../icon.svg", import.meta.url)), "utf8");
   ok("插件图标：蓝底对话气泡内嵌三档滑块", /viewBox="0 0 64 64"/.test(iconSrc) &&
     iconSrc.includes('fill="#2563eb"') && iconSrc.includes("M23 23h18M23 30h18M23 37h18") &&
@@ -3058,9 +3058,9 @@ function pushTombstone(bag, plan, id, action) {
       && !i18nSrc.includes("对话管理"));
   ok("文案：英文同步为 Session manager",
     i18nSrc.includes("'cost.tab.sessions': 'Session manager'"));
-  ok("locale/zh.json：生成「会话管理」且不再有「对话管理」",
-    localeZh.includes("会话管理") && !localeZh.includes("对话管理"));
-  ok("locale/en.json：meta 同步为 session management", localeEn.includes("session management"));
+  ok("locale/zh.json：meta 为新描述且不再有「对话管理」",
+    localeZh.includes("删除会话、回收站、恢复、批量操作") && !localeZh.includes("对话管理"));
+  ok("locale/en.json：meta 同步为 session deletion", localeEn.includes("session deletion") && localeEn.includes("completion sound"));
 
   // —— 状态筛选：活跃 = 未归档；已归档可单独查看；计数与总数一致 ——
   ok("状态筛选：已归档可单独筛选",
