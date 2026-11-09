@@ -188,7 +188,7 @@
 1. **确认版本**
    - 修改 `package.json.version`（修复类 +1 patch，功能类 +1 minor）。
    - 同步更新 `src/i18n.cjs` 与 `market/index.json` 的描述（如功能有变）。
-   - 确认 `package.json` 顶层声明宿主范围：`"engines": { "dsh": "^0.2.1-rc.1 || ^0.2.2-rc.1" }`。宿主安装校验只认顶层 `engines.dsh`；`dsh.engines.dsh` 仅影响市场徽章展示。缺这段时市场卡片显示「未声明宿主要求」。
+   - 确认 `package.json` 顶层声明宿主范围：`"engines": { "dsh": "^0.2.2-rc.1" }`。宿主安装校验只认顶层 `engines.dsh`；`dsh.engines.dsh` 仅影响市场徽章展示。缺这段时市场卡片显示「未声明宿主要求」。范围只写实际验证过的版本，不写未验证的低版本。
    - `npm run build`，确认设置页版本号与新版本一致。
 
 2. **验证**
@@ -351,7 +351,7 @@
 
 | 项目 | 内容 |
 |---|---|
-| 宿主范围 | `package.json` 新增顶层 `engines.dsh: "^0.2.1-rc.1 \|\| ^0.2.2-rc.1"`，消除市场卡片的「未声明宿主要求」；已用市场同款 `satisfiesRange` 验证匹配 0.2.1 / 0.2.2 两代宿主，`0.1.7-alpha.1` 与 `0.3.0` 不匹配 |
+| 宿主范围 | `package.json` 新增顶层 `engines.dsh: "^0.2.2-rc.1"`，消除市场卡片的「未声明宿主要求」；已用市场同款 `satisfiesRange` 验证：匹配 `0.2.2-rc.1` / `0.2.2` / `0.2.9`，`0.1.7-alpha.1`、`0.2.1-rc.1`、`0.3.0` 不匹配。只声明实际验证过的 0.2.2 线，不覆盖未测试的 0.2.1 |
 | README 截图 | 中英文各补「界面预览 / Screenshots」四图（消息操作与费用卡片、设置·消息操作、设置·会话管理、设置·费用统计），地址为 `raw.githubusercontent.com/.../main/pic/*.png` |
 | 旧截图 | `pic/` 已换成 0.2.8 实拍：中文 `1–4.png`、英文 `1en–4en.png`；0.2.1 时代的设置页旧图已不再引用 |
 | 验证 | `node build.mjs` 正常；`check.mjs` 3057 通过；`e2e-sessions.mjs` 86 通过 |
