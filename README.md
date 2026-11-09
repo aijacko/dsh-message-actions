@@ -13,6 +13,14 @@
 
 **功能：撤回、删除、删至末尾、多选分享与导出；删除会话、回收站、恢复、批量操作；用量计费、余额与费用展示；对话完成提示音。** 宿主本身没有撤回、删除与费用视图，这个插件把这几件事补齐：消息操作、分享导出、会话管理、用量计费全部在本机完成，不上传对话内容。
 
+## 界面预览
+
+| 消息操作与费用卡片 | 设置 · 消息操作 |
+|---|---|
+| ![提问行与回答行的撤回、删除、分享、导出按钮；回答行显示 tokens、字数与单条费用；左下角是余额卡片](https://raw.githubusercontent.com/aijacko/dsh-message-actions/main/pic/1.png) | ![消息操作标签：撤回、分享、导出、删除、删至末尾、操作确认、回答统计、提示音与音量](https://raw.githubusercontent.com/aijacko/dsh-message-actions/main/pic/2.png) |
+| **设置 · 会话管理** | **设置 · 费用统计** |
+| ![会话管理标签：删除会话开关、会话与回收站计数、按工作区分组、搜索与状态筛选、批量删除到回收站](https://raw.githubusercontent.com/aijacko/dsh-message-actions/main/pic/3.png) | ![费用统计标签：费用统计开关、计费样式单行/多行、单次消耗、自动关闭、峰谷定价行、统计表入口](https://raw.githubusercontent.com/aijacko/dsh-message-actions/main/pic/4.png) |
+
 ## 功能一览
 
 ### 消息操作

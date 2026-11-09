@@ -13,6 +13,14 @@
 
 **Features: recall, delete, and delete-to-end; multi-select share and export; session deletion, trash, restore, and batch actions; usage billing with balance and cost views; a completion sound when a reply finishes.** The host has no recall, delete, or cost view; this plugin fills those gaps — message actions, share/export, session management, and usage billing all run locally, with conversation data never uploaded.
 
+## Screenshots
+
+| Message actions and cost card | Settings · Message actions |
+|---|---|
+| ![Recall, delete, share, and export on question and answer rows; the answer row shows tokens, words, and per-reply cost; the balance card sits at the bottom left](https://raw.githubusercontent.com/aijacko/dsh-message-actions/main/pic/1en.png) | ![Message actions tab: recall, share, export, delete, delete-to-end, confirmation, answer stats, completion sound, and volume](https://raw.githubusercontent.com/aijacko/dsh-message-actions/main/pic/2en.png) |
+| **Settings · Sessions** | **Settings · Cost** |
+| ![Sessions tab: delete toggle, session and trash counts, grouping by workspace, search and status filters, delete-to-trash for a batch](https://raw.githubusercontent.com/aijacko/dsh-message-actions/main/pic/3en.png) | ![Cost tab: cost toggle, single-row or multi-row layout, per-reply cost, auto-close, peak/off-peak pricing row, stats table entry](https://raw.githubusercontent.com/aijacko/dsh-message-actions/main/pic/4en.png) |
+
 ## Features
 
 ### Message actions
