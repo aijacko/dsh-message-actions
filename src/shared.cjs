@@ -610,10 +610,20 @@ function turnSpan(events, nodes, turnIndex, turn) {
 
 /** 由区间组装一个可落地的删除计划。 */
 function buildPlan(events, nodes, startSeq, endSeq, targetType, action, turn) {
-  const startIdx = nodes.indexOf(startSeq);
+  let startIdx = nodes.indexOf(startSeq);
   const endIdx = nodes.indexOf(endSeq);
   if (startIdx === -1 || endIdx === -1 || endIdx < startIdx) {
     return { ok: false, code: 'TARGET_NOT_FOUND' };
+  }
+  // DSH 0.2.2-rc.5 起，surface 节点 0 若是 system/message（系统提示），
+  // 只允许由 system/message 精确改写；删除/撤回不能把它卷入替换区间。
+  // 轮次区间可能恰好从该节点开始（旧版会话或运行时注入），此时保留系统提示，
+  // 从下一个节点开始遮蔽。
+  const head = events[startSeq];
+  if (startIdx === 0 && head && head.type === 'system/message') {
+    if (nodes.length <= 1) return { ok: false, code: 'NOT_DELETABLE' };
+    startIdx = 1;
+    startSeq = nodes[startIdx];
   }
   const removed = nodes.slice(startIdx, endIdx + 1);
   const kinds = removed.map((seq) => (events[seq] ? events[seq].type : 'unknown'));

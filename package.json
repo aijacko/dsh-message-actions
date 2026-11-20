@@ -1,6 +1,6 @@
 {
   "name": "dsh-message-actions",
-  "version": "0.2.8",
+  "version": "0.2.9",
   "description": "功能：撤回、删除、删至末尾、多选分享与导出；删除会话、回收站、恢复、批量操作；用量计费、余额与费用展示；对话完成提示音。",
   "type": "module",
   "license": "MIT",

@@ -2,14 +2,14 @@
 
 [English](README-en.md) | **中文**
 
-![version](https://img.shields.io/badge/version-0.2.8-blue)
-![npm](https://img.shields.io/badge/npm-v0.2.8-orange)
+![version](https://img.shields.io/badge/version-0.2.9-blue)
+![npm](https://img.shields.io/badge/npm-v0.2.9-orange)
 ![license](https://img.shields.io/badge/license-MIT-green)
-![DSH](https://img.shields.io/badge/DSH-0.2.2--rc.1-blue)
+![DSH](https://img.shields.io/badge/DSH-0.2.2--rc.5-blue)
 [![GitHub repository](https://img.shields.io/badge/GitHub-repository-blue)](https://github.com/aijacko/dsh-message-actions)
 ![awesome](https://img.shields.io/badge/awesome-DSH%20plugin-red)
 
-> **兼容性**：已适配最新版 DSH（`0.2.2-rc.1`），desktop / web profile 均已实测。
+> **兼容性**：已适配最新版 DSH（`0.2.2-rc.5`），desktop / web profile 均已实测。
 
 **功能：撤回、删除、删至末尾、多选分享与导出；删除会话、回收站、恢复、批量操作；用量计费、余额与费用展示；对话完成提示音。** 宿主本身没有撤回、删除与费用视图，这个插件把这几件事补齐：消息操作、分享导出、会话管理、用量计费全部在本机完成，不上传对话内容。
 
@@ -81,7 +81,7 @@ pnpm add "file:/path/to/dsh-message-actions"
 - 把包名加入 profile `package.json` 的 `dsh.profile.bundles`；**不要**在 `cordis.patch.yml` 里再追加 `insert`，否则可能出现设置无法保存。
 - 升级插件后需**完全退出并重启 DSH**（含托盘 / 后台进程）；仅刷新页面不会加载新的客户端代码。
 
-已发布版本 `0.2.8`。
+已发布版本 `0.2.9`。
 
 ## 配置项
 

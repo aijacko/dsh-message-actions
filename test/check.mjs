@@ -189,6 +189,33 @@ function makeEvents() {
 }
 
 // ---------------------------------------------------------------------------
+// 1.2 轮次区间从 surface 节点 0 的系统提示开始时，保留系统提示
+// ---------------------------------------------------------------------------
+
+{
+  const events = [
+    ev("turn/start", { turn: 1 }),
+    ev("system/message", { message: { content: [{ type: "text", text: "sys" }] } }),
+    ev("user/message", { role: "user", id: "u1", content: [{ type: "text", text: "Hi" }], source: { kind: "user" } }),
+    ev("assistant/message", { turn: 1, step: 1, message: { content: [{ type: "text", text: "Hello" }] } }),
+    ev("turn/end", { turn: 1 }),
+    ev("turn/start", { turn: 2 }),
+    ev("user/message", { role: "user", id: "u2", content: [{ type: "text", text: "Next?" }], source: { kind: "user" } }),
+    ev("assistant/message", { turn: 2, step: 1, message: { content: [{ type: "text", text: "Sure" }] } }),
+    ev("turn/end", { turn: 2 })
+  ];
+  const { events: bag, nodes } = session(events);
+  const recall = planAction(bag, nodes, { action: "recall", seq: 2 });
+  ok("系统提示位于节点0时撤回仍可执行", recall.ok === true);
+  eq("系统提示位于节点0时撤回起点顺延", [recall.startSeq, recall.endSeq], [2, 3]);
+  eq("系统提示位于节点0时撤回不遮蔽系统提示", recall.removed, [2, 3]);
+  eq("系统提示位于节点0时回填真实提问", recall.refillText, "Hi");
+  const del = planAction(bag, nodes, { action: "delete", seq: 2 });
+  ok("系统提示位于节点0时删除仍可执行", del.ok === true);
+  eq("系统提示位于节点0时删除不遮蔽系统提示", del.removed, [2, 3]);
+}
+
+// ---------------------------------------------------------------------------
 // 2. 删除（问行）= 整轮
 // ---------------------------------------------------------------------------
 
